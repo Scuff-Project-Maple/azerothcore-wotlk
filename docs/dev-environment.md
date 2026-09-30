@@ -26,6 +26,35 @@ revision `e98e7a97e3f2+` on the Playerbot branch with ACDB 335.16-dev
 (2026-05-29). Verified `e98e7a97e3f2` is an ancestor of the pinned commit
 `7f12e89e…` in this checkout.
 
+## Git remotes (updated 2026-09-30, per board request)
+
+The company forks live in the `Scuff-Project-Maple` GitHub org. All working
+remotes now point at the forks; the upstreams are kept as an `upstream`
+remote for merges (every core patch remains a merge risk against upstream).
+
+| Repo | `origin` (working) | `upstream` (reference) |
+|---|---|---|
+| azerothcore-wotlk (this tree, branch `Playerbot`) | `https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git` | `https://github.com/mod-playerbots/azerothcore-wotlk.git` |
+| `modules/mod-ale` (nested repo) | `https://github.com/Scuff-Project-Maple/mod-ale.git` | `https://github.com/azerothcore/mod-ale.git` |
+| `modules/mod-playerbots` (nested repo) | `https://github.com/Scuff-Project-Maple/mod-playerbots.git` | `https://github.com/mod-playerbots/mod-playerbots.git` |
+
+Fork heads verified against the pins: `azerothcore-wotlk` `Playerbot` @
+`7f12e89e…`, `mod-playerbots` `master` @ `7bae1b5c…` (the `mod-ale` fork's
+`master` is at upstream HEAD; check out the pinned `1cb86c96…` when
+provisioning — see table above).
+
+**Push status:** the 4 T1 commits (`f5b197b8d`, `7c40d8102`, `0f5a3955a`,
+`2bfcc80c7` + this doc update) are ahead of `origin/Playerbot` in this tree.
+Pushing to the fork is pending the company's managed GitHub identity being
+completed in Paperclip ("The managed GitHub identity is incomplete" from the
+git credential broker; no agent secret or gh auth available in the sandbox).
+The push is a clean fast-forward (`origin/Playerbot` = pinned base
+`7f12e89e…`). Until it lands, treat the provisioned tree in the shared
+project workspace as the source of truth; after it lands, a clean clone of
+the fork's `Playerbot` branch carries the tracked content (core-patch
+`worldserver.conf.dist` change, this doc, `wrath-unbound/` snapshot, and the
+tracked patch file under `modules/mod-unbound/`).
+
 ## Provisioned tree layout
 
 This repo's `.gitignore` intentionally keeps provisioned content out of the
@@ -172,12 +201,15 @@ menu (class unlock ladder: free at 5, 3g at 25, 80g at 50, 300g at 70,
 
 ## Reprovisioning from a clean clone (e.g. on the new Docker host)
 
+Clone from the company forks (`Scuff-Project-Maple`); the upstreams remain
+available as `upstream` remotes on the provisioned tree.
+
 ```bash
-git clone --branch=Playerbot https://github.com/mod-playerbots/azerothcore-wotlk.git azerothcore
+git clone --branch=Playerbot https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git azerothcore
 cd azerothcore && git checkout 7f12e89ee5f467a50e62eba1d525eac7dc953d03
 
-git clone --depth 1 https://github.com/mod-playerbots/mod-playerbots.git --branch=master modules/mod-playerbots
-git clone https://github.com/azerothcore/mod-ale.git modules/mod-ale
+git clone --depth 1 https://github.com/Scuff-Project-Maple/mod-playerbots.git --branch=master modules/mod-playerbots
+git clone https://github.com/Scuff-Project-Maple/mod-ale.git modules/mod-ale
 git -C modules/mod-ale checkout 1cb86c9600260c3731c96dc3c98d25b4fc3f2153
 
 # stage the tracked Wrath Unbound snapshot (see wrath-unbound/README.md for the mapping)
