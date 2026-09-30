@@ -1867,8 +1867,10 @@ PersistentCharacterCleanFlags = 0
 #                     0 - (Disabled, allow invalid spells)
 #        Note:        Disabling this and then having your character learn spells which require DBC edits can result in the character not being saved in the database
 #                     Disable AT YOUR OWN RISK
+#        Note:        Set to 0 for Wrath Unbound (PRO-2): cross-class spells granted via
+#                     unbound unlocks are stripped on login when this is 1.
 
-ValidateSkillLearnedBySpells = 1
+ValidateSkillLearnedBySpells = 0
 
 #
 ###################################################################################################
