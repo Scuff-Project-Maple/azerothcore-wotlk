@@ -1,0 +1,24 @@
+services:
+  ac-worldserver:
+    build:
+      context: .
+      target: worldserver
+    volumes:
+      - ./modules:/azerothcore/modules
+    environment:
+      AC_PLAYERBOTS_UPDATES_ENABLE_DATABASES: "1"
+      AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"
+      AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "1600"
+      AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "2000"
+  ac-authserver:
+    build:
+      context: .
+      target: authserver
+  ac-db-import:
+    build:
+      context: .
+      target: db-import
+  ac-client-data-init:
+    build:
+      context: .
+      target: client-data
