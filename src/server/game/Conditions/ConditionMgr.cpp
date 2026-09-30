@@ -132,7 +132,15 @@ bool Condition::Meets(ConditionSourceInfo& sourceInfo)
     case CONDITION_CLASS:
     {
         if (Unit* unit = object->ToUnit())
+        {
             condMeets = unit->getClassMask() & ConditionValue1;
+
+            // Unbound Wrath Edition — also meets the condition if any class
+            // this character has unlocked via the Mentor matches.
+            if (!condMeets)
+                if (Player* player = unit->ToPlayer())
+                    condMeets = player->GetUnboundClassMask() & ConditionValue1;
+        }
         break;
     }
     case CONDITION_RACE:

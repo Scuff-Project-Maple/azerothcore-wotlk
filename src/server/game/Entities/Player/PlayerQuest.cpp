@@ -1129,7 +1129,9 @@ bool Player::SatisfyQuestClass(Quest const* qInfo, bool msg) const
     if (reqClass == 0)
         return true;
 
-    if ((reqClass & getClassMask()) == 0)
+    // Unbound Wrath Edition — also satisfy class quests for any class this
+    // character has unlocked via the Mentor.
+    if ((reqClass & (getClassMask() | GetUnboundClassMask())) == 0)
     {
         if (msg)
             SendCanTakeQuestResponse(INVALIDREASON_DONT_HAVE_REQ);

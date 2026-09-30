@@ -2394,7 +2394,9 @@ InventoryResult Player::CanUseItem(ItemTemplate const* proto) const
         return EQUIP_ERR_YOU_CAN_NEVER_USE_THAT_ITEM;
     }
 
-    if ((proto->AllowableClass & getClassMask()) == 0 || (proto->AllowableRace & getRaceMask()) == 0)
+    // Unbound Wrath Edition — characters who've unlocked extra classes via the
+    // Mentor can ignore an item's AllowableClass restriction; AllowableRace is untouched.
+    if ((GetUnboundClassMask() == 0 && (proto->AllowableClass & getClassMask()) == 0) || (proto->AllowableRace & getRaceMask()) == 0)
     {
         return EQUIP_ERR_YOU_CAN_NEVER_USE_THAT_ITEM;
     }

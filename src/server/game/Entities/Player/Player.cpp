@@ -12620,7 +12620,9 @@ float Player::GetReputationPriceDiscount(FactionTemplateEntry const* factionTemp
 bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
 {
     uint32 racemask  = getRaceMask();
-    uint32 classmask = getClassMask();
+    // Unbound Wrath Edition — also fit spells belonging to any class this
+    // character has unlocked via the Mentor (trainer spell visibility).
+    uint32 classmask = getClassMask() | GetUnboundClassMask();
 
     SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spell_id);
     if (bounds.first == bounds.second)

@@ -2144,6 +2144,12 @@ public:
     void SetFactionForRace(uint8 race);
     void setTeamId(TeamId teamid) { m_team = teamid; };
 
+    // Unbound Wrath Edition — bitmask of classes this character has access to
+    // via the Mentor (native class | every class unlocked in unbound_character_unlocks).
+    // 0 means this character is not Unbound. Populated on login by UnboundSystem.cpp.
+    [[nodiscard]] uint32 GetUnboundClassMask() const { return m_unboundClassMask; }
+    void SetUnboundClassMask(uint32 mask) { m_unboundClassMask = mask; }
+
     void InitDisplayIds();
 
     bool IsAtGroupRewardDistance(WorldObject const* pRewardSource) const;
@@ -2842,6 +2848,7 @@ protected:
     ObjectGuid m_lootGuid;
 
     TeamId m_team;
+    uint32 m_unboundClassMask = 0; // Unbound Wrath Edition — see GetUnboundClassMask()
     uint32 m_nextSave; // pussywizard
     uint16 m_additionalSaveTimer; // pussywizard
     uint8 m_additionalSaveMask; // pussywizard

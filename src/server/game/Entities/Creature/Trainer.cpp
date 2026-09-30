@@ -230,7 +230,12 @@ namespace Trainer
             case Type::Class:
             case Type::Pet:
                 // check class for class trainers
-                return player->getClass() == GetTrainerRequirement();
+                if (player->getClass() == GetTrainerRequirement())
+                    return true;
+
+                // Unbound Wrath Edition — also valid for any class this
+                // character has unlocked via the Mentor.
+                return (player->GetUnboundClassMask() & (1u << (GetTrainerRequirement() - 1))) != 0;
             case Type::Mount:
                 // check race for mount trainers
                 return player->getRace() == GetTrainerRequirement();
