@@ -116,6 +116,7 @@ void WorldSession::HandleLfgSetRolesOpcode(WorldPacket& recvData)
     }
     ObjectGuid gguid = group->GetGUID();
     LOG_DEBUG("network", "CMSG_LFG_SET_ROLES: Group [{}], Player [{}], Roles: {}", gguid.ToString(), guid.ToString(), roles);
+    sScriptMgr->OnPlayerLfgSetRoles(GetPlayer(), roles);
     sLFGMgr->UpdateRoleCheck(gguid, guid, roles);
 }
 

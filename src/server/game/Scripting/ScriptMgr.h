@@ -348,6 +348,9 @@ public: /* PlayerScript */
     void OnPlayerTextEmote(Player* player, uint32 textEmote, uint32 emoteNum, ObjectGuid guid);
     void OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck);
     void OnPlayerLogin(Player* player);
+    void OnPlayerOnline(Player* player);
+    void OnPlayerAfterUpdateAllStats(Player* player);
+    void OnPlayerLfgSetRoles(Player* player, uint8& roles);
     void OnPlayerLoadFromDB(Player* player);
     void OnPlayerBeforeLogout(Player* player);
     void OnPlayerLogout(Player* player);

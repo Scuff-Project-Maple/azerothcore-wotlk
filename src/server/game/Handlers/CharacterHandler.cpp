@@ -1129,6 +1129,7 @@ void WorldSession::HandlePlayerLoginFromDB(LoginQueryHolder const& holder)
     }
 
     sScriptMgr->OnPlayerLogin(pCurrChar);
+    sScriptMgr->OnPlayerOnline(pCurrChar);
 
     if (pCurrChar->HasAtLoginFlag(AT_LOGIN_FIRST))
     {

@@ -237,6 +237,9 @@ enum PlayerHook
     PLAYERHOOK_ON_BEFORE_RECEIVE_SPELL_LIST_FROM_TRAINER,
     PLAYERHOOK_ON_GET_TRAINER_SPELL_STATE,
     PLAYERHOOK_ON_AFTER_TRAIN_SPELL,
+    PLAYERHOOK_ON_PLAYER_ONLINE,
+    PLAYERHOOK_ON_AFTER_UPDATE_ALL_STATS,
+    PLAYERHOOK_ON_PLAYER_LFG_SET_ROLES,
     PLAYERHOOK_END
 };
 
@@ -956,6 +959,40 @@ public:
      * @param spellId The id of the trainer spell that was bought
      */
     virtual void OnPlayerAfterTrainSpell(Player* /*player*/, Creature* /*trainer*/, uint32 /*spellId*/) {}
+
+    /**
+     * @brief This hook is called on every player login, immediately after all
+     *        OnPlayerLogin handlers have run, before AT_LOGIN_FIRST processing.
+     *
+     * Deterministic ordering guarantee: registration work that must see the
+     * state produced by OnPlayerLogin scripts must use this hook.
+     *
+     * @param player Contains information about the Player
+     */
+    virtual void OnPlayerOnline(Player* /*player*/) {}
+
+    /**
+     * @brief This hook is called at the very end of Player::UpdateAllStats(),
+     *        after every stat has been recalculated.
+     *
+     * For work that must run exactly once per full stat recalculation (e.g.
+     * school-agnostic spell power or melee crit bases the per-stat hooks
+     * cannot reach).
+     *
+     * @param player Contains information about the Player
+     */
+    virtual void OnPlayerAfterUpdateAllStats(Player* /*player*/) {}
+
+    /**
+     * @brief This hook is called when a player changes their LFG role
+     *        selection (CMSG_LFG_SET_ROLES), before the new roles are stored.
+     *
+     * `roles` is passed by reference so the handler can clamp the mask.
+     *
+     * @param player Contains information about the Player
+     * @param roles The role bitmask selected by the client (lfg::PLAYER_ROLE_*)
+     */
+    virtual void OnPlayerLfgSetRoles(Player* /*player*/, uint8& /*roles*/) {}
 };
 
 #endif

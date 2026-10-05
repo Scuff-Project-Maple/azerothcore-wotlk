@@ -223,6 +223,21 @@ void ScriptMgr::OnPlayerLogin(Player* player)
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOGIN, script->OnPlayerLogin(player));
 }
 
+void ScriptMgr::OnPlayerOnline(Player* player)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_ONLINE, script->OnPlayerOnline(player));
+}
+
+void ScriptMgr::OnPlayerAfterUpdateAllStats(Player* player)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_UPDATE_ALL_STATS, script->OnPlayerAfterUpdateAllStats(player));
+}
+
+void ScriptMgr::OnPlayerLfgSetRoles(Player* player, uint8& roles)
+{
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_LFG_SET_ROLES, script->OnPlayerLfgSetRoles(player, roles));
+}
+
 void ScriptMgr::OnPlayerLoadFromDB(Player* player)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOAD_FROM_DB, script->OnPlayerLoadFromDB(player));

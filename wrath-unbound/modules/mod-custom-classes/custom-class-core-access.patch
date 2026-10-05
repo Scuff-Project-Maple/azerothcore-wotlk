@@ -1,0 +1,132 @@
+diff --git a/src/server/game/Entities/Unit/StatSystem.cpp b/src/server/game/Entities/Unit/StatSystem.cpp
+index 24c025ac6..cb2afc3a8 100644
+--- a/src/server/game/Entities/Unit/StatSystem.cpp
++++ b/src/server/game/Entities/Unit/StatSystem.cpp
+@@ -230,6 +230,8 @@ bool Player::UpdateAllStats()
+     RecalculateRating(CR_ARMOR_PENETRATION);
+     UpdateAllResistances();
+ 
++    sScriptMgr->OnPlayerAfterUpdateAllStats(this);
++
+     return true;
+ }
+ 
+diff --git a/src/server/game/Handlers/CharacterHandler.cpp b/src/server/game/Handlers/CharacterHandler.cpp
+index d2457ccda..38c9bd0c2 100644
+--- a/src/server/game/Handlers/CharacterHandler.cpp
++++ b/src/server/game/Handlers/CharacterHandler.cpp
+@@ -1129,6 +1129,7 @@ void WorldSession::HandlePlayerLoginFromDB(LoginQueryHolder const& holder)
+     }
+ 
+     sScriptMgr->OnPlayerLogin(pCurrChar);
++    sScriptMgr->OnPlayerOnline(pCurrChar);
+ 
+     if (pCurrChar->HasAtLoginFlag(AT_LOGIN_FIRST))
+     {
+diff --git a/src/server/game/Handlers/LFGHandler.cpp b/src/server/game/Handlers/LFGHandler.cpp
+index 98aff9882..d8c58dd8f 100644
+--- a/src/server/game/Handlers/LFGHandler.cpp
++++ b/src/server/game/Handlers/LFGHandler.cpp
+@@ -116,6 +116,7 @@ void WorldSession::HandleLfgSetRolesOpcode(WorldPacket& recvData)
+     }
+     ObjectGuid gguid = group->GetGUID();
+     LOG_DEBUG("network", "CMSG_LFG_SET_ROLES: Group [{}], Player [{}], Roles: {}", gguid.ToString(), guid.ToString(), roles);
++    sScriptMgr->OnPlayerLfgSetRoles(GetPlayer(), roles);
+     sLFGMgr->UpdateRoleCheck(gguid, guid, roles);
+ }
+ 
+diff --git a/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp b/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
+index 33daa9355..a59967cfd 100644
+--- a/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
+@@ -223,6 +223,21 @@ void ScriptMgr::OnPlayerLogin(Player* player)
+     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOGIN, script->OnPlayerLogin(player));
+ }
+ 
++void ScriptMgr::OnPlayerOnline(Player* player)
++{
++    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_ONLINE, script->OnPlayerOnline(player));
++}
++
++void ScriptMgr::OnPlayerAfterUpdateAllStats(Player* player)
++{
++    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_AFTER_UPDATE_ALL_STATS, script->OnPlayerAfterUpdateAllStats(player));
++}
++
++void ScriptMgr::OnPlayerLfgSetRoles(Player* player, uint8& roles)
++{
++    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_LFG_SET_ROLES, script->OnPlayerLfgSetRoles(player, roles));
++}
++
+ void ScriptMgr::OnPlayerLoadFromDB(Player* player)
+ {
+     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOAD_FROM_DB, script->OnPlayerLoadFromDB(player));
+diff --git a/src/server/game/Scripting/ScriptDefines/PlayerScript.h b/src/server/game/Scripting/ScriptDefines/PlayerScript.h
+index cc6ff6499..417ea598a 100644
+--- a/src/server/game/Scripting/ScriptDefines/PlayerScript.h
++++ b/src/server/game/Scripting/ScriptDefines/PlayerScript.h
+@@ -237,6 +237,9 @@ enum PlayerHook
+     PLAYERHOOK_ON_BEFORE_RECEIVE_SPELL_LIST_FROM_TRAINER,
+     PLAYERHOOK_ON_GET_TRAINER_SPELL_STATE,
+     PLAYERHOOK_ON_AFTER_TRAIN_SPELL,
++    PLAYERHOOK_ON_PLAYER_ONLINE,
++    PLAYERHOOK_ON_AFTER_UPDATE_ALL_STATS,
++    PLAYERHOOK_ON_PLAYER_LFG_SET_ROLES,
+     PLAYERHOOK_END
+ };
+ 
+@@ -956,6 +959,40 @@ public:
+      * @param spellId The id of the trainer spell that was bought
+      */
+     virtual void OnPlayerAfterTrainSpell(Player* /*player*/, Creature* /*trainer*/, uint32 /*spellId*/) {}
++
++    /**
++     * @brief This hook is called on every player login, immediately after all
++     *        OnPlayerLogin handlers have run, before AT_LOGIN_FIRST processing.
++     *
++     * Deterministic ordering guarantee: registration work that must see the
++     * state produced by OnPlayerLogin scripts must use this hook.
++     *
++     * @param player Contains information about the Player
++     */
++    virtual void OnPlayerOnline(Player* /*player*/) {}
++
++    /**
++     * @brief This hook is called at the very end of Player::UpdateAllStats(),
++     *        after every stat has been recalculated.
++     *
++     * For work that must run exactly once per full stat recalculation (e.g.
++     * school-agnostic spell power or melee crit bases the per-stat hooks
++     * cannot reach).
++     *
++     * @param player Contains information about the Player
++     */
++    virtual void OnPlayerAfterUpdateAllStats(Player* /*player*/) {}
++
++    /**
++     * @brief This hook is called when a player changes their LFG role
++     *        selection (CMSG_LFG_SET_ROLES), before the new roles are stored.
++     *
++     * `roles` is passed by reference so the handler can clamp the mask.
++     *
++     * @param player Contains information about the Player
++     * @param roles The role bitmask selected by the client (lfg::PLAYER_ROLE_*)
++     */
++    virtual void OnPlayerLfgSetRoles(Player* /*player*/, uint8& /*roles*/) {}
+ };
+ 
+ #endif
+diff --git a/src/server/game/Scripting/ScriptMgr.h b/src/server/game/Scripting/ScriptMgr.h
+index 72a8e103d..9cb35a3fd 100644
+--- a/src/server/game/Scripting/ScriptMgr.h
++++ b/src/server/game/Scripting/ScriptMgr.h
+@@ -348,6 +348,9 @@ public: /* PlayerScript */
+     void OnPlayerTextEmote(Player* player, uint32 textEmote, uint32 emoteNum, ObjectGuid guid);
+     void OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck);
+     void OnPlayerLogin(Player* player);
++    void OnPlayerOnline(Player* player);
++    void OnPlayerAfterUpdateAllStats(Player* player);
++    void OnPlayerLfgSetRoles(Player* player, uint8& roles);
+     void OnPlayerLoadFromDB(Player* player);
+     void OnPlayerBeforeLogout(Player* player);
+     void OnPlayerLogout(Player* player);

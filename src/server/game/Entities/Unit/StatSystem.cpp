@@ -230,6 +230,8 @@ bool Player::UpdateAllStats()
     RecalculateRating(CR_ARMOR_PENETRATION);
     UpdateAllResistances();
 
+    sScriptMgr->OnPlayerAfterUpdateAllStats(this);
+
     return true;
 }
 
