@@ -232,8 +232,7 @@ write token; tracked on the PRO-9 thread).
 ```bash
 git clone --branch=Playerbot https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git azerothcore
 cd azerothcore
-git log --oneline -4   # head must be at/after ae1d9e5d0; expect:
-                       # ae1d9e5d0, ad3393eb7, 9c0db4ef6, deaf1109c
+git log --oneline -4   # head must be at/after ae1d9e5d0 (newer heads are fine)
 
 git clone --depth 1 https://github.com/Scuff-Project-Maple/mod-playerbots.git --branch=master modules/mod-playerbots
 git clone https://github.com/Scuff-Project-Maple/mod-ale.git modules/mod-ale
