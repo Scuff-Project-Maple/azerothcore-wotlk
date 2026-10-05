@@ -222,7 +222,9 @@ available as `upstream` remotes on the provisioned tree.
 flow stages is committed on that branch: the in-tree core hook patches
 (mod-unbound + mod-custom-classes), the `wrath-unbound/` snapshot (both
 modules + confs), `docs/custom-class-template.md`, and the PRO-10 Warden
-seed. The clone must reach at least `9c0db4ef6` (PRO-9 DDL re-apply fix).
+seed. The clone must reach at least `ae1d9e5d0` (PRO-9 mod-unbound
+patch vendor — the pinned-base variant below pulls the snapshot from
+there, so it must contain the staged `unbound-core-access.patch`).
 While the execution workspace is ahead of the fork, sync it first —
 `git push origin Playerbot` from the execution workspace (needs a GitHub
 write token; tracked on the PRO-9 thread).
@@ -230,8 +232,8 @@ write token; tracked on the PRO-9 thread).
 ```bash
 git clone --branch=Playerbot https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git azerothcore
 cd azerothcore
-git log --oneline -4   # head must be at/after 9c0db4ef6; expect:
-                       # 9c0db4ef6, deaf1109c, b732dfd71, 8c16d1194
+git log --oneline -4   # head must be at/after ae1d9e5d0; expect:
+                       # ae1d9e5d0, ad3393eb7, 9c0db4ef6, deaf1109c
 
 git clone --depth 1 https://github.com/Scuff-Project-Maple/mod-playerbots.git --branch=master modules/mod-playerbots
 git clone https://github.com/Scuff-Project-Maple/mod-ale.git modules/mod-ale
@@ -263,13 +265,13 @@ grep -n '^ValidateSkillLearnedBySpells' src/server/apps/worldserver/worldserver.
 
 Same clone, then pin the pre-company base `7f12e89ee`. The `wrath-unbound/`
 snapshot does not exist at that commit, so pull the payload files forward
-from `9c0db4ef6`, stage modules + confs exactly as in the primary flow
+from `ae1d9e5d0`, stage modules + confs exactly as in the primary flow
 above, then apply both core patches in this order (verified 2026-10-05,
 both `git apply --check` clean on the base):
 
 ```bash
 git checkout 7f12e89ee5f467a50e62eba1d525eac7dc953d03
-git checkout 9c0db4ef6 -- wrath-unbound docs/custom-class-template.md data/sql/updates/pending_db_world
+git checkout ae1d9e5d0 -- wrath-unbound docs/custom-class-template.md data/sql/updates/pending_db_world
 git apply modules/mod-unbound/unbound-core-access.patch
 git apply modules/mod-custom-classes/custom-class-core-access.patch
 sed -i 's/^ValidateSkillLearnedBySpells.*/ValidateSkillLearnedBySpells = 0/' src/server/apps/worldserver/worldserver.conf.dist
