@@ -43,17 +43,19 @@ Fork heads verified against the pins: `azerothcore-wotlk` `Playerbot` @
 `master` is at upstream HEAD; check out the pinned `1cb86c96…` when
 provisioning — see table above).
 
-**Push status:** the 4 T1 commits (`f5b197b8d`, `7c40d8102`, `0f5a3955a`,
-`2bfcc80c7` + this doc update) are ahead of `origin/Playerbot` in this tree.
+**Push status (2026-10-05):** the T1/Wrath-Unbound commits (`f5b197b8d`,
+`7c40d8102`, `0f5a3955a`, `2bfcc80c7`, `8c16d1194`) are in the fork —
+`origin/Playerbot` is at `8c16d1194`. Three commits are still ahead of the
+fork: `b732dfd71` (PRO-9 `mod-custom-classes` module, including the
+in-tree core hook patch), `deaf1109c` (PRO-10 Warden seed + validation),
+`9c0db4ef6` (PRO-9 DDL re-apply fix) — plus this doc update when it lands.
 Pushing to the fork is pending the company's managed GitHub identity being
 completed in Paperclip ("The managed GitHub identity is incomplete" from the
 git credential broker; no agent secret or gh auth available in the sandbox).
-The push is a clean fast-forward (`origin/Playerbot` = pinned base
-`7f12e89e…`). Until it lands, treat the provisioned tree in the shared
-project workspace as the source of truth; after it lands, a clean clone of
-the fork's `Playerbot` branch carries the tracked content (core-patch
-`worldserver.conf.dist` change, this doc, `wrath-unbound/` snapshot, and the
-tracked patch file under `modules/mod-unbound/`).
+The push will be a clean fast-forward. Until it lands, treat the tree in the
+shared project workspace as the source of truth; the
+[Reprovisioning](#reprovisioning-from-a-clean-clone-e-g-on-the-new-docker-host)
+flow states the fork-sync prerequisite explicitly.
 
 ## Provisioned tree layout
 
@@ -66,18 +68,23 @@ and the `wrath-unbound/` snapshot are tracked in git.
 ```
 <repo root>  (= this checkout of azerothcore-wotlk @ 7f12e89e…)
 ├── modules/
-│   ├── mod-unbound/                      # Wrath Unbound C++ module (staged, not committed by fork design)
-│   │   ├── src/UnboundSystem.cpp         #   PLAYERHOOK_ON_LOGIN builds m_unboundClassMask
-│   │   ├── src/UnboundSystem_loader.cpp  #   Addmod_unboundScripts() (auto-collected build; no CMakeLists needed)
-│   │   ├── npc_setup.sql                 #   Mentor NPC creature_template 900001 (apply before first start)
-│   │   ├── data/sql/db-world/01..14_*.sql
-│   │   ├── data/sql/db-characters/01_unbound_characters.sql
-│   │   └── unbound-core-access.patch     #   6-file core patch (already applied, kept for re-apply after rebases)
-│   ├── mod-ale/                          # nested git repo @ 1cb86c96…
-│   └── mod-playerbots/                   # nested git repo @ 7bae1b5c… (depth-1 master)
-├── env/dist/etc/modules/
-│   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
-│   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
+ │   ├── mod-unbound/                      # Wrath Unbound C++ module (staged, not committed by fork design)
+ │   │   ├── src/UnboundSystem.cpp         #   PLAYERHOOK_ON_LOGIN builds m_unboundClassMask
+ │   │   ├── src/UnboundSystem_loader.cpp  #   Addmod_unboundScripts() (auto-collected build; no CMakeLists needed)
+ │   │   ├── npc_setup.sql                 #   Mentor NPC creature_template 900001 (apply before first start)
+ │   │   ├── data/sql/db-world/01..14_*.sql
+ │   │   ├── data/sql/db-characters/01_unbound_characters.sql
+ │   │   └── unbound-core-access.patch     #   6-file core patch (in-tree on Playerbot, kept for re-apply after rebases)
+ │   ├── mod-custom-classes/               # data-driven custom class engine (PRO-9; staged from snapshot)
+ │   │   ├── src/CustomClassSystem*.cpp    #   registry + player hooks (auto-collected build; no CMakeLists needed)
+ │   │   ├── data/sql/db-world/01_custom_class_template.sql  # table DDL (DB-updater auto-applies)
+ │   │   └── custom-class-core-access.patch  # 6-file core hook patch (in-tree on Playerbot, kept for re-apply after rebases)
+ │   ├── mod-ale/                          # nested git repo @ 1cb86c96…
+ │   └── mod-playerbots/                   # nested git repo @ 7bae1b5c… (depth-1 master)
+ ├── env/dist/etc/modules/
+ │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
+ │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
+ │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
 ├── docker-compose.override.yml           # Playerbots env (random bots 1600–2000, DB auto-updates), ./modules mount
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
@@ -136,6 +143,13 @@ done
 docker exec -i ac-database mysql -u root -ppassword acore_characters < "$SQL/db-characters/01_unbound_characters.sql"
 docker exec -i ac-database mysql -u root -ppassword acore_world < modules/mod-unbound/npc_setup.sql
 ```
+
+Note: the custom-class tables are **not** part of this manual order.
+`modules/mod-custom-classes/data/sql/db-world/01_custom_class_template.sql`
+and `data/sql/updates/pending_db_world/2026_10_05_*.sql` (PRO-10 Warden
+seed + validation) are auto-applied by the world DB updater at
+worldserver startup (module + pending update types); both are
+re-apply-safe by construction.
 
 DB root password is `password` (stock default; override with
 `DOCKER_DB_ROOT_PASSWORD` in a `.env` file at the repo root if you change it).
@@ -204,29 +218,60 @@ menu (class unlock ladder: free at 5, 3g at 25, 80g at 50, 300g at 70,
 Clone from the company forks (`Scuff-Project-Maple`); the upstreams remain
 available as `upstream` remotes on the provisioned tree.
 
+**Prerequisite — the fork's `Playerbot` must be current.** Everything this
+flow stages is committed on that branch: the in-tree core hook patches
+(mod-unbound + mod-custom-classes), the `wrath-unbound/` snapshot (both
+modules + confs), `docs/custom-class-template.md`, and the PRO-10 Warden
+seed. The clone must reach at least `9c0db4ef6` (PRO-9 DDL re-apply fix).
+While the execution workspace is ahead of the fork, sync it first —
+`git push origin Playerbot` from the execution workspace (needs a GitHub
+write token; tracked on the PRO-9 thread).
+
 ```bash
 git clone --branch=Playerbot https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git azerothcore
-cd azerothcore && git checkout 7f12e89ee5f467a50e62eba1d525eac7dc953d03
+cd azerothcore
+git log --oneline -4   # head must be at/after 9c0db4ef6; expect:
+                       # 9c0db4ef6, deaf1109c, b732dfd71, 8c16d1194
 
 git clone --depth 1 https://github.com/Scuff-Project-Maple/mod-playerbots.git --branch=master modules/mod-playerbots
 git clone https://github.com/Scuff-Project-Maple/mod-ale.git modules/mod-ale
 git -C modules/mod-ale checkout 1cb86c9600260c3731c96dc3c98d25b4fc3f2153
 
-# stage the tracked Wrath Unbound snapshot (see wrath-unbound/README.md for the mapping)
+# stage the gitignored build-time copies of the tracked Wrath Unbound
+# snapshot (see wrath-unbound/README.md for the mapping)
 cp -r wrath-unbound/modules/mod-unbound modules/
+cp -r wrath-unbound/modules/mod-custom-classes modules/
 mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
+cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
 cp wrath-unbound/docker-compose.override.yml .
 
-# core patch (6 files: Player.h/.cpp, Trainer.cpp, PlayerQuest.cpp,
-# PlayerStorage.cpp, ConditionMgr.cpp). Idempotence check afterwards:
-#   grep -n GetUnboundClassMask src/server/game/Entities/Player/Player.h
-git apply modules/mod-unbound/unbound-core-access.patch
+# the core hook patches are committed IN-TREE on Playerbot
+# (f5b197b8d mod-unbound, 6 files; b732dfd71 mod-custom-classes, 6 files)
+# — verify, do NOT re-apply:
+grep -n GetUnboundClassMask src/server/game/Entities/Player/Player.h
+grep -n OnPlayerAfterUpdateAllStats src/server/game/Entities/Unit/StatSystem.cpp
+grep -n OnPlayerLfgSetRoles src/server/game/Handlers/LFGHandler.cpp
 
 # ValidateSkillLearnedBySpells = 0 is baked into the tracked
-# src/server/apps/worldserver/worldserver.conf.dist in this tree;
-# if reprovisioning onto a vanilla checkout, also set:
+# src/server/apps/worldserver/worldserver.conf.dist in this tree:
+grep -n '^ValidateSkillLearnedBySpells' src/server/apps/worldserver/worldserver.conf.dist
+```
+
+### Variant — pure upstream base (e.g. upstream-merge test)
+
+Same clone, then pin the pre-company base `7f12e89ee`. The `wrath-unbound/`
+snapshot does not exist at that commit, so pull the payload files forward
+from `9c0db4ef6`, stage modules + confs exactly as in the primary flow
+above, then apply both core patches in this order (verified 2026-10-05,
+both `git apply --check` clean on the base):
+
+```bash
+git checkout 7f12e89ee5f467a50e62eba1d525eac7dc953d03
+git checkout 9c0db4ef6 -- wrath-unbound docs/custom-class-template.md data/sql/updates/pending_db_world
+git apply modules/mod-unbound/unbound-core-access.patch
+git apply modules/mod-custom-classes/custom-class-core-access.patch
 sed -i 's/^ValidateSkillLearnedBySpells.*/ValidateSkillLearnedBySpells = 0/' src/server/apps/worldserver/worldserver.conf.dist
 ```
 
@@ -272,9 +317,10 @@ verify per the sections above.
 
 - [x] AzerothCore 3.3.5a cloned from the Playerbots base; URL+branch+commit recorded above
 - [x] `docker-compose.yml` stack present (stock file; services ac-database / ac-authserver / ac-worldserver + db-import + client-data-init)
-- [x] mod-unbound C++ module staged; core patch applied (6 files, verified by `grep GetUnboundClassMask src/server/game/Entities/Player/Player.h`)
+- [x] mod-unbound C++ module staged; core patch in-tree on Playerbot (6 files, verified by `grep GetUnboundClassMask src/server/game/Entities/Player/Player.h`)
+- [x] mod-custom-classes C++ module staged (PRO-9); core hook patch in-tree on Playerbot (6 files, verified by `grep OnPlayerAfterUpdateAllStats src/server/game/Entities/Unit/StatSystem.cpp`)
 - [x] Mentor Lua staged where ALE scans; `mod_ale.conf` with `ALE.Enabled = 1` + absolute `ALE.ScriptPath`
-- [x] SQL migrations staged with documented apply order
+- [x] SQL migrations staged with documented apply order (custom-class DDL + PRO-10 seed auto-apply via the DB updater)
 - [x] `ValidateSkillLearnedBySpells = 0`
 - [x] Setup doc in the repo (this file)
 - [ ] Build worldserver (pending Docker host — D1)
