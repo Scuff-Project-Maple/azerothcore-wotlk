@@ -270,10 +270,11 @@ both `git apply --check` clean on the base):
 
 ```bash
 git checkout 7f12e89ee5f467a50e62eba1d525eac7dc953d03
-git checkout ae1d9e5d0 -- wrath-unbound docs/custom-class-template.md data/sql/updates/pending_db_world
+# the forward-pull also brings worldserver.conf.dist, which carries the
+# company's ValidateSkillLearnedBySpells = 0 (see D2) — no sed needed
+git checkout ae1d9e5d0 -- wrath-unbound docs/custom-class-template.md data/sql/updates/pending_db_world src/server/apps/worldserver/worldserver.conf.dist
 git apply modules/mod-unbound/unbound-core-access.patch
 git apply modules/mod-custom-classes/custom-class-core-access.patch
-sed -i 's/^ValidateSkillLearnedBySpells.*/ValidateSkillLearnedBySpells = 0/' src/server/apps/worldserver/worldserver.conf.dist
 ```
 
 Then `docker compose up -d --build`, apply the SQL migrations above, and
