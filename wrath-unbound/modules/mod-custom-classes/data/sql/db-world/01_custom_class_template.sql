@@ -12,6 +12,11 @@
 --
 -- No seed rows here: Warden (and any other shipped class) is seeded by
 -- PRO-10 (SQL schema + migrations + Warden seed).
+--
+-- Re-apply safe: module SQL files are re-applied in full whenever the file
+-- hash changes, so every key lives in the CREATE TABLE body. No standalone
+-- ALTER statements in this file (an unguarded ADD UNIQUE KEY dies with
+-- "Duplicate key name" on re-apply).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS `custom_class_template` (
@@ -33,8 +38,7 @@ CREATE TABLE IF NOT EXISTS `custom_class_template` (
     `armor_prof_mask` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'ItemSubClass_Armor bitmask. Granted on login.',
     `unbound_mask_bit` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Single bit in 2048..2147483648 (1<<11..1<<31); unique across rows. OR-ed into Player::GetUnboundClassMask() so existing unbound consult sites (trainer/quest/condition/item class checks) accept the custom class.',
     `enabled` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = row ignored at load (template disabled without deleting data).',
-    `description` TEXT COMMENT 'Free-form designer notes.'
+    `description` TEXT COMMENT 'Free-form designer notes.',
+    PRIMARY KEY (`template_key`),
+    UNIQUE KEY `uq_custom_class_template_backing` (`backing_class`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-ALTER TABLE `custom_class_template`
-    ADD UNIQUE KEY `uq_custom_class_template_backing` (`backing_class`);
