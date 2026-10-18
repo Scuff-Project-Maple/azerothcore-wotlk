@@ -61,18 +61,27 @@ namespace
         double number = 0.0;
         std::string string;
         std::vector<JsonNode> items;
-        std::vector<std::pair<std::string, JsonNode>> members;
+        struct Member;
+        std::vector<Member> members;
 
-        JsonNode const* Find(std::string const& key) const
-        {
-            if (type != Type::Object)
-                return nullptr;
-            for (auto const& member : members)
-                if (member.first == key)
-                    return &member.second;
-            return nullptr;
-        }
+        JsonNode const* Find(std::string const& key) const;
     };
+
+    struct JsonNode::Member
+    {
+        std::string first;
+        JsonNode second;
+    };
+
+    JsonNode const* JsonNode::Find(std::string const& key) const
+    {
+        if (type != Type::Object)
+            return nullptr;
+        for (auto const& member : members)
+            if (member.first == key)
+                return &member.second;
+        return nullptr;
+    }
 
     bool IsWholeNumber(double value)
     {
