@@ -31,36 +31,36 @@ revision `e98e7a97e3f2+` on the Playerbot branch with ACDB 335.16-dev
 (2026-05-29). Verified `e98e7a97e3f2` is an ancestor of the pinned commit
 `7f12e89e…` in this checkout.
 
-## Git remotes (updated 2026-09-30, per board request)
+## Git remotes (updated 2026-10-18)
 
-The company forks live in the `Scuff-Project-Maple` GitHub org. All working
-remotes now point at the forks; the upstreams are kept as an `upstream`
-remote for merges (every core patch remains a merge risk against upstream).
+The company forks live in the `Scuff-Project-Maple` GitHub org. `origin` in
+every repo in this tree points at the fork; that is the only remote
+configured. The `upstream` remotes that existed in early October were
+removed on 2026-10-01 (board decision in the PRO-7 thread). The upstream
+source URLs are kept below for provenance only (every core patch remains a
+merge risk against them); add a temporary `upstream` remote for an upstream
+merge and remove it again afterwards.
 
-| Repo | `origin` (working) | `upstream` (reference) |
+| Repo | `origin` (working) | Upstream source (provenance, no remote) |
 |---|---|---|
 | azerothcore-wotlk (this tree, branch `Playerbot`) | `https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git` | `https://github.com/mod-playerbots/azerothcore-wotlk.git` |
 | `modules/mod-ale` (nested repo) | `https://github.com/Scuff-Project-Maple/mod-ale.git` | `https://github.com/azerothcore/mod-ale.git` |
 | `modules/mod-playerbots` (nested repo) | `https://github.com/Scuff-Project-Maple/mod-playerbots.git` | `https://github.com/mod-playerbots/mod-playerbots.git` |
 
-Fork heads verified against the pins: `azerothcore-wotlk` `Playerbot` @
-`7f12e89e…`, `mod-playerbots` `master` @ `7bae1b5c…` (the `mod-ale` fork's
-`master` is at upstream HEAD; check out the pinned `1cb86c96…` when
-provisioning — see table above).
+The fork `Playerbot` branch intentionally diverges from the pinned base
+(`7f12e89e…`, see table above): it carries the company's T1/Wrath-Unbound
+commits on top of it. `mod-playerbots` fork `master` tracks `7bae1b5c…`;
+the `mod-ale` fork's `master` is at upstream HEAD — check out the pinned
+`1cb86c96…` when provisioning.
 
-**Push status (2026-10-05):** the T1/Wrath-Unbound commits (`f5b197b8d`,
-`7c40d8102`, `0f5a3955a`, `2bfcc80c7`, `8c16d1194`) are in the fork —
-`origin/Playerbot` is at `8c16d1194`. Three commits are still ahead of the
-fork: `b732dfd71` (PRO-9 `mod-custom-classes` module, including the
-in-tree core hook patch), `deaf1109c` (PRO-10 Warden seed + validation),
-`9c0db4ef6` (PRO-9 DDL re-apply fix) — plus this doc update when it lands.
-Pushing to the fork is pending the company's managed GitHub identity being
-completed in Paperclip ("The managed GitHub identity is incomplete" from the
-git credential broker; no agent secret or gh auth available in the sandbox).
-The push will be a clean fast-forward. Until it lands, treat the tree in the
-shared project workspace as the source of truth; the
-[Reprovisioning](#reprovisioning-from-a-clean-clone-e-g-on-the-new-docker-host)
-flow states the fork-sync prerequisite explicitly.
+**Push status (2026-10-18):** the fork is current with the shared project
+workspace — `origin/Playerbot` carries the T1/Wrath-Unbound base
+(`f5b197b8d`–`8c16d1194`), the PRO-9/PRO-10 module + SQL work
+(`b732dfd71`–`e0a4b88e6`), the PRO-3/PRO-16/PRO-20 docs
+(`e025c7dc9`–`f76e13468`), and this remotes-table fix. Pushes go through
+the company's managed GitHub identity (PRO-7); the fork is the source of
+truth for reprovisioning — see
+[Reprovisioning](#reprovisioning-from-a-clean-clone-e-g-on-the-new-docker-host).
 
 ## Provisioned tree layout
 
