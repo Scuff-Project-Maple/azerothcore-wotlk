@@ -702,7 +702,7 @@ namespace CustomClasses
     {
         std::unordered_set<uint32> existingTalents;
         for (auto const& item : sTalentStore)
-            existingTalents.insert(item.second.TalentID);
+            existingTalents.insert(item.second->TalentID);
 
         int removed = 0;
         for (auto it = m_byClass.begin(); it != m_byClass.end();)
@@ -787,33 +787,33 @@ namespace CustomClasses
 
         for (auto const& item : sTalentStore)
         {
-            TalentEntry const& entry = item.second;
-            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(entry.TalentTab);
+            TalentEntry const* entry = item.second;
+            TalentTabEntry const* tab = sTalentTabStore.LookupEntry(entry->TalentTab);
             if (!tab || (tab->ClassMask & classBit) == 0)
                 continue;
 
             bool const covered = std::any_of(t.specs.begin(), t.specs.end(),
-                [&](Spec const& s) { return s.talentTree == entry.TalentTab; });
+                [&](Spec const& s) { return s.talentTree == entry->TalentTab; });
             if (!covered)
                 continue;
 
-            pool.insert(entry.TalentID);
-            for (uint32 rankSpell : entry.RankID)
+            pool.insert(entry->TalentID);
+            for (uint32 rankSpell : entry->RankID)
                 if (rankSpell != 0)
                     pool.insert(rankSpell);
-            if (entry.addToSpellBook != 0)
-                pool.insert(entry.addToSpellBook);
+            if (entry->addToSpellBook != 0)
+                pool.insert(entry->addToSpellBook);
 
             for (auto const& s : t.specs)
             {
-                if (s.talentTree != entry.TalentTab || !s.spellWhitelisted(entry.TalentID))
+                if (s.talentTree != entry->TalentTab || !s.spellWhitelisted(entry->TalentID))
                     continue;
-                allowed.insert(entry.TalentID);
-                for (uint32 rankSpell : entry.RankID)
+                allowed.insert(entry->TalentID);
+                for (uint32 rankSpell : entry->RankID)
                     if (rankSpell != 0)
                         allowed.insert(rankSpell);
-                if (entry.addToSpellBook != 0)
-                    allowed.insert(entry.addToSpellBook);
+                if (entry->addToSpellBook != 0)
+                    allowed.insert(entry->addToSpellBook);
             }
         }
 
