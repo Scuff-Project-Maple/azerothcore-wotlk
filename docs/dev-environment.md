@@ -169,32 +169,38 @@ A healthy boot ends with `[UNBOUND] Prereq map built.` and the stock
 `ready...` marker. `ValidateSkillLearnedBySpells = 0` was confirmed in
 `env/dist/etc/worldserver.conf` on the host.
 
-### Host tree layout (provenance gap)
+### Host tree layout (resynced to fork head, 2026-10-18)
 
-The host tree at `/mnt/data/wow-server` is **not** byte-identical to the
-provisioned tree described in this doc. The host layout is authoritative for
-*running* the stack; the pinned-revision gap below is an **open provenance
-question owned by [PRO-2](/PRO/issues/PRO-2)**. Do not "fix" it by
-rebuilding or re-cloning — the host holds the running server, and that call
-belongs to PRO-2.
+The host tree at `/mnt/data/wow-server` was resynced to the fork on
+2026-10-18 as the closing step of
+[PRO-2](/PRO/issues/PRO-2). It now matches the provisioned layout in this
+doc:
 
-| Item | Doc (PRO-2 pinned) | Host reality (verified 2026-10-18) |
-|---|---|---|
-| Core | Playerbot fork @ `7f12e89ee5f4` | @ `06234df3d5ab` (branch `Playerbot`, "Merge pull request #246 from mod-playerbots/test-staging", 2026-09-11) with the 6-file unbound core patch **applied but uncommitted** in the working tree |
-| Modules | separate pinned clones: mod-ale @ `1cb86c960026`, mod-playerbots @ `7bae1b5c58c7` | in-tree plain source trees: `modules/mod-ale`, `modules/mod-arac`, `modules/mod-playerbots`, `modules/mod-unbound` (no `.git` in any of them) |
-| Wrath Unbound | tracked payload snapshot + 6-file core patch | `modules/mod-unbound` (`src/`, `data/`, `npc_setup.sql`, `unbound-core-access.patch`) + the uncommitted working-tree patch |
+| Item | State (verified 2026-10-18) |
+|---|---|
+| Core | branch `Playerbot` @ fork head (in-tree core hook patches committed: `f5b197b8d` unbound, `b732dfd71` custom-classes) |
+| Git remotes | `origin` → `https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git` (the previous base-repo remote was replaced) |
+| Modules | plain source trees staged from the pinned/fork-snapshot sources: `mod-ale` @ `1cb86c960026`, `mod-playerbots` @ `7bae1b5c58c7`, `mod-unbound` + `mod-custom-classes` from the tracked `wrath-unbound/` snapshot, plus host-only `mod-arac` (kept) |
+| Conf | `env/dist/etc/modules/mod_ale.conf`, `mod_custom_classes.conf`, `lua_scripts/unbound_mentor.lua` in place; live `worldserver.conf` untouched |
+
+Before the resync, safety artifacts were written to
+`/mnt/data/backups/pre-fork-resync-20261018/`: a gzip-verified dump of all
+four databases, and the full pre-reset worktree patch (12 files — the
+committed core patches **plus** an in-progress hook variant belonging to
+[PRO-9](/PRO/issues/PRO-9), re-land it from there if still wanted).
 
 Consequences for anyone working on the host:
 
 - The `acore/ac-wotlk-worldserver:master` and
   `acore/ac-wotlk-authserver:master` images are **locally built from this
-  tree**, not Docker Hub pulls (banner: `AzerothCore rev. 06234df3d5ab+ …
-  (Playerbot branch)` — the `+` is the uncommitted patch).
-- The host tree has **no** `mod-custom-classes` (PRO-9) module or conf —
-  only the modules listed above.
-- A `git checkout`/`git reset` in `/mnt/data/wow-server` would discard the
-  uncommitted unbound patch the running server was built from. Treat the
-  working tree as live content.
+  tree**, not Docker Hub pulls. Until the resync rebuild finishes, the
+  running server still reports the pre-resync revision banner — a stale
+  banner is not a provenance problem.
+- `mod-custom-classes` is staged and enabled (`CustomClasses.Enabled = true`);
+  its two build-blocking snapshot bugs were fixed on the fork
+  (`f484ebf21`, `3ba856b98`).
+- The tree is now plain fork content: `git checkout`/`git reset` are safe
+  (untracked: `MY_SERVER.txt`, build logs).
 
 ## First-boot SQL migrations (one-time, idempotent)
 
@@ -301,8 +307,9 @@ menu (class unlock ladder: free at 5, 3g at 25, 80g at 50, 300g at 70,
 > Do not re-clone or rebuild the host to close the gap — that is
 > [PRO-2](/PRO/issues/PRO-2)'s call, and the host holds the running server.
 
-Clone from the company forks (`Scuff-Project-Maple`); the upstreams remain
-available as `upstream` remotes on the provisioned tree.
+Clone from the company forks (`Scuff-Project-Maple`); no `upstream` remotes
+are configured on the provisioned tree (removed 2026-10-01, board decision —
+see [Git remotes](#git-remotes-updated-2026-10-18)).
 
 **Prerequisite — the fork's `Playerbot` must be current.** Everything this
 flow stages is committed on that branch: the in-tree core hook patches
@@ -312,8 +319,8 @@ seed. The clone must reach at least `ae1d9e5d0` (PRO-9 mod-unbound
 patch vendor — the pinned-base variant below pulls the snapshot from
 there, so it must contain the staged `unbound-core-access.patch`).
 While the execution workspace is ahead of the fork, sync it first —
-`git push origin Playerbot` from the execution workspace (needs a GitHub
-write token; tracked on the PRO-9 thread).
+`git push origin Playerbot` from the execution workspace (pushes go through
+the company's managed GitHub identity, [PRO-7](/PRO/issues/PRO-7)).
 
 ```bash
 git clone --branch=Playerbot https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git azerothcore
