@@ -400,6 +400,16 @@ verify per the sections above.
   immutable; module work lives under `modules/`; C++ is 4-space, no tabs,
   LF, ≤120 cols.
 - All git commits in this tree carry `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+- **Docker-only on the build host (board rule, [PRO-6](/PRO/issues/PRO-6)):** all
+  deployments on `192.168.1.71` happen inside Docker containers — no code
+  executes on that machine natively. Host facts: [Build host](#build-host).
+- **Canonical agent access path:** `ssh 192.168.1.71 '<docker command>'` —
+  build, apply SQL, and read logs from there. Do not ssh in and run a
+  host-local compiler.
+- **Prohibited on the host:** a `cmake`/`make`/gcc build tree, binaries run
+  outside a container, and any `docker`-alternative that shells out to a
+  host-local toolchain. `docker compose up -d --build` is fine — it compiles
+  inside a container, which is exactly what the board wants.
 
 ## Acceptance checklist (PRO-2)
 
