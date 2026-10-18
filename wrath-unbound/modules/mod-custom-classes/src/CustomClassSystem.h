@@ -81,9 +81,9 @@ namespace CustomClasses
     {
         StatCurve melee;
         StatCurve ranged;
-        uint32 ValueAt(bool ranged, uint8 level) const
+        uint32 ValueAt(bool useRanged, uint8 level) const
         {
-            if (ranged && !ranged.empty())
+            if (useRanged && !ranged.empty())
                 return ranged.ValueAt(level);
             return melee.ValueAt(level);
         }
