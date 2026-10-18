@@ -10,6 +10,11 @@ docs). **Build, boot, and in-game verification are pending a Docker-capable
 host** — the agent sandbox where this was provisioned has no Docker, no root,
 no C/C++ toolchain (see Deviations, D1).
 
+**Build host:** the stack now runs on a provisioned Docker host — see
+[Build host](#build-host). The host tree differs from this doc's pinned
+tree; that gap is documented in the Build host section and is an open
+provenance question owned by [PRO-2](/PRO/issues/PRO-2).
+
 ---
 
 ## Pinned references (the team depends on these)
@@ -98,6 +103,9 @@ Services (from the stock `docker-compose.yml`, all started by one command):
 
 ## Build & run
 
+All commands in this section run **on the [build host](#build-host)**, over
+BatchMode SSH (agent sandboxes have no Docker).
+
 One documented command from a provisioned tree (fresh image build; 2–4 h on
 a typical host, less on the Steam Deck baseline the guide targets):
 
@@ -116,6 +124,77 @@ docker compose up -d --force-recreate ac-worldserver
 
 Stop/start without rebuild: `docker compose stop ac-worldserver` /
 `docker compose start ac-worldserver`.
+
+## Build host
+
+The live stack runs on a provisioned Docker host. All builds, boots, log
+checks, and in-game tests happen there — agent sandboxes have no Docker.
+Reachability from an agent run was re-verified by QA on 2026-10-18
+([PRO-16](/PRO/issues/PRO-16)); re-verify after any host-side change.
+
+| Property | Value |
+|---|---|
+| Address | `192.168.1.71` (hostname `pve-wow-dev`) |
+| SSH | `ssh 192.168.1.71` — already configured in `~/.ssh/config` (no `-i` needed) |
+| User | `scuff-dev` (member of groups `scuff-dev`, `sudo`, `docker`) |
+| Key | `~/.ssh/id_ed25519_pve_wow_dev` (referenced by the `~/.ssh/config` entry) |
+| OS | Ubuntu 24.04.2 LTS, kernel 6.8.0-146-generic |
+| Docker | Engine 29.8.0, storage driver `overlayfs` |
+| Compose | v5.5.1 |
+| CPU / RAM | 8 cores / 23 GB total (17 GB available at check) |
+| Disk | `/` = 61 GB (35 GB free); **`/mnt/data` = 251 GB (215 GB free)** |
+| Outbound net | github.com `200`, registry-1.docker.io reachable |
+| Compose root | `/mnt/data/wow-server` |
+| Published ports | worldserver `8085` (+ client-data `7878`), authserver `3724`; ac-database also publishes `3306` |
+
+Access model is **SSH**, not an exposed Docker API. Agents run
+non-interactive, so always use BatchMode. The one-liner to check the stack:
+
+```bash
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && docker compose ps'
+```
+
+Expected: `ac-worldserver`, `ac-authserver`, `ac-database` (healthy) all
+`Up`. `portainer_agent` and `rathole-client` also run on this host but in a
+separate compose project, so they do not appear in that command.
+
+The [Verification](#verification-what-healthy-looks-like) section applies
+unchanged on this host; the canonical quick check:
+
+```bash
+ssh -o BatchMode=yes 192.168.1.71 'docker logs ac-worldserver | grep UNBOUND'
+```
+
+A healthy boot ends with `[UNBOUND] Prereq map built.` and the stock
+`ready...` marker. `ValidateSkillLearnedBySpells = 0` was confirmed in
+`env/dist/etc/worldserver.conf` on the host.
+
+### Host tree layout (provenance gap)
+
+The host tree at `/mnt/data/wow-server` is **not** byte-identical to the
+provisioned tree described in this doc. The host layout is authoritative for
+*running* the stack; the pinned-revision gap below is an **open provenance
+question owned by [PRO-2](/PRO/issues/PRO-2)**. Do not "fix" it by
+rebuilding or re-cloning — the host holds the running server, and that call
+belongs to PRO-2.
+
+| Item | Doc (PRO-2 pinned) | Host reality (verified 2026-10-18) |
+|---|---|---|
+| Core | Playerbot fork @ `7f12e89ee5f4` | @ `06234df3d5ab` (branch `Playerbot`, "Merge pull request #246 from mod-playerbots/test-staging", 2026-09-11) with the 6-file unbound core patch **applied but uncommitted** in the working tree |
+| Modules | separate pinned clones: mod-ale @ `1cb86c960026`, mod-playerbots @ `7bae1b5c58c7` | in-tree plain source trees: `modules/mod-ale`, `modules/mod-arac`, `modules/mod-playerbots`, `modules/mod-unbound` (no `.git` in any of them) |
+| Wrath Unbound | tracked payload snapshot + 6-file core patch | `modules/mod-unbound` (`src/`, `data/`, `npc_setup.sql`, `unbound-core-access.patch`) + the uncommitted working-tree patch |
+
+Consequences for anyone working on the host:
+
+- The `acore/ac-wotlk-worldserver:master` and
+  `acore/ac-wotlk-authserver:master` images are **locally built from this
+  tree**, not Docker Hub pulls (banner: `AzerothCore rev. 06234df3d5ab+ …
+  (Playerbot branch)` — the `+` is the uncommitted patch).
+- The host tree has **no** `mod-custom-classes` (PRO-9) module or conf —
+  only the modules listed above.
+- A `git checkout`/`git reset` in `/mnt/data/wow-server` would discard the
+  uncommitted unbound patch the running server was built from. Treat the
+  working tree as live content.
 
 ## First-boot SQL migrations (one-time, idempotent)
 
@@ -214,6 +293,13 @@ menu (class unlock ladder: free at 5, 3g at 25, 80g at 50, 300g at 70,
 1500g at 80+).
 
 ## Reprovisioning from a clean clone (e.g. on the new Docker host)
+
+> The **running stack is on the [build host](#build-host)** at
+> `/mnt/data/wow-server`. Reprovisioning builds a clean-clone tree from the
+> company forks; it is **not** a copy of the host layout (see
+> [Host tree layout (provenance gap)](#host-tree-layout-provenance-gap)).
+> Do not re-clone or rebuild the host to close the gap — that is
+> [PRO-2](/PRO/issues/PRO-2)'s call, and the host holds the running server.
 
 Clone from the company forks (`Scuff-Project-Maple`); the upstreams remain
 available as `upstream` remotes on the provisioned tree.
