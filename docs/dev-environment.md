@@ -445,6 +445,81 @@ verify per the sections above.
   installer does it; its pinned head is recorded above. The team does not
   patch mod-playerbots; if they start to, fetch history first.
 
+- **D5 — Dev DB durability relaxed (PRO-30).** `conf/mysql-dev.cnf`
+  (tracked) is bind-mounted into `ac-database` at
+  `/etc/mysql/conf.d/maple-dev.cnf` via the root `docker-compose.override.yml`
+  (installer-managed, untracked): `innodb_flush_log_at_trx_commit = 2`,
+  `sync_binlog = 10000`, `binlog_expire_logs_seconds = 172800`,
+  `max_binlog_size = 104857600`. The dev box is a KVM VM on shared storage;
+  per-commit fsyncs (InnoDB log + binlog) wedged the worldserver main thread
+  for minutes under I/O pressure, stalling external-client auth (see
+  [PRO-30](/PRO/issues/PRO-30) and the section below). Trade-off: on power
+  failure the dev DB may lose up to ~1 s of transactions. Do not carry these
+  values into a production stack.
+## PRO-30: auth hang defect, dev DB durability, and host I/O notes
+
+**Defect (found by QA on 2026-10-19, tracked in
+[PRO-30](/PRO/issues/PRO-30)):** every external WotLK client login hung at
+auth — no `SMSG_AUTH_RESPONSE`, no server log line, no stuck MySQL query
+visible from the client side. In-process playerbot logins were unaffected
+until the stall.
+
+**Root cause (verified with live backtraces on the host):**
+
+1. The worldserver **main thread** executes synchronous DB commits on the
+   per-tick bot-update path: `World::Update` -> `RandomPlayerbotMgr::UpdateAI`
+   -> `SetEventValue` -> `PlayerbotsDatabasePool::CommitTransaction`
+   (`DirectCommitTransaction`, mod-playerbots). The same pattern exists on
+   the characters pool via async transaction tasks.
+2. With `innodb_flush_log_at_trx_commit = 1` + `sync_binlog = 1` (MySQL
+   defaults), every commit forces fsyncs on the shared KVM storage.
+3. Under host I/O pressure (concurrent docker builds; root disk near full),
+   commit flushes took minutes ("waiting for handler commit" in
+   `information_schema.processlist`; transactions stuck in InnoDB
+   `ACTIVE (PREPARED)` waiting on the binlog flush). The main thread sat in
+   `SSL_read` inside `mysql_real_query("COMMIT")`, so `World::Update` never
+   advanced, auth query callbacks were never processed, and external clients
+   timed out.
+
+**Fix applied (dev stack):**
+
+- `conf/mysql-dev.cnf` (D5): no per-commit fsyncs; commits complete in
+  microseconds even under I/O pressure.
+- Disk hygiene on the build host: `docker builder prune` (41 GB build cache
+  -> ~31 GB) and `PURGE BINARY LOGS BEFORE` (16.5 GB binlogs -> 5 files).
+  Root disk went 98% -> ~82%. Keep an eye on it: the MySQL data volume and
+  the docker build cache share the 62 GB root disk.
+
+**Verification:**
+
+- `docker compose up -d --build`-fresh boot on the host: `ready...`,
+  `[UNBOUND] Prereq map built.`, custom-class registry line, 1865/1865
+  playerbots logged in, zero "waiting for handler commit" sessions under
+  the bot login storm.
+- External login re-verified with the tracked e2e suite
+  (`e2e/smoke/smoke_e2e_test.go`, AzerothGhost harness v1.0.8):
+  `TestSmoke_ValidLoginEnterWorld` PASS (auth -> `SMSG_AUTH_RESPONSE` ->
+  in-world at Eastern Kingdoms). QA re-run is tracked as
+  [PRO-31](/PRO/issues/PRO-31).
+
+**Pending hardening (code, not yet built):** mod-playerbots commits
+synchronously on the main thread by design (`PlayerbotsDatabasePool` is a
+sync pool; see D4 — it is pinned third-party code, fetch history before
+patching). Batching/deferring those commits would bound main-thread DB
+blocking even if the DB regresses. Tracked as a follow-up child of
+[PRO-2](/PRO/issues/PRO-2).
+
+**Debugging notes (reused during PRO-30):**
+
+- The worldserver container has no capabilities (`CapEff=0`) and the
+  rebuilt image has no gdb; attach with a PID-namespace-sharing helper:
+  `docker run --rm --cap-add SYS_PTRACE --pid=container:ac-worldserver
+  scuff/gdbprobe gdb -batch -p 1 -ex "thread apply all bt 20"`.
+- Per-pool commit state: `SELECT id,db,command,time,state FROM
+  information_schema.processlist WHERE command <> 'Sleep';` (stuck commits
+  show `waiting for handler commit`; `SHOW ENGINE INNODB STATUS` shows the
+  stuck trx as `ACTIVE (PREPARED)` when waiting on the binlog).
+
 ## Rules
 
 - Never disable an upstream patch or core check to make a build pass —
