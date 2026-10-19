@@ -61,12 +61,31 @@ no conf file. Set `false` to force the vanilla no-op even if template rows
 exist. Reload at runtime with the GM command `RELOAD CONFIG` (the registry
 re-runs both validation stages).
 
+Log channel: `worldserver.custom-classes`. The registry's boot markers (row
+counts, DBC validation rejections, no-op notice) are `LOG_INFO`; without a
+matching logger entry the channel falls back to root (Error+) and they are
+dropped silently. The fork's `worldserver.conf.dist` ships:
+
+```
+Logger.worldserver.custom-classes=4,Console Server
+```
+
 ## Verification status
 
-Code is complete but **not yet compiled**: this host has no C++ toolchain
-or Docker (blocked by PRO-6, the Docker-capable build host). Static
-verification performed: exact-anchored core patch (`git apply --check`
-passes in both directions), all hook signatures matched against
-`ScriptDefines/PlayerScript.h`, all Player/Unit/DBC API calls matched
-against headers. Boot + zero-template no-op check is recorded as pending
-PRO-6.
+Verified on the Docker build host (2026-10-19, `pve-wow-dev`), full-stack
+`docker compose up -d --build`:
+
+- Module compiles and links into `worldserver`; zero-template boot is a
+  no-op: `custom_class_template: 1 row(s) read, 0 template(s) active,
+  1 disabled by flag, 0 rejected at load`, world initializes normally.
+- `CustomClasses.Enabled=false` while template rows exist: `registry stays
+  empty (vanilla no-op)`.
+- Fail-loud: a row whose `specs` use `talent_tree` dbcid 999999 yields
+  exactly one startup line, `Template "pro9_failtest" disabled after DBC
+  validation: spec talent_tree 999999 not found in TalentTab.dbc`; the
+  template is excluded, the other template stays active, no crash.
+- DDL: `01_custom_class_template.sql` is auto-applied by db-import
+  (hash-tracked) and re-applies cleanly across image rebuilds.
+- PRO-10's Warden seed row (mask bit 2048) loads and passes DBC
+  cross-validation: `custom class registry ready: 1 template(s) active
+  (0 removed after DBC validation)`.
