@@ -702,7 +702,7 @@ namespace CustomClasses
     {
         std::unordered_set<uint32> existingTalents;
         for (auto const& item : sTalentStore)
-            existingTalents.insert(item.second->TalentID);
+            existingTalents.insert(item->TalentID);
 
         int removed = 0;
         for (auto it = m_byClass.begin(); it != m_byClass.end();)
@@ -787,7 +787,7 @@ namespace CustomClasses
 
         for (auto const& item : sTalentStore)
         {
-            TalentEntry const* entry = item.second;
+            TalentEntry const* entry = item;
             TalentTabEntry const* tab = sTalentTabStore.LookupEntry(entry->TalentTab);
             if (!tab || (tab->ClassMask & classBit) == 0)
                 continue;
