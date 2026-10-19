@@ -502,12 +502,15 @@ until the stall.
   in-world at Eastern Kingdoms). QA re-run is tracked as
   [PRO-31](/PRO/issues/PRO-31).
 
-**Pending hardening (code, not yet built):** mod-playerbots commits
-synchronously on the main thread by design (`PlayerbotsDatabasePool` is a
-sync pool; see D4 — it is pinned third-party code, fetch history before
-patching). Batching/deferring those commits would bound main-thread DB
-blocking even if the DB regresses. Tracked as a follow-up child of
-[PRO-2](/PRO/issues/PRO-2).
+**Hardening (implemented + deployed, under independent review):** the
+main-thread commit storm is batched in
+`modules/mod-playerbots/src/Bot/RandomPlayerbotMgr.{h,cpp}` — per-tick
+event writes are deferred into one transaction committed once at the end
+of `UpdateAIInternal` (was: one commit per event), and the boot top-up
+uses single `IN`-list SELECTs (was: per-row SELECTs). Crash-durability
+delta: up to one tick (~1s) of event writes, re-synced from DB at next
+boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
+(independent verification by Scuff Rev).
 
 **Debugging notes (reused during PRO-30):**
 
