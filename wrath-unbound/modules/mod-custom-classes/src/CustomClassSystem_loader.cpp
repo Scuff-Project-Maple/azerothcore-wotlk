@@ -2,9 +2,12 @@
 // The top-level modules/CMakeLists.txt calls Addmod_custom_classesScripts(),
 // which this file defines by forwarding to our actual registration function.
 
-void AddCustomClassesScripts();
+namespace CustomClasses
+{
+    void AddCustomClassesScripts();
+}
 
 void Addmod_custom_classesScripts()
 {
-    AddCustomClassesScripts();
+    CustomClasses::AddCustomClassesScripts();
 }
