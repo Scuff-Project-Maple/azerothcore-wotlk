@@ -58,6 +58,8 @@ public:
     ~SQLQueryHolderTask();
 
     bool Execute() override;
+    void ResolveFutureOnStall() override;
+    std::string_view GetOperationName() const override { return "SQLQueryHolderTask"; }
     QueryResultHolderFuture GetFuture() { return m_result.get_future(); }
 
 private:

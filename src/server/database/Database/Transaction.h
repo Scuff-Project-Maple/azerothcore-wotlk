@@ -99,6 +99,10 @@ public:
     TransactionWithResultTask(std::shared_ptr<TransactionBase> trans) : TransactionTask(trans) { }
 
     TransactionFuture GetFuture() { return m_result.get_future(); }
+    // Not resolved by the watchdog: the deadlock retry loop can run up to
+    // DEADLOCK_MAX_RETRY_TIME_MS with the future legitimately pending.
+    bool SupportsStallResolution() const override { return false; }
+    std::string_view GetOperationName() const override { return "TransactionWithResultTask"; }
 
 protected:
     bool Execute() override;

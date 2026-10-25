@@ -20,6 +20,8 @@
 
 #include "DatabaseEnvFwd.h"
 #include "Define.h"
+#include <atomic>
+#include <string_view>
 #include <variant>
 
 //- Type specifier of our element data
@@ -53,11 +55,36 @@ public:
     virtual bool Execute() = 0;
     virtual void SetConnection(MySQLConnection* con) { m_conn = con; }
 
+    //! Resolves this operation's future with an empty/failed value so waiting
+    //! callers do not hang forever. Thread-safe and idempotent: the first
+    //! resolver (the executing worker, or the async worker's watchdog when the
+    //! operation made no progress for the stall threshold) wins.
+    //! Operations without a future do nothing.
+    virtual void ResolveFutureOnStall() { }
+
+    //! False when a long in-flight execution is legitimate (e.g. the deadlock
+    //! retry loop) and the watchdog must not force-resolve the future.
+    virtual bool SupportsStallResolution() const { return true; }
+
+    //! Short human-readable operation type for diagnostics (stall logging).
+    virtual std::string_view GetOperationName() const { return "SQLOperation"; }
+
     MySQLConnection* m_conn{nullptr};
 
 private:
+    std::atomic<bool> _completionClaimed{ false };
+
     SQLOperation(SQLOperation const& right) = delete;
     SQLOperation& operator=(SQLOperation const& right) = delete;
+
+protected:
+    //! Atomically claims the right to resolve this operation's future.
+    //! Exactly one of the executing worker or the watchdog wins; the loser
+    //! must skip its own set_value() call to avoid a double resolve.
+    bool ClaimCompletion()
+    {
+        return _completionClaimed.exchange(true, std::memory_order_acq_rel) == false;
+    }
 };
 
 #endif

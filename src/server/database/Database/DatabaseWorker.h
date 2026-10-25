@@ -20,6 +20,8 @@
 
 #include "Define.h"
 #include <atomic>
+#include <cstdint>
+#include <mutex>
 #include <thread>
 
 template <typename T>
@@ -40,6 +42,25 @@ private:
 
     void WorkerThread();
     std::thread _workerThread;
+
+    //! Monitors the worker for a stuck in-flight operation (blocked MySQL call
+    //! or reconnect backoff) and resolves its future so waiting callers are
+    //! not left hanging indefinitely.
+    void WatchdogThread();
+    std::thread _watchdogThread;
+
+    //! Guarded by _inFlightMutex together with _inFlightOp/_inFlightSinceMs.
+    std::mutex _inFlightMutex;
+    SQLOperation* _inFlightOp{ nullptr };
+    uint64_t _inFlightSinceMs{ 0 };
+
+    //! Milliseconds an in-flight operation may run without the worker making
+    //! progress before the watchdog reports a stall (config:
+    //! Database.AsyncWorkerStallSeconds, default 10).
+    uint64_t _stallThresholdMs{ 10'000 };
+
+    //! Set in the destructor before joining _watchdogThread.
+    std::atomic<bool> _stop{ false };
 
     DatabaseWorker(DatabaseWorker const& right) = delete;
     DatabaseWorker& operator=(DatabaseWorker const& right) = delete;

@@ -98,6 +98,12 @@ uint32 MySQLConnection::Open()
 
     mysql_options(mysqlInit, MYSQL_SET_CHARSET_NAME, "utf8");
 
+    // Bound the connect itself: without this, mysql_real_connect() can block
+    // indefinitely against a frozen/unreachable peer (initial open and every
+    // reconnect), which would stall the calling worker thread.
+    unsigned int const connectTimeout = 5;
+    mysql_options(mysqlInit, MYSQL_OPT_CONNECT_TIMEOUT, &connectTimeout);
+
 #ifdef _WIN32
     if (m_connectionInfo.host == ".")                                           // named pipe use option (Windows)
     {
@@ -611,6 +617,9 @@ bool MySQLConnection::_HandleMySQLErrno(uint32 errNo, char const* err, uint8 att
             {
                 // It's possible this attempted reconnect throws 2006 at us.
                 // To prevent crazy recursive calls, sleep here.
+                LOG_WARN("sql.driver", "Reconnect to MySQL database `{}` failed (errno {}); {} attempts remaining, retrying in 3s. "
+                    "Queries enqueued on this connection are waiting until the connection is re-established.",
+                    m_connectionInfo.database, lErrno, attempts);
                 std::this_thread::sleep_for(3s); // Sleep 3 seconds
                 return _HandleMySQLErrno(lErrno, mysql_error(m_Mysql), attempts); // Call self (recursive)
             }
