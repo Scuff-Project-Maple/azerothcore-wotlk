@@ -133,7 +133,7 @@ up by a plain `docker compose up`. From the repo root:
 
 ```bash
 # load-test boot (1600–2000 randombots)
-COMPOSE_FILE=docker-compose.yml,docker-compose.override.yml,docker-compose.loadtest.override.yml \
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
   docker compose up -d --force-recreate ac-worldserver
 
 # back to the 50-bot default

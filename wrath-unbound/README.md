@@ -87,7 +87,7 @@ The default override boots **50** randombots
 repo root:
 
 ```bash
-COMPOSE_FILE=docker-compose.yml,docker-compose.override.yml,docker-compose.loadtest.override.yml \
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
   docker compose up -d --force-recreate ac-worldserver
 ```
 
