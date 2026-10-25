@@ -143,7 +143,8 @@ bool TransactionWithResultTask::Execute()
     int errorCode = TryExecute();
     if (!errorCode)
     {
-        m_result.set_value(true);
+        if (ClaimCompletion())
+            m_result.set_value(true);
         return true;
     }
 
@@ -161,7 +162,8 @@ bool TransactionWithResultTask::Execute()
             {
                 if (!TryExecute())
                 {
-                    m_result.set_value(true);
+                    if (ClaimCompletion())
+                        m_result.set_value(true);
                     return true;
                 }
 
@@ -174,7 +176,8 @@ bool TransactionWithResultTask::Execute()
 
     // Clean up now.
     CleanupOnFailure();
-    m_result.set_value(false);
+    if (ClaimCompletion())
+        m_result.set_value(false);
 
     return false;
 }

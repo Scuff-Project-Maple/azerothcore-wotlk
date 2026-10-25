@@ -81,6 +81,12 @@ PreparedStatementTask::~PreparedStatementTask()
         delete m_result;
 }
 
+void PreparedStatementTask::ResolveFutureOnStall()
+{
+    if (m_has_result && m_result && ClaimCompletion())
+        m_result->set_value(PreparedQueryResult(nullptr));
+}
+
 bool PreparedStatementTask::Execute()
 {
     if (m_has_result)
@@ -89,11 +95,16 @@ bool PreparedStatementTask::Execute()
         if (!result || !result->GetRowCount())
         {
             delete result;
-            m_result->set_value(PreparedQueryResult(nullptr));
+            if (ClaimCompletion())
+                m_result->set_value(PreparedQueryResult(nullptr));
             return false;
         }
 
-        m_result->set_value(PreparedQueryResult(result));
+        if (ClaimCompletion())
+            m_result->set_value(PreparedQueryResult(result));
+        else
+            delete result; // Watchdog already resolved the future; drop the result.
+
         return true;
     }
 

@@ -134,8 +134,13 @@ CharacterDatabaseInfo = "127.0.0.1;3306;acore;acore;acore_characters"
 #        Default:     1 - (LoginDatabase.WorkerThreads)
 #                     1 - (WorldDatabase.WorkerThreads)
 #                     1 - (CharacterDatabase.WorkerThreads)
+#        Company:     Login pool runs 2 workers (PRO-32): external client auth goes through the
+#                     Login pool's single shared async queue, so a worker stuck on a dead MySQL
+#                     connection would otherwise wedge every login behind it. With 2 workers the
+#                     queue keeps draining on the healthy connection; the per-worker watchdog
+#                     (Database.AsyncWorkerStallSeconds) detects and reports the stuck one.
 
-LoginDatabase.WorkerThreads     = 1
+LoginDatabase.WorkerThreads     = 2
 WorldDatabase.WorkerThreads     = 1
 CharacterDatabase.WorkerThreads = 1
 

@@ -36,6 +36,12 @@ BasicStatementTask::~BasicStatementTask()
         delete m_result;
 }
 
+void BasicStatementTask::ResolveFutureOnStall()
+{
+    if (m_has_result && m_result && ClaimCompletion())
+        m_result->set_value(QueryResult(nullptr));
+}
+
 bool BasicStatementTask::Execute()
 {
     if (m_has_result)
@@ -44,11 +50,16 @@ bool BasicStatementTask::Execute()
         if (!result || !result->GetRowCount() || !result->NextRow())
         {
             delete result;
-            m_result->set_value(QueryResult(nullptr));
+            if (ClaimCompletion())
+                m_result->set_value(QueryResult(nullptr));
             return false;
         }
 
-        m_result->set_value(QueryResult(result));
+        if (ClaimCompletion())
+            m_result->set_value(QueryResult(result));
+        else
+            delete result; // Watchdog already resolved the future; drop the result.
+
         return true;
     }
 
