@@ -87,7 +87,8 @@ and the `wrath-unbound/` snapshot are tracked in git.
  │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
  │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
-├── docker-compose.override.yml           # Playerbots env (random bots 1600–2000, DB auto-updates), ./modules mount
+├── docker-compose.override.yml           # Playerbots env (default 50 random bots, DB auto-updates), ./modules mount
+├── docker-compose.loadtest.override.yml  # PRO-33: restores the 1600–2000 randombot volume for load tests (opt-in)
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
 └── wrath-unbound/                        # tracked snapshot of the provisioned payload (reprovisioning source)
@@ -121,6 +122,31 @@ docker compose up -d --force-recreate ac-worldserver
 
 Stop/start without rebuild: `docker compose stop ac-worldserver` /
 `docker compose start ac-worldserver`.
+
+### Load testing (randombot volume, PRO-33)
+
+Default boots load **50** randombots
+(`AC_AI_PLAYERBOT_MIN_RANDOM_BOTS`/`MAX_RANDOM_BOTS` = `50` in
+`docker-compose.override.yml`). The former 1600–2000 load-test volume is
+restored by `docker-compose.loadtest.override.yml`, which is **not** picked
+up by a plain `docker compose up`. From the repo root:
+
+```bash
+# load-test boot (1600–2000 randombots)
+COMPOSE_FILE=docker-compose.yml,docker-compose.override.yml,docker-compose.loadtest.override.yml \
+  docker compose up -d --force-recreate ac-worldserver
+
+# back to the 50-bot default
+docker compose up -d --force-recreate ac-worldserver
+```
+
+Verify the loaded count after boot: the `bot_count` event on map 0
+(`acore_world`) should read 50 (default) or 1600–2000 (load test), and the
+online `rndbot%` characters in `acore_characters` should match within a few
+minutes. Background: the boot-time login storm was the primary stressor
+behind the auth-chain wedge
+([PRO-21](/PRO/issues/PRO-21)); DB-async SPOF hardening is tracked
+separately in [PRO-32](/PRO/issues/PRO-32).
 
 ## Build host
 
@@ -380,6 +406,7 @@ cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
 cp wrath-unbound/docker-compose.override.yml .
+cp wrath-unbound/docker-compose.loadtest.override.yml .
 
 # the core hook patches are committed IN-TREE on Playerbot
 # (f5b197b8d mod-unbound, 6 files; b732dfd71 mod-custom-classes, 6 files)
