@@ -7,9 +7,12 @@ services:
       - ./modules:/azerothcore/modules
     environment:
       AC_PLAYERBOTS_UPDATES_ENABLE_DATABASES: "1"
+      # PRO-33: normal-operation default is 50 randombots. The load-test
+      # volume (1600-2000) is restored by docker-compose.loadtest.override.yml,
+      # see wrath-unbound/README.md ("Load testing") and docs/dev-environment.md.
       AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"
-      AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "1600"
-      AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "2000"
+      AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "50"
+      AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "50"
   ac-authserver:
     build:
       context: .
