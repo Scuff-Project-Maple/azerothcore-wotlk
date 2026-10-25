@@ -13,6 +13,9 @@ services:
       AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"
       AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "50"
       AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "50"
+      # e2e prerequisite (see e2e/README.md): the harness stores an empty
+      # account.os, so Warden rejects every login (AUTH_REJECT 14).
+      AC_WARDEN_ENABLED: "0"
   ac-authserver:
     build:
       context: .

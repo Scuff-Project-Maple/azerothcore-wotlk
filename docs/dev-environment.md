@@ -87,7 +87,7 @@ and the `wrath-unbound/` snapshot are tracked in git.
  │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
  │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
-├── docker-compose.override.yml           # Playerbots env (default 50 random bots, DB auto-updates), ./modules mount
+├── docker-compose.override.yml            # 50 random bots (DB auto-updates), Warden off for e2e, ./modules mount
 ├── docker-compose.loadtest.override.yml  # PRO-33: restores the 1600–2000 randombot volume for load tests (opt-in)
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
@@ -140,10 +140,22 @@ COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadt
 docker compose up -d --force-recreate ac-worldserver
 ```
 
-Verify the loaded count after boot: the `bot_count` event on map 0
-(`acore_world`) should read 50 (default) or 1600–2000 (load test), and the
-online `rndbot%` characters in `acore_characters` should match within a few
-minutes. Background: the boot-time login storm was the primary stressor
+Verify the loaded count after boot: the `bot_count` row in
+`acore_playerbots.playerbots_random_bots` (owner=0, bot=0) should read 50
+(default) or 1600–2000 (load test):
+
+```bash
+docker exec ac-database mysql -u root -ppassword acore_playerbots \
+  -e "SELECT event, value FROM playerbots_random_bots WHERE owner = 0 AND bot = 0;"
+```
+
+and the online `rndbot%` characters in `acore_characters` should match
+within a few minutes:
+
+```bash
+docker exec ac-database mysql -u root -ppassword \
+  -e "SELECT COUNT(*) AS online_bots FROM acore_characters c JOIN acore_auth a ON c.account = a.id WHERE a.username LIKE 'rndbot%' AND c.online > 0;"
+``` Background: the boot-time login storm was the primary stressor
 behind the auth-chain wedge
 ([PRO-21](/PRO/issues/PRO-21)); DB-async SPOF hardening is tracked
 separately in [PRO-32](/PRO/issues/PRO-32).
