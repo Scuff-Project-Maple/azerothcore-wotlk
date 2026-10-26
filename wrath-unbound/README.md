@@ -30,6 +30,7 @@ Companion guide: `guides/unbound-wrath/Wrath-Unbound-Addon-HOWTO.md` (blob
 | `env/dist/etc/modules/mod_custom_classes.conf` | `env/dist/etc/modules/mod_custom_classes.conf` |
 | `env/dist/etc/modules/lua_scripts/unbound_mentor.lua` | `env/dist/etc/modules/lua_scripts/unbound_mentor.lua` |
 | `docker-compose.override.yml` | `docker-compose.override.yml` (repo root) |
+| `docker-compose.loadtest.override.yml` | `docker-compose.loadtest.override.yml` (repo root) |
 
 Notes:
 
@@ -64,6 +65,7 @@ cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
 cp wrath-unbound/docker-compose.override.yml .
+cp wrath-unbound/docker-compose.loadtest.override.yml .
 # core hook patches are in-tree on Playerbot (f5b197b8d, b732dfd71):
 # verify, do not re-apply (on a base-pinned tree, git-apply both patches
 # instead, unbound first):
@@ -74,3 +76,29 @@ grep -n OnPlayerLfgSetRoles src/server/game/Handlers/LFGHandler.cpp
 
 SQL migrations and apply order: see
 [docs/dev-environment.md](../docs/dev-environment.md#first-boot-sql-migrations-one-time-idempotent).
+
+## Load testing (randombot volume, PRO-33)
+
+The default override boots **50** randombots
+(`AC_AI_PLAYERBOT_MIN_RANDOM_BOTS`/`MAX_RANDOM_BOTS` = `50`). A plain
+`docker compose up` auto-merges only `docker-compose.yml` +
+`docker-compose.override.yml`. The 1600–2000 load-test volume lives in
+`docker-compose.loadtest.override.yml` and is enabled explicitly, from the
+repo root:
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
+  docker compose up -d --force-recreate ac-worldserver
+```
+
+Return to the 50-bot default afterwards:
+
+```bash
+docker compose up -d --force-recreate ac-worldserver
+```
+
+`AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"` stays on in both, so the world
+still populates in normal operation. Background: the 1600–2000 boot-time
+login storm was the primary stressor behind the auth-chain wedge
+([PRO-21](/PRO/issues/PRO-21)); DB-async SPOF hardening is tracked
+separately in [PRO-32](/PRO/issues/PRO-32).
