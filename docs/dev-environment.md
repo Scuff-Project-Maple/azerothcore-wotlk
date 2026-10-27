@@ -159,7 +159,9 @@ within a few minutes:
 ```bash
 docker exec ac-database mysql -u root -ppassword \
   -e "SELECT COUNT(*) AS online_bots FROM acore_characters c JOIN acore_auth a ON c.account = a.id WHERE a.username LIKE 'rndbot%' AND c.online > 0;"
-``` Background: the boot-time login storm was the primary stressor
+```
+
+Background: the boot-time login storm was the primary stressor
 behind the auth-chain wedge
 ([PRO-21](/PRO/issues/PRO-21)); DB-async SPOF hardening is tracked
 separately in [PRO-32](/PRO/issues/PRO-32).
