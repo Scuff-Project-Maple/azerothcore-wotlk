@@ -55,11 +55,13 @@ commits on top of it. `mod-playerbots` fork `master` tracks `7bae1b5c…`;
 the `mod-ale` fork's `master` is at upstream HEAD — check out the pinned
 `1cb86c96…` when provisioning.
 
-**Push status (updated 2026-10-27):** the fork `Playerbot` branch is the
-source of truth; it carries the
+**Push status (synced, verified 2026-10-27):** the fork `Playerbot` branch is
+the source of truth (head `a6c0eb14d`); it carries the
 T1/Wrath-Unbound base (`f5b197b8d`–`8c16d1194`), the PRO-9/PRO-10 module +
 SQL work (`b732dfd71`–`4805857c4`), and the PRO-3/PRO-16/PRO-20 docs
-(`e025c7dc9`–`f76e13468`). Pushes go through the company's managed GitHub
+(`e025c7dc9`–`f76e13468`) — all four PRO-15 commits (`b732dfd71`,
+`deaf1109c`, `9c0db4ef6`, `ad3393eb7`) verified as ancestors of the fork
+head. Pushes go through the company's managed GitHub
 identity (PRO-7); cloning that branch is the reprovisioning path — see
 [Reprovisioning](#reprovisioning-from-a-clean-clone-e-g-on-the-new-docker-host).
 
