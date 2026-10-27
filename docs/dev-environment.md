@@ -5,12 +5,16 @@ Dev environment for the Unbound Wrath WotLK project. Provisioned per
 truth for repo pinning, build/run commands, `env/` config, and the expected
 healthy-boot log lines. QA and all engineers: start here.
 
-**Status:** provisioned, built, and booted on the [build host](#build-host).
-Clean boot verified 2026-10-19: `ready...` at 01:33:20 UTC, `[UNBOUND]
-Prereq map built.` at 01:32:55, `custom class registry ready: 1 template(s)
-active`, no errors since start, ~1500 random playerbots online. The
-in-game `.npc add 900001` check is delegated to QA as a child of
-[PRO-2](/PRO/issues/PRO-2) — see
+**Status:** provisioned, built, booted, and **fully accepted (2026-10-27)**.
+Current stack verified 2026-10-27 00:53 UTC on `AzerothCore rev.
+34d6f4b0e8c7+` (Playerbot branch, built 2026-10-25, includes the PRO-32
+async-DB hardening): `ready...`, `[UNBOUND] Prereq map built.`, `custom
+class registry ready: 1 template(s) active`, no errors/crash. The final
+in-game acceptance item — `.npc add 900001` from a GM3 session — **PASSED**
+in [PRO-43](/PRO/issues/PRO-43) (QA, 2026-10-27): login/enter-world, the
+persistent Mentor visible at -8830/614/93.5, a second Mentor spawned and
+persisted, no errors, ALE gossip menu answered. See
+[Verification](#verification-what-healthy-looks-like) and
 [Worldserver console vs in-game GM commands](#worldserver-console-vs-in-game-gm-commands).
 
 ---
@@ -51,12 +55,12 @@ commits on top of it. `mod-playerbots` fork `master` tracks `7bae1b5c…`;
 the `mod-ale` fork's `master` is at upstream HEAD — check out the pinned
 `1cb86c96…` when provisioning.
 
-**Push status (2026-10-19):** the fork `Playerbot` branch is current with
-the build host tree at `/mnt/data/wow-server` — it carries the
+**Push status (updated 2026-10-27):** the fork `Playerbot` branch is the
+source of truth; it carries the
 T1/Wrath-Unbound base (`f5b197b8d`–`8c16d1194`), the PRO-9/PRO-10 module +
 SQL work (`b732dfd71`–`4805857c4`), and the PRO-3/PRO-16/PRO-20 docs
 (`e025c7dc9`–`f76e13468`). Pushes go through the company's managed GitHub
-identity (PRO-7); the fork is the source of truth for reprovisioning — see
+identity (PRO-7); cloning that branch is the reprovisioning path — see
 [Reprovisioning](#reprovisioning-from-a-clean-clone-e-g-on-the-new-docker-host).
 
 ## Provisioned tree layout
@@ -217,7 +221,7 @@ doc:
 | Git remotes | `origin` → `https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git` (the previous base-repo remote was replaced) |
 | Modules | plain source trees staged from the pinned/fork-snapshot sources: `mod-ale` @ `1cb86c960026`, `mod-playerbots` @ `7bae1b5c58c7`, `mod-unbound` + `mod-custom-classes` from the tracked `wrath-unbound/` snapshot, plus host-only `mod-arac` (kept) |
 | Conf | `env/dist/etc/modules/mod_ale.conf`, `mod_custom_classes.conf`, `lua_scripts/unbound_mentor.lua` in place; live `worldserver.conf` untouched |
-| Running binary | `AzerothCore rev. fd6df4549+ (Playerbot branch)`, built 2026-10-19 00:29 from this tree (the `+` marks untracked content in the tree at build time) |
+| Running binary | `AzerothCore rev. 34d6f4b0e8c7+ (Playerbot branch)`, built 2026-10-25 21:12 from this tree (the `+` marks untracked content in the tree at build time). Earlier verified run: `fd6df4549+` (2026-10-19) |
 
 Before the resync, safety artifacts were written to
 `/mnt/data/backups/pre-fork-resync-20261018/`: a gzip-verified dump of all
@@ -323,17 +327,30 @@ has none) and the stock ready marker:
 docker logs ac-worldserver | grep "ready..."
 ```
 
-**Verified on the live host (2026-10-19, 01:30–01:33 UTC boot):**
+**Verified on the live host (2026-10-27 00:53 UTC, running `rev.
+34d6f4b0e8c7+`, boot started 2026-10-26T23:52:43Z):**
 
 ```
+banner: AzerothCore rev. 34d6f4b0e8c7+ 2026-10-25 21:12:06 +0000 (Playerbot branch) ... ready...
+[UNBOUND] ranger_vex_gossip.lua loaded: entry 900200, quests 900101/900102
 [UNBOUND] Prereq map built.
-custom class registry ready: 1 template(s) active (0 removed after DBC validation)
 ```
 
-Boot reached `ready...` at 01:33:20 with no ERROR/ABRT/assert/segfault
-since start, `mod_custom_classes.conf` loaded with
-`CustomClasses.Enabled = true`, and ~1500 random playerbots online. The
-Mentor template (900001) loaded from the world DB without rejection.
+No `ERROR|FATAL|Assert|Segmentation|terminate called` in the boot window
+and no crash/restart, ~50 random playerbots online (PRO-33 default). The
+one config line that looks alarming but is **benign**: `Config: Missing
+property AiPlayerbot.ErrorDelay` — the live
+`env/dist/etc/modules/playerbots.conf` predates
+`modules/mod-playerbots/conf/playerbots.conf.dist:384`; it only disables a
+retry delay (module default applies) and is safe to ignore, or add
+`AiPlayerbot.ErrorDelay = 100` to the live conf on the next planned
+restart.
+
+Earlier verified boot (2026-10-19, `rev. fd6df4549+`, 01:30–01:33 UTC)
+also showed `custom class registry ready: 1 template(s) active (0 removed
+after DBC validation)`, `CustomClasses.Enabled = true`, and ~1500 random
+playerbots. The Mentor template (900001) loaded from the world DB without
+rejection in both boots.
 
 ### Worldserver console vs in-game GM commands
 
@@ -349,20 +366,25 @@ exposes only a **subset** of GM commands. In this build
 
 `<spawn guid>` is the primary key of the `acore_world.creature` table, not
 the creature template id. For "The Mentor" (template 900001) the persistent
-spawn row is `guid 5300679` (Eastern Kingdoms, -8830/614/93.5):
+spawn row is **`guid 9002020`** (Eastern Kingdoms, -8830/614/93.5; the
+earlier row `guid 5300679` was replaced during later data work):
 
 ```
-.npc load 5300679
-# → "Creature spawn 5300679 is already loaded."  (verified on the running
-#   worldserver 2026-10-19 — the console-side proof the NPC is in the live
-#   world)
+.npc load 9002020
+# → "Creature spawn 9002020 is already loaded."  (console-side proof the
+#   NPC is in the live world; re-verified 2026-10-27)
 ```
 
 All other `.npc` subcommands — including `.npc add` — are `Console::No`
 (in-game GM sessions only). `.npc add 900001` therefore **must be run from
 an in-game GM3 character**; it spawns "The Mentor" at the GM's position and
-persists the spawn row to the DB. That in-game check is the remaining PRO-2
-acceptance item, delegated to QA.
+persists the spawn row to the DB. That in-game check **PASSED** in
+[PRO-43](/PRO/issues/PRO-43) on 2026-10-27 (protocol-harness GM3 session):
+`.npc add 900001` produced live GUID
+`0xF1300DBBA1005C5D` and a new `acore_world.creature` row (`guid 9002023`),
+so the template+command path works from a real in-game session. The test
+spawn was deleted afterwards; the only remaining row is the persistent
+`9002020`.
 
 In-game test (GM3 account, in-game only — the console does not expose
 `.npc add`; see above):
@@ -460,12 +482,12 @@ verify per the sections above.
   toolchain. Build, boot, and log verification were then executed on the
   [build host](#build-host) (host provisioned via
   [PRO-6](/PRO/issues/PRO-6)). Clean boot + `[UNBOUND] Prereq map built.`
-  verified 2026-10-19. The only unverified acceptance item is the
-  in-game `.npc add 900001` spawn check, which requires an in-game GM
-  character (the console does not expose `.npc add` — see
+  verified 2026-10-19 and re-verified 2026-10-27. The in-game
+  `.npc add 900001` spawn check requires an in-game GM character (the
+  console does not expose `.npc add` — see
   [Worldserver console vs in-game GM commands](#worldserver-console-vs-in-game-gm-commands));
-  it is delegated to QA as a child of
-  [PRO-2](/PRO/issues/PRO-2).
+  it passed in [PRO-43](/PRO/issues/PRO-43) on 2026-10-27, closing the last
+  PRO-2 acceptance item.
 - **D2 — `ValidateSkillLearnedBySpells = 0` set in `worldserver.conf.dist`
   instead of the installer's runtime sed of `env/dist/etc/worldserver.conf`.**
   The runtime conf is generated into the bind-mounted `env/dist/etc` by the
@@ -513,7 +535,7 @@ verify per the sections above.
 - [x] SQL migrations staged with documented apply order (custom-class DDL + PRO-10 seed auto-apply via the DB updater)
 - [x] `ValidateSkillLearnedBySpells = 0`
 - [x] Setup doc in the repo (this file)
-- [x] Build worldserver (on the build host; running rev `fd6df4549+`, 2026-10-19)
-- [x] Clean boot + `[UNBOUND] Prereq map built.` (verified 2026-10-19 01:30–01:33 UTC boot; no errors, ~1500 bots online)
-- [x] NPC 900001 in the live world — template 900001 "The Mentor" + persistent spawn row (guid 5300679) in `acore_world`; `.npc load 5300679` → "already loaded" on the running worldserver (console-side equivalent)
-- [ ] `.npc add 900001` from an in-game GM3 character — in-game only (console limitation, see above); delegated to QA
+- [x] Build worldserver (on the build host; current running rev `34d6f4b0e8c7+`, 2026-10-25; first verified `fd6df4549+`, 2026-10-19)
+- [x] Clean boot + `[UNBOUND] Prereq map built.` (re-verified 2026-10-27 on `rev. 34d6f4b0e8c7+`; no errors/crash)
+- [x] NPC 900001 in the live world — template 900001 "The Mentor" + persistent spawn row **guid 9002020** in `acore_world`; `.npc load 9002020` → "already loaded" (console-side proof)
+- [x] `.npc add 900001` from an in-game GM3 character — **PASS** in [PRO-43](/PRO/issues/PRO-43) (2026-10-27): new live unit + persisted `creature` row, no errors; test spawn deleted, persistent `9002020` intact
