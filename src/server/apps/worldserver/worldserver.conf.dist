@@ -165,6 +165,23 @@ CharacterDatabase.SynchThreads = 1
 MaxPingTime = 30
 
 #
+#    Database.AsyncWorkerStallSeconds
+#        Description: Time (in seconds) that an asynchronous database operation may stay in
+#                     flight without the worker making progress before the async-worker
+#                     watchdog reports it as stalled, logs it (sql.driver) and resolves the
+#                     operation's future with a failure, so waiting callers receive a clean
+#                     error instead of hanging. A stuck operation is re-reported once per
+#                     threshold while it stays stuck.
+#        Default:     10 - (seconds)
+#        Company:     Project Maple watchdog added by PRO-32. Read once per DatabaseWorker
+#                     construction, so reconnect/worker churn re-reads the option. Keep the
+#                     value on its own line: this parser only strips comments that START the
+#                     line, so an inline "#" becomes part of the value, the value fails to
+#                     parse as a number, and 10 is silently used instead (PRO-57).
+
+Database.AsyncWorkerStallSeconds = 10
+
+#
 #    Database.Reconnect.Seconds
 #    Database.Reconnect.Attempts
 #        Description: How many seconds between every reconnection attempt
