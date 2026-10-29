@@ -105,10 +105,40 @@ Services (from the stock `docker-compose.yml`, all started by one command):
 `ac-worldserver`, `ac-authserver`. Compose project resolves from CWD —
 **always `cd` into the repo root before compose commands**.
 
+## Single-writer lease (one worldserver, one writer at a time)
+
+There is exactly **one** `ac-worldserver` on the [build host](#build-host) and
+no mutual exclusion, so a restart under someone else's run silently destroys
+their verification — it cost [PRO-36](/PRO/issues/PRO-36) its T4.7 e2e gate on
+2026-10-28. Before you restart/recreate `ac-worldserver`, run
+`docker compose up`, apply a DB migration, **or run the e2e suite**, you MUST
+hold the lease. If `check` below reports `LEASE_HELD_LIVE`: **do not proceed** —
+wait, or coordinate in the holder's issue thread. Breaking a
+`LEASE_STALE_BREAKABLE` lease is allowed only with a comment on **your** issue
+naming the lease you broke (its `agentId`, `issueId`, `acquiredAt`,
+`expectedMinutes`). Release when the action finishes, including on failure.
+Lease file: `/mnt/data/wow-server/.stack/lease` (JSON, one line). The
+`.stack/` dir is `0775 scuff-dev:pira` so both host drivers can write it — the
+compose root itself is not agent-writable. No cron, no daemon: the read is the
+rule.
+
+```bash
+# ACQUIRE — atomic (O_EXCL); prints LEASE_HELD + the holder and exits non-zero if someone is in there
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && ( set -o noclobber; jq -cn --arg agent "<agent-id>" --arg issue "<PRO-xx>" --arg action "<worldserver-restart|e2e-suite|db-migration|compose-up>" --arg at "$(date -u +%FT%TZ)" --argjson mins 90 "{agentId:\$agent,issueId:\$issue,action:\$action,acquiredAt:\$at,expectedMinutes:\$mins}" > .stack/lease ) && echo LEASE_ACQUIRED || { echo LEASE_HELD; cat .stack/lease; exit 1; }'
+
+# CHECK — prints LEASE_FREE | LEASE_HELD_LIVE | LEASE_STALE_BREAKABLE (+ the lease JSON)
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && { [ -f .stack/lease ] && { jq -er "(.acquiredAt|fromdate)+(.expectedMinutes*60) > (now|floor)" .stack/lease >/dev/null && { echo LEASE_HELD_LIVE; cat .stack/lease; } || { echo LEASE_STALE_BREAKABLE; cat .stack/lease; }; } || echo LEASE_FREE; }'
+
+# RELEASE — always, including on failure
+ssh -o BatchMode=yes 192.168.1.71 'rm -f /mnt/data/wow-server/.stack/lease && echo LEASE_RELEASED'
+```
+
 ## Build & run
 
 All commands in this section run **on the [build host](#build-host)**, over
-BatchMode SSH (agent sandboxes have no Docker).
+BatchMode SSH (agent sandboxes have no Docker). Take the
+[single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time)
+before any of them.
 
 One documented command from a provisioned tree (fresh image build; 2–4 h on
 a typical host, less on the Steam Deck baseline the guide targets):
@@ -524,6 +554,10 @@ verify per the sections above.
 - **Canonical agent access path:** `ssh 192.168.1.71 '<docker command>'` —
   build, apply SQL, and read logs from there. Do not ssh in and run a
   host-local compiler.
+- **Single-writer lease (board rule, [PRO-67](/PRO/issues/PRO-67)):** no
+  worldserver restart/recreate, `docker compose up`, DB migration, or e2e run
+  without first holding `/mnt/data/wow-server/.stack/lease` — see
+  [Single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time).
 - **Prohibited on the host:** a `cmake`/`make`/gcc build tree, binaries run
   outside a container, and any `docker`-alternative that shells out to a
   host-local toolchain. `docker compose up -d --build` is fine — it compiles
