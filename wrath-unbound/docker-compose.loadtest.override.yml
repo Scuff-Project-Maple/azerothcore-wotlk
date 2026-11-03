@@ -3,8 +3,9 @@
 #
 # SOURCE OF TRUTH (PRO-180): the repo-root `docker-compose.loadtest.override.yml`
 # is a gitignored, generated copy of this file. Edit this file and run
-# `scripts/compose-sync.sh`; never hand-edit the root copy (hand-editing the
-# root copies is what produced the PRO-33/PRO-65/PRO-178 drift).
+# `sudo -u pira scripts/compose-sync.sh` (`--check` is read-only); never
+# hand-edit the root copy (hand-editing the root copies is what produced the
+# PRO-33/PRO-65/PRO-178 drift).
 #
 # This file is NOT loaded by a plain `docker compose up` (only
 # docker-compose.yml + docker-compose.override.yml are auto-merged).
@@ -16,7 +17,8 @@
 # To return to the 50-bot default afterwards:
 #   docker compose up -d --force-recreate ac-worldserver
 #
-# See docs/dev-environment.md ("Load testing (randombot volume)").
+# See the "Load testing (randombot volume, PRO-33)" section in
+# docs/dev-environment.md.
 services:
   ac-worldserver:
     environment:

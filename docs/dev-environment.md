@@ -93,13 +93,13 @@ their `wrath-unbound/` snapshots and must not be hand-edited — see
  │   │   └── custom-class-core-access.patch  # 6-file core hook patch (in-tree on Playerbot, kept for re-apply after rebases)
  │   ├── mod-ale/                          # nested git repo @ 1cb86c96…
  │   └── mod-playerbots/                   # nested git repo @ 7bae1b5c… (depth-1 master)
- ├── env/dist/etc/modules/
+├── env/dist/etc/modules/
  │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
  │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
- ├── docker-compose.override.yml           # generated copy of wrath-unbound/docker-compose.override.yml (PRO-178): 50 randombots, world-DB auto-updates, Warden off, ./modules + ./data/sql + mysql-dev.cnf mounts
- ├── docker-compose.loadtest.override.yml   # generated copy of wrath-unbound/docker-compose.loadtest.override.yml (PRO-33 profile, tracked since PRO-180): 1600–2000 randombots; only loaded via COMPOSE_FILE
- ├── scripts/compose-sync.sh               # tracked: installs both generated copies from wrath-unbound/; `--check` is the pre-boot drift assertion (PRO-180)
+├── docker-compose.override.yml           # generated copy of wrath-unbound/docker-compose.override.yml (PRO-178)
+├── docker-compose.loadtest.override.yml  # generated copy of wrath-unbound/docker-compose.loadtest.override.yml (PRO-180)
+├── scripts/compose-sync.sh               # installs the two root copies; --check asserts no drift (PRO-180)
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
 └── wrath-unbound/                        # tracked snapshot of the provisioned payload (reprovisioning source)
@@ -580,12 +580,12 @@ verify per the sections above.
   on login).
 - **D3 — Tracked snapshot in `wrath-unbound/`.** The fork gitignores all
   provisioned content, so the payload's only upstream home is the embedded
-   heredocs in Dad's installer script. `wrath-unbound/` vendors an
-   extracted copy (byte-identical, provenance in its README) plus **both**
-   compose overrides (the load-test one was added in PRO-180 — until then it
-   existed only as an untracked root file, so a clean-clone reprovision lost
-   it) so the tree can be rebuilt without re-downloading the
-   installer.
+  heredocs in Dad's installer script. `wrath-unbound/` vendors an
+  extracted copy (byte-identical, provenance in its README) plus **both**
+  compose overrides (the load-test one was added in PRO-180 — until then it
+  existed only as an untracked root file, so a clean-clone reprovision lost
+  it) so the tree can be rebuilt without re-downloading the
+  installer.
 - **D4 — mod-playerbots shallow clone.** `--depth 1` exactly as the base
   installer does it; its pinned head is recorded above. The team does not
   patch mod-playerbots; if they start to, fetch history first.
@@ -606,9 +606,13 @@ verify per the sections above.
   values into a production stack.
   Verify the mount and values are live:
   `docker inspect ac-database --format '{{json .Mounts}}'` lists the cnf
-  bind mount, and `docker exec ac-database mysql -u root -ppassword -N -e
-  "SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog;"` returns `2
-  10000`.
+  bind mount. **Regression tripwire:** a permission drift or a stricter
+  future image silently un-applies this drop-in (MySQL skips option files
+  under `!includedir` whose permissions it considers unsafe). The check is:
+  `docker exec ac-database mysql -u root -ppassword -N -e "SELECT
+  @@innodb_flush_log_at_trx_commit, @@sync_binlog,
+  @@binlog_expire_logs_seconds, @@max_binlog_size;"` must return
+  `2 10000 172800 104857600`.
 ## PRO-30: auth hang defect, dev DB durability, and host I/O notes
 
 **Defect (found by QA on 2026-10-19, tracked in

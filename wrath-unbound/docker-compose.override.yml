@@ -4,6 +4,9 @@
 #   sudo -u pira scripts/compose-sync.sh
 # never with a bare `cp`, which skips the drift check on the sibling
 # load-test override (PRO-180).
+# NOTE: paths here (build context ".", ./conf, ./modules, ./data/sql) are
+# repo-root-relative, so this snapshot is valid only once compose-sync.sh
+# installs it at the repo root.
 services:
   ac-worldserver:
     build:
@@ -24,8 +27,9 @@ services:
       # auth/character ledgers stay under their existing process of record.
       AC_UPDATES_ENABLE_DATABASES: "4"
       # PRO-33: normal-operation default is 50 randombots. The load-test
-      # volume (1600-2000) is restored by docker-compose.loadtest.override.yml,
-      # see wrath-unbound/README.md ("Load testing") and docs/dev-environment.md.
+      # volume (1600-2000) is restored by docker-compose.loadtest.override.yml;
+      # see the "Load testing (randombot volume, PRO-33)" section in
+      # wrath-unbound/README.md and docs/dev-environment.md.
       AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"
       AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "50"
       AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "50"
