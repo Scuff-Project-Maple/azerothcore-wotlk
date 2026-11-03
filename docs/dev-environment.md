@@ -65,7 +65,11 @@ This repo's `.gitignore` intentionally keeps provisioned content out of the
 git index: `/modules/*`, `/env/dist/*`, and `/*.override.yml` are all
 gitignored. Provisioned files therefore live in the **working tree** of this
 checkout; only the core-source changes (`worldserver.conf.dist`), this doc,
-and the `wrath-unbound/` snapshot are tracked in git.
+the `scripts/compose-sync.sh` installer, and the `wrath-unbound/` snapshot are
+tracked in git. The two root compose overrides are **generated** copies of
+their `wrath-unbound/` snapshots and must not be hand-edited — see
+[Keep the compose overrides in sync](#keep-the-compose-overrides-in-sync-pre-boot-assertion)
+(PRO-180).
 
 ```
 <repo root>  (= this checkout of azerothcore-wotlk @ 7f12e89e…)
@@ -88,6 +92,8 @@ and the `wrath-unbound/` snapshot are tracked in git.
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
  │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
  ├── docker-compose.override.yml           # generated copy of wrath-unbound/docker-compose.override.yml (PRO-178): 50 randombots, world-DB auto-updates, Warden off, ./modules + ./data/sql + mysql-dev.cnf mounts
+ ├── docker-compose.loadtest.override.yml   # generated copy of wrath-unbound/docker-compose.loadtest.override.yml (PRO-33 profile, tracked since PRO-180): 1600–2000 randombots; only loaded via COMPOSE_FILE
+ ├── scripts/compose-sync.sh               # tracked: installs both generated copies from wrath-unbound/; `--check` is the pre-boot drift assertion (PRO-180)
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
 └── wrath-unbound/                        # tracked snapshot of the provisioned payload (reprovisioning source)
@@ -121,6 +127,47 @@ docker compose up -d --force-recreate ac-worldserver
 
 Stop/start without rebuild: `docker compose stop ac-worldserver` /
 `docker compose start ac-worldserver`.
+
+### Keep the compose overrides in sync (pre-boot assertion)
+
+`docker compose` only ever reads the two **gitignored root** overrides, so a
+stale root copy is a silent config regression — that is how PRO-33, PRO-65 and
+PRO-178 all drifted (the tracked snapshot and the root copy were hand-edited
+independently). Since PRO-180 the `wrath-unbound/` snapshots are the single
+source of truth and `scripts/compose-sync.sh` owns the root copies:
+
+```bash
+cd <repo root>
+scripts/compose-sync.sh --check   # pre-boot assertion; non-zero exit = drift
+scripts/compose-sync.sh           # install the snapshots over the root copies
+```
+
+Run `--check` **before** any `docker compose up`/`build`, and as the first step
+of the worldserver rebuild loop above. There is deliberately no allowlist: each
+pair must be byte-identical (`cmp`). Edit `wrath-unbound/*.override.yml`, never
+the root copies.
+
+### Load testing (randombot volume)
+
+The stack runs **50/50** randombots in normal operation
+(`AC_AI_PLAYERBOT_MIN/MAX_RANDOM_BOTS` in `docker-compose.override.yml`). The
+1600–2000 volume is the PRO-33 load-test profile and lives only in
+`wrath-unbound/docker-compose.loadtest.override.yml` (tracked since PRO-180;
+the root copy is generated). It is **not** merged by a plain
+`docker compose up`:
+
+```bash
+cd <repo root>
+scripts/compose-sync.sh --check
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
+  docker compose up -d --force-recreate ac-worldserver
+# back to the 50-bot default:
+docker compose up -d --force-recreate ac-worldserver
+```
+
+Take the single-writer lease (`/mnt/data/wow-server/.stack/lease`) before any
+recreate, and health-check afterwards (`RestartCount=0`, empty `Errors.log`,
+the expected number of `Bot … logged in` lines).
 
 ## Build host
 
@@ -387,9 +434,9 @@ mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
-cp wrath-unbound/docker-compose.override.yml .
-# the root override is a generated copy (PRO-178): never hand-edit it;
-# edit wrath-unbound/docker-compose.override.yml and re-run this cp
+scripts/compose-sync.sh
+# both root overrides are generated copies (PRO-178/PRO-180): never hand-edit
+# them; edit wrath-unbound/*.override.yml and re-run scripts/compose-sync.sh
 
 # the core hook patches are committed IN-TREE on Playerbot
 # (f5b197b8d mod-unbound, 6 files; b732dfd71 mod-custom-classes, 6 files)
@@ -447,10 +494,12 @@ verify per the sections above.
   on login).
 - **D3 — Tracked snapshot in `wrath-unbound/`.** The fork gitignores all
   provisioned content, so the payload's only upstream home is the embedded
-  heredocs in Dad's installer script. `wrath-unbound/` vendors an
-  extracted copy (byte-identical, provenance in its README) plus the
-  compose override so the tree can be rebuilt without re-downloading the
-  installer.
+   heredocs in Dad's installer script. `wrath-unbound/` vendors an
+   extracted copy (byte-identical, provenance in its README) plus **both**
+   compose overrides (the load-test one was added in PRO-180 — until then it
+   existed only as an untracked root file, so a clean-clone reprovision lost
+   it) so the tree can be rebuilt without re-downloading the
+   installer.
 - **D4 — mod-playerbots shallow clone.** `--depth 1` exactly as the base
   installer does it; its pinned head is recorded above. The team does not
   patch mod-playerbots; if they start to, fetch history first.
@@ -550,6 +599,13 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
 
 - Never disable an upstream patch or core check to make a build pass —
   report the real error on the issue instead.
+- **Compose overrides are generated (PRO-180):** the gitignored root
+  `docker-compose.override.yml` and `docker-compose.loadtest.override.yml` are
+  installed by `scripts/compose-sync.sh` from their `wrath-unbound/` snapshots.
+  Edit the snapshots only, run `scripts/compose-sync.sh` (then
+  `docker compose up -d --force-recreate ac-worldserver` to apply), and run
+  `scripts/compose-sync.sh --check` before any `up`/`build`. Hand-editing the
+  root copies is what produced the PRO-33/PRO-65/PRO-178 drift.
 - This fork's `AGENTS.md`: SQL outside `data/sql/updates/pending_db_*/` is
   immutable; module work lives under `modules/`; C++ is 4-space, no tabs,
   LF, ≤120 cols.
