@@ -1,7 +1,9 @@
 # Source of truth for the Project Maple dev-stack compose override
-# (PRO-178). The gitignored root docker-compose.override.yml is a copy of
-# this file - never hand-edit the root copy; regenerate it with:
-#   cp wrath-unbound/docker-compose.override.yml .
+# (PRO-178). The gitignored root docker-compose.override.yml is a generated
+# copy of this file - never hand-edit the root copy. Install it with:
+#   sudo -u pira scripts/compose-sync.sh
+# never with a bare `cp`, which skips the drift check on the sibling
+# load-test override (PRO-180).
 services:
   ac-worldserver:
     build:

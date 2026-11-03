@@ -37,7 +37,8 @@ Notes:
 
 - `docker-compose.override.yml` here is the **source of truth** (PRO-178):
   the root `docker-compose.override.yml` is a gitignored, generated copy.
-  Edit this file and run `scripts/compose-sync.sh` (PRO-180) to install it;
+  Edit this file and run `sudo -u pira scripts/compose-sync.sh` (PRO-180) to
+  install it (`--check` is read-only and runs as any user);
   never hand-edit the root copy (hand-editing it is what caused the PRO-178
   drift). `docker-compose.loadtest.override.yml` works the same way and is
   tracked here for the first time in PRO-180 — before PRO-180 it existed only
@@ -70,6 +71,12 @@ Notes:
 
 ## Staging command
 
+Run these **as the tree owner**. On the build host the checkout is
+`pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
+are not in the `pira` group, so a bare write exits `1` on the first `cp`;
+use a `pira` shell or prefix with `sudo -u pira` (shown on the installer
+below). `scripts/compose-sync.sh --check` is read-only and safe as any user.
+
 ```bash
 cp -r wrath-unbound/modules/mod-unbound modules/
 cp -r wrath-unbound/modules/mod-custom-classes modules/
@@ -78,8 +85,9 @@ cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
 # root overrides are generated copies of the snapshots above (PRO-180):
-# scripts/compose-sync.sh installs them; --check is the pre-boot assertion
-scripts/compose-sync.sh
+# the installer WRITES, so it runs as the tree owner; `--check` is the
+# read-only pre-boot assertion and needs no sudo
+sudo -u pira scripts/compose-sync.sh
 # core hook patches are in-tree on Playerbot (f5b197b8d, b732dfd71):
 # verify, do not re-apply (on a base-pinned tree, git-apply both patches
 # instead, unbound first):

@@ -174,14 +174,20 @@ source of truth and `scripts/compose-sync.sh` owns the root copies:
 
 ```bash
 cd <repo root>
-scripts/compose-sync.sh --check   # pre-boot assertion; non-zero exit = drift
-scripts/compose-sync.sh           # install the snapshots over the root copies
+scripts/compose-sync.sh --check     # read-only pre-boot assertion; any user
+sudo -u pira scripts/compose-sync.sh  # install: this WRITES — tree owner only
 ```
 
 Run `--check` **before** any `docker compose up`/`build`, and as the first step
 of the worldserver rebuild loop above. There is deliberately no allowlist: each
 pair must be byte-identical (`cmp`). Edit `wrath-unbound/*.override.yml`, never
 the root copies.
+
+**Run the install as the tree owner.** The build-host checkout is
+`pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
+are not in the `pira` group, so a bare `scripts/compose-sync.sh` exits `1` on
+the first `cp`; prefix it with `sudo -u pira` (as above) or run from a `pira`
+shell. `--check` only reads and is safe as any user.
 
 ### Load testing (randombot volume, PRO-33)
 
@@ -510,9 +516,13 @@ mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
+# installs both generated root overrides. On a fresh clone the tree is owned
+# by you, so no sudo is needed; on the existing build-host checkout (owned by
+# pira:pira, and agent logins are not in that group) use
+# `sudo -u pira scripts/compose-sync.sh` instead. `--check` is read-only.
 scripts/compose-sync.sh
 # both root overrides are generated copies (PRO-178/PRO-180): never hand-edit
-# them; edit wrath-unbound/*.override.yml and re-run scripts/compose-sync.sh
+# them; edit wrath-unbound/*.override.yml and re-run the installer
 
 # the core hook patches are committed IN-TREE on Playerbot
 # (f5b197b8d mod-unbound, 6 files; b732dfd71 mod-custom-classes, 6 files)
@@ -678,8 +688,10 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
 - **Compose overrides are generated (PRO-180):** the gitignored root
   `docker-compose.override.yml` and `docker-compose.loadtest.override.yml` are
   installed by `scripts/compose-sync.sh` from their `wrath-unbound/` snapshots.
-  Edit the snapshots only, run `scripts/compose-sync.sh` (then
-  `docker compose up -d --force-recreate ac-worldserver` to apply), and run
+  Edit the snapshots only, run `sudo -u pira scripts/compose-sync.sh` on the
+  build host (the installer writes, and the tree is `pira`-owned; `--check` is
+  read-only and safe as any user), then
+  `docker compose up -d --force-recreate ac-worldserver` to apply, and run
   `scripts/compose-sync.sh --check` before any `up`/`build`. Hand-editing the
   root copies is what produced the PRO-33/PRO-65/PRO-178 drift.
 - This fork's `AGENTS.md`: SQL outside `data/sql/updates/pending_db_*/` is

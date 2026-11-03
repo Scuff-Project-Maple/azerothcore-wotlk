@@ -9,8 +9,12 @@
 # PRO-178). There is deliberately no allowlist: each pair must be
 # byte-identical.
 #
-#   scripts/compose-sync.sh          install canonical copies over the root ones
-#   scripts/compose-sync.sh --check  pre-boot assertion; non-zero exit on drift
+#   scripts/compose-sync.sh           install the snapshots over the root
+#                                     copies — this WRITES, so on the build
+#                                     host run it as the tree owner:
+#                                     `sudo -u pira scripts/compose-sync.sh`
+#   scripts/compose-sync.sh --check   pre-boot assertion; non-zero exit on
+#                                     drift. Read-only: safe as any user.
 #
 set -euo pipefail
 
@@ -27,7 +31,7 @@ case "${1:-}" in
   "") ;;
   --check) mode=check ;;
   -h|--help)
-    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
     exit 0
     ;;
   *)
@@ -57,13 +61,21 @@ for pair in "${pairs[@]}"; do
     if [[ -f "$root/$installed" ]]; then
       diff -u "$root/$canonical" "$root/$installed" >&2 || true
     else
-      echo "compose-sync:       $installed is missing (run scripts/compose-sync.sh)" >&2
+      echo "compose-sync:       $installed is missing (run: sudo -u pira scripts/compose-sync.sh)" >&2
     fi
     status=1
   else
-    if ! cp -p "$root/$canonical" "$root/$installed" 2>/dev/null; then
-      echo "compose-sync: cannot write $installed — run as the tree owner" >&2
-      echo "compose-sync: (on the build host: sudo -u pira scripts/compose-sync.sh)" >&2
+    if [[ -d "$root/$installed" ]]; then
+      # cp would silently copy *into* the directory and report success
+      echo "compose-sync: $installed is a directory, expected a regular file" >&2
+      exit 1
+    fi
+    # Keep cp's own message: ENOSPC/EROFS must not be reported as a
+    # permissions problem just because the tree is pira-owned (PRO-180 review).
+    if ! cp_err=$(cp -p "$root/$canonical" "$root/$installed" 2>&1); then
+      echo "compose-sync: cannot write $installed: ${cp_err:-cp failed}" >&2
+      echo "compose-sync: (if that is a permissions error, the tree is owned by" >&2
+      echo "compose-sync:  pira: sudo -u pira scripts/compose-sync.sh)" >&2
       exit 1
     fi
     echo "compose-sync: wrote $installed from $canonical"
@@ -72,7 +84,8 @@ done
 
 if [[ $mode == check && $status -ne 0 ]]; then
   echo "compose-sync: fix with 'scripts/compose-sync.sh' in $root" >&2
-  echo "compose-sync: (on the build host the tree is owned by pira: sudo -u pira scripts/compose-sync.sh)" >&2
+  echo "compose-sync: (on the build host the tree is owned by pira, so that install" >&2
+  echo "compose-sync:  must run as: sudo -u pira scripts/compose-sync.sh)" >&2
 fi
 
 exit $status
