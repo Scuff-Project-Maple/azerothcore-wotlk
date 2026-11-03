@@ -123,9 +123,11 @@ wait, or coordinate in the holder's issue thread. Breaking a
 naming the lease you broke (its `agentId`, `issueId`, `acquiredAt`,
 `expectedMinutes`). Release when the action finishes, including on failure.
 Lease file: `/mnt/data/wow-server/.stack/lease` (JSON, one line). The
-`.stack/` dir is `0775 scuff-dev:pira` so both host drivers can write it — the
-compose root itself is not agent-writable. No cron, no daemon: the read is the
-rule.
+`.stack/` dir is `0775 scuff-dev:pira` so both host drivers can write it (the
+compose root became agent-writable too with
+[PRO-198](/PRO/issues/PRO-198) — see
+[Git access on the compose root](#git-access-on-the-compose-root)). No cron,
+no daemon: the read is the rule.
 
 ```bash
 # ACQUIRE — atomic (O_EXCL); prints LEASE_HELD + the holder and exits non-zero if someone is in there
@@ -244,7 +246,7 @@ Reachability from an agent run was re-verified by QA on 2026-10-18
 |---|---|
 | Address | `192.168.1.71` (hostname `pve-wow-dev`) |
 | SSH | `ssh 192.168.1.71` — already configured in `~/.ssh/config` (no `-i` needed) |
-| User | `scuff-dev` (member of groups `scuff-dev`, `sudo`, `docker`) |
+| User | `scuff-dev` (member of groups `scuff-dev`, `sudo`, `docker`, `pira`, `acore-git` — see [Git access on the compose root](#git-access-on-the-compose-root)) |
 | Key | `~/.ssh/id_ed25519_pve_wow_dev` (referenced by the `~/.ssh/config` entry) |
 | OS | Ubuntu 24.04.2 LTS, kernel 6.8.0-146-generic |
 | Docker | Engine 29.8.0, storage driver `overlayfs` |
@@ -276,6 +278,114 @@ ssh -o BatchMode=yes 192.168.1.71 'docker logs ac-worldserver | grep UNBOUND'
 A healthy boot ends with `[UNBOUND] Prereq map built.` and the stock
 `ready...` marker. `ValidateSkillLearnedBySpells = 0` was confirmed in
 `env/dist/etc/worldserver.conf` on the host.
+
+### Git access on the compose root
+
+`/mnt/data/wow-server` is owned `pira:pira` and is the **build provenance of the
+running `ac-worldserver` binary** ([PRO-69](/PRO/issues/PRO-69)). Agents work on
+it as `scuff-dev` without ever taking ownership. Two groups make that work, and
+neither one is optional:
+
+| Path | Group | Mode | Group that grants access |
+|---|---|---|---|
+| `.git/` dirs | `acore-git` | `drwxrwsr-x` (setgid) | `acore-git` — members `scuff-dev,pira` |
+| `.git/` files (`HEAD`, `config`, `FETCH_HEAD`, refs) | `acore-git` | `-rw-rw-r--` | `acore-git` — same members |
+| Worktree dirs | `pira` | `drwxrwxr-x` | `pira` — member `scuff-dev` |
+| Worktree tracked files | `pira` | `-rw-rw-r--` (executables such as `acore.sh` carry `x`) | `pira` — member `scuff-dev` |
+
+Under `.git` only the *directories* are setgid; the files in them are plain
+group-writable. Modes re-verified on the host 2026-11-03 with
+`stat -c "%A %U:%G %n" .git .git/HEAD .git/config .git/FETCH_HEAD`.
+
+The split is historical. [PRO-70](/PRO/issues/PRO-70) fixed the **`.git`** half
+only, and deliberately avoided widening agent membership by creating the
+dedicated `acore-git` group plus `git config core.sharedRepository group` in
+`.git/config`. That fixed `git fetch` (the frozen-`origin/Playerbot` bug) but
+left `git checkout`/`switch`/`reset`/`apply` failing, because the *worktree* is
+group-owned `pira` and was already `g+w` end to end — membership was the only
+zero-`chmod`, zero-`chown` path. [PRO-198](/PRO/issues/PRO-198) closed it with:
+
+```bash
+sudo usermod -aG pira scuff-dev
+```
+
+Final membership (verify with `id` / `getent group` on the host):
+
+```
+uid=1001(scuff-dev) gid=1001(scuff-dev) groups=1001(scuff-dev),27(sudo),988(docker),1000(pira),1002(acore-git)
+pira:x:1000:scuff-dev
+acore-git:x:1002:scuff-dev,pira
+```
+
+Live `id` output is a **single line** — the block above is intentionally
+unwrapped so a diff against reality does not produce a false mismatch
+(re-verified on the host 2026-11-03).
+
+Keep `acore-git` regardless of `pira`: `.git` relies on it plus the setgid bit
+and `core.sharedRepository=group`, and `pira` membership alone does not restore
+fetch if that group ownership is lost.
+
+**Rules for agents on this tree:**
+
+- **Never `chown`** any part of `/mnt/data/wow-server`, and never `chown -R`.
+  Ownership stays `pira`; shared access is a *group* problem, solved with
+  groups. A `chown` breaks the build provenance and the `acore-git`/`pira`
+  model at once.
+- Never `chgrp -R` / `chmod -R` over the worktree without explicit CEO/board
+  approval — that rewrites permissions across the running binary's provenance.
+- Git writes to the host tree (`checkout` / `switch` / `reset --hard` / `apply`)
+  require the [single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time).
+  The write itself is permitted — the tree is plain fork content, see
+  [Host tree layout](#host-tree-layout-resynced-to-fork-head-2026-10-18) — but a
+  branch move under a running worldserver invalidates someone else's
+  verification, which is what the lease exists to prevent. Never `reset --hard`
+  away work you did not create, never re-clone, never delete the tree. Keep the
+  tree on `Playerbot` unless a lease-holding task says otherwise.
+- A group change needs a **new SSH session** to take effect — existing
+  processes keep stale credentials. Verify with a fresh `ssh … 'id'`, not from
+  the session in which you ran `usermod`.
+- Caveat: the compose root is **not** setgid, so files an agent creates land
+  `scuff-dev:scuff-dev` and are read-only to `pira`. Making the *directories*
+  setgid would fix that, but it is a `chmod` over the provenance tree and
+  therefore needs the same CEO/board approval as the rule above.
+
+The read-only probe, and the two checks that prove the fix **without touching
+the worktree or the running stack**. `git fetch` is not a no-op: it writes
+`FETCH_HEAD`, objects and `refs/remotes/origin/*` into `.git` (and can trigger
+`git gc`) — that is precisely the write `acore-git` + `core.sharedRepository=group`
+exist to allow, and it needs no lease because it never touches the worktree or
+the stack:
+
+```bash
+# W_OK must be True for ., src, modules, .git, acore.sh, CMakeLists.txt.
+# src/AzerCore is listed for completeness and is EXPECTED to print False — see
+# the note under this block.
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && python3 -c "
+import os
+for p in [\".\",\"src\",\"modules\",\"/mnt/data/wow-server/.git\",\"acore.sh\",\"CMakeLists.txt\",\"src/AzerCore\"]:
+    print(f\"{p:32s} W_OK={os.access(p, os.W_OK)}\")
+"'
+# Anti-frozen-ref. Each fetch_exit must be 0, ls_remote_exit must be 0, and the
+# ref comparison is its own statement, so a fetch/permission failure or an
+# ls-remote network failure can no longer be misread as a frozen ref.
+# Expected as run 2026-11-03:
+#   fetch_exit=0  fetch_exit=0  ls_remote_exit=0  REF_TRACKS_REMOTE
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server || exit 9
+git fetch origin; echo "fetch_exit=$?"
+git fetch origin; echo "fetch_exit=$?"
+refs=$(git ls-remote origin refs/heads/Playerbot); echo "ls_remote_exit=$?"
+remote=$(printf "%s\n" "$refs" | cut -f1)
+echo "local=$(git rev-parse origin/Playerbot) remote=${remote:-none}"
+if [ -n "$remote" ] && [ "$(git rev-parse origin/Playerbot)" = "$remote" ]; then
+  echo REF_TRACKS_REMOTE
+else
+  echo REF_FROZEN_OR_UNAVAILABLE
+fi'
+```
+
+`src/AzerCore` is not present in this tree (`ls src/` → `cmake CMakeLists.txt
+common genrev server test tools`); a `W_OK=False` there means *missing path*,
+not a permissions gap — do not chase it.
 
 ### Host tree layout (resynced to fork head, 2026-10-18)
 
@@ -702,6 +812,20 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   immutable; module work lives under `modules/`; C++ is 4-space, no tabs,
   LF, ≤120 cols.
 - All git commits in this tree carry `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+- **No force-push to `Playerbot`, and none to any branch another agent may be
+  building from.** `Playerbot` is the shared integration branch and the
+  provenance of the running binary
+  ([Git access on the compose root](#git-access-on-the-compose-root)); rewriting
+  it loses someone else's work. The one allowed case is amending **your own
+  unmerged feature branch** to answer review — the normal fixup path, which is
+  how [PRO-205](/PRO/issues/PRO-205) re-landed `pro-198-agent-git-access`. Use
+  `--force-with-lease`, never plain `--force`. That allowance covers nothing
+  else. [PRO-69](/PRO/issues/PRO-69) step 2 is the decision record for the
+  `Playerbot` landing push: "Forbidden: `--force`, `--force-with-lease`,
+  history rewrite, deleting any remote branch" and "If the push is rejected,
+  stop and report — do not force." The bullet was moved here from the
+  compose-root permissions list at [PRO-203](/PRO/issues/PRO-203) request N6
+  because it is a git rule, not a filesystem one.
 - **Docker-only on the build host (board rule, [PRO-6](/PRO/issues/PRO-6)):** all
   deployments on `192.168.1.71` happen inside Docker containers — no code
   executes on that machine natively. Host facts: [Build host](#build-host).
