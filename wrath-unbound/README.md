@@ -108,15 +108,19 @@ The default override boots **50** randombots
 `docker-compose.loadtest.override.yml` and is enabled explicitly, from the
 repo root:
 
+Every boot here goes through the PRO-179 gate — the wrapper forwards the
+compose flags it recognises, so nothing needs to step around the gate (see
+[docs/dev-environment.md](../docs/dev-environment.md#build--run)):
+
 ```bash
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
-  docker compose up -d --force-recreate ac-worldserver
+  bash ops/deploy/worldserver-up.sh --force-recreate
 ```
 
 Return to the 50-bot default afterwards:
 
 ```bash
-docker compose up -d --force-recreate ac-worldserver
+bash ops/deploy/worldserver-up.sh --force-recreate
 ```
 
 `AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"` stays on in both, so the world

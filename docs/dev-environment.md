@@ -108,7 +108,9 @@ their `wrath-unbound/` snapshots and must not be hand-edited — see
 Services (from the stock `docker-compose.yml`, all started by one command):
 `ac-database` (mysql:8.4), `ac-db-import`, `ac-client-data-init`,
 `ac-worldserver`, `ac-authserver`. Compose project resolves from CWD —
-**always `cd` into the repo root before compose commands**.
+**always `cd` into the repo root before compose commands**. Except that
+`ac-worldserver` is not started by a bare `docker compose up` — its world-DB
+updater must clear the [PRO-179 pre-flight gate](#build--run) first.
 
 ## Single-writer lease (one worldserver, one writer at a time)
 
@@ -151,24 +153,74 @@ BatchMode SSH (agent sandboxes have no Docker). Take the
 before any command below that builds, starts, restarts or recreates a container,
 or applies SQL — read-only inspection commands do not need it.
 
-One documented command from a provisioned tree (fresh image build; 2–4 h on
-a typical host, less on the Steam Deck baseline the guide targets):
+> **Gate every worldserver start (PRO-179).** The AzerothCore world-DB updater
+> runs the moment `ac-worldserver` starts. `ops/deploy/worldserver-up.sh` runs
+> the [PRO-179 pre-flight gate](../ops/preflight/README.md) and only then
+> `docker compose up -d ac-worldserver`; on a gate failure it prints
+> `REFUSING BOOT` and exits non-zero **without touching the stack**. Never run
+> `docker compose up/start/recreate ac-worldserver` around the gate. Two
+> sanctioned forms:
+>
+> - **Any worldserver boot** (the common case):
+>   `bash ops/deploy/worldserver-up.sh` — gate, then `docker compose up -d
+>   ac-worldserver`. Recognised compose flags are forwarded, so
+>   `bash ops/deploy/worldserver-up.sh --force-recreate` and
+>   `COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
+>   bash ops/deploy/worldserver-up.sh` stay gated (`-f/--file` and
+>   `-p/--project-name` are forwarded to compose *and* to the gate, so the gate
+>   reads the same files compose will).
+> - **Anything the wrapper genuinely cannot express** — `up -d --build`,
+>   `docker compose restart` — run the gate alone first and boot only if it
+>   PASSes: `PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh`
+>   (exit 0 = PASS), then run your exact `docker compose` command. Never the
+>   other way round.
+>
+> The wrapper **verifies** the [single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time)
+> at `/mnt/data/wow-server/.stack/lease` and refuses to boot if it is missing,
+> unreadable or past its `expectedMinutes` window; it never **takes** it (the
+> gate is CI-safe and read-only, and a gate that could grab the lease would let
+> a CI run starve the host boot path). Take the lease yourself before the
+> wrapper. `PREFLIGHT_CHECK_ONLY=1` skips the lease check because nothing in
+> the stack is touched.
+
+Fresh provisioned tree (build every image; 2–4 h on a typical host, less on the
+Steam Deck baseline the guide targets). The updater runs when `ac-worldserver`
+starts and the gate reads the updater ledger from the live DB, so on a cold
+stack bring the database up first, gate, then start the worldserver (authserver
+and client-data are independent of the world updater):
 
 ```bash
-cd <repo root>
-docker compose up -d --build
+cd <repo root>                       # = /mnt/data/wow-server on the host
+docker compose build                 # builds all images; starts no container
+docker compose up -d ac-database     # one-shot ac-db-import loads the base schema
+# wait until ac-database is healthy and ac-db-import has finished
+bash ops/deploy/worldserver-up.sh    # gate, then up -d ac-worldserver
+docker compose up -d ac-authserver   # independent of the world updater
 ```
 
 After **any** core/module C++ change (the normal Scuff-Core loop —
-incremental, ~30–90 min):
+incremental, ~30–90 min), the rebuild stays a plain compose build and only the
+worldserver start is gated:
 
 ```bash
 docker compose build ac-worldserver
-docker compose up -d --force-recreate ac-worldserver
+bash ops/deploy/worldserver-up.sh    # gate, then up -d ac-worldserver (new image)
 ```
 
-Stop/start without rebuild: `docker compose stop ac-worldserver` /
-`docker compose start ac-worldserver`.
+If compose does not recreate on the new image and you must force it, forward
+the flag through the gate — do not step around it:
+
+```bash
+bash ops/deploy/worldserver-up.sh --force-recreate
+```
+
+Stop is un-gated (no updater runs while stopped); bring it back through the
+gate, not `docker compose start`:
+
+```bash
+docker compose stop ac-worldserver               # fine — updater does not run
+bash ops/deploy/worldserver-up.sh                # gate, then up -d ac-worldserver
+```
 
 ### Keep the compose overrides in sync (pre-boot assertion)
 
@@ -208,9 +260,9 @@ the root copy is generated). It is **not** merged by a plain
 cd <repo root>
 scripts/compose-sync.sh --check
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
-  docker compose up -d --force-recreate ac-worldserver
+  bash ops/deploy/worldserver-up.sh --force-recreate
 # back to the 50-bot default:
-docker compose up -d --force-recreate ac-worldserver
+bash ops/deploy/worldserver-up.sh --force-recreate
 ```
 
 Take the single-writer lease (`/mnt/data/wow-server/.stack/lease`) before any
@@ -667,8 +719,11 @@ git apply modules/mod-unbound/unbound-core-access.patch
 git apply modules/mod-custom-classes/custom-class-core-access.patch
 ```
 
-Then `docker compose up -d --build`, apply the SQL migrations above, and
-verify per the sections above.
+Then `docker compose build`, bring up `ac-database` and `ac-authserver`, apply
+the SQL migrations above, and start `ac-worldserver` through the gate
+(`bash ops/deploy/worldserver-up.sh`) — never with a bare
+`docker compose up -d --build`, which starts the worldserver un-gated. Verify
+per the sections above.
 
 ## Deviations from the guide (documented explicitly, per PRO-2)
 
@@ -808,8 +863,10 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   installed by `scripts/compose-sync.sh` from their `wrath-unbound/` snapshots.
   Edit the snapshots only, run `sudo -u pira scripts/compose-sync.sh` on the
   build host (the installer writes, and the tree is `pira`-owned; `--check` is
-  read-only and safe as any user), then
-  `docker compose up -d --force-recreate ac-worldserver` to apply, and run
+  read-only and safe as any user), then apply with
+  `bash ops/deploy/worldserver-up.sh --force-recreate` — not a bare
+  `docker compose up`, which skips the gate (see the pre-flight gate rule
+  below) — and run
   `scripts/compose-sync.sh --check` before any `up`/`build`. Hand-editing the
   root copies is what produced the PRO-33/PRO-65/PRO-178 drift.
 - This fork's `AGENTS.md`: SQL outside `data/sql/updates/pending_db_*/` is
@@ -840,6 +897,26 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   worldserver restart/recreate, `docker compose up`, DB migration, or e2e run
   without first holding `/mnt/data/wow-server/.stack/lease` — see
   [Single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time).
+- **World-DB pre-flight gate (PRO-179):** never start, recreate, or restart
+  `ac-worldserver` without the gate having passed — use
+  `bash ops/deploy/worldserver-up.sh` (it forwards `--force-recreate`,
+  `-f/--file`, `-p/--project-name` and honours `COMPOSE_FILE`), or
+  `PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh` before an exact
+  `docker compose` command the wrapper cannot express (`up -d --build`,
+  `restart`). Take the lease first — the wrapper verifies it, the gate does not
+  take it; keep `AC_UPDATES_ENABLE_DATABASES=4` and leave the Playerbots updater
+  (`acore_playerbots`) alone. The wrapper **refuses** the flags that would let a
+  boot step around what the gate read: `-f/--file`, `--env-file` and
+  `-p/--project-name` after a bare `--` (pass them before `--`), `--compose-root`
+  and `--gate` (set `COMPOSE_ROOT`/`PYTHON` instead, so the gate and the `cd`
+  cannot disagree), and `--no-boot-path-check` unless `PREFLIGHT_CHECK_ONLY=1`.
+  A restart that changes **no** SQL can skip the slow half of the gate — the
+  scratch clone plus up to `--data-copy-max-rows` rows copied per referenced
+  table — with `bash ops/deploy/worldserver-up.sh --no-dry-run`; it prints a
+  warning on purpose, because it is exactly the fast path that must not be used
+  after a SQL change. `--keep-scratch` keeps the scratch schema instead of
+  dropping it, for post-mortem queries. See
+  [Build & run](#build--run) and [`ops/preflight/README.md`](../ops/preflight/README.md).
 - **Prohibited on the host:** a `cmake`/`make`/gcc build tree, binaries run
   outside a container, and any `docker`-alternative that shells out to a
   host-local toolchain. `docker compose up -d --build` is fine — it compiles
