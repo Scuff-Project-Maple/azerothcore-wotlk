@@ -1,0 +1,276 @@
+{
+  "version": 1,
+  "_comment": [
+    "Policy for the PRO-179 world-DB updater pre-flight gate.",
+    "Every value here is a governance decision owned by Scuff (SQL) and reviewed by Scuff (Rev).",
+    "Fail-closed rule: a table that is not listed in 'tables' (base tables) or 'customTables'",
+    "cannot be written by a company-authored update file. Adding a table = a reviewed diff to this file.",
+    "Bands come from docs/content-playbook.md section 2.4 (reserved ids) and PRO-175 (spawn-guid band)."
+  ],
+
+  "liveDatabase": "acore_world",
+  "scratchDatabaseDefault": "acore_world_preflight",
+
+  "includedDirs": [
+    { "path": "$/data/sql/archive/db_world", "state": "ARCHIVED", "origin": "upstream" },
+    { "path": "$/data/sql/custom/db_world", "state": "CUSTOM", "origin": "company" },
+    { "path": "$/data/sql/updates/db_world", "state": "RELEASED", "origin": "upstream" },
+    { "path": "$/data/sql/updates/pending_db_world", "state": "PENDING", "origin": "company" }
+  ],
+
+  "expectedSourceDirectory": "/azerothcore",
+  "worldserverConfCandidates": ["env/dist/etc/worldserver.conf", "env/dist/etc/worldserver.conf.dist"],
+
+  "companyEmailDomains": ["paperclip.local"],
+
+  "writePolicyExemptOrigins": ["upstream"],
+
+  "forbiddenStatements": [
+    "ALTER", "DROP", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
+    "LOAD", "CALL", "LOCK", "UNLOCK", "HANDLER", "PREPARE", "DEALLOCATE",
+    "KILL", "SHUTDOWN", "CREATE_USER", "SET_GLOBAL", "OPTIMIZE", "ANALYZE", "REPAIR", "CHECKSUM"
+  ],
+
+  "baseTables": {
+    "creature_template": {
+      "keyColumns": ["entry"],
+      "bands": [{ "column": "entry", "min": 900000 }]
+    },
+    "creature": {
+      "keyColumns": ["guid", "id"],
+      "bands": [{ "column": "guid", "min": 9000000 }],
+      "refs": [{ "column": "id", "min": 900000 }]
+    },
+    "creature_addon": {
+      "keyColumns": ["guid"],
+      "bands": [{ "column": "guid", "min": 9000000 }]
+    },
+    "creature_template_model": {
+      "keyColumns": ["CreatureID"],
+      "bands": [{ "column": "CreatureID", "min": 900000 }]
+    },
+    "creature_template_spell": {
+      "keyColumns": ["CreatureID"],
+      "bands": [{ "column": "CreatureID", "min": 900000 }]
+    },
+    "creature_model": {
+      "keyColumns": ["CreatureDisplayID"],
+      "bands": []
+    },
+    "creature_queststarter": {
+      "keyColumns": ["id", "quest"],
+      "refs": [{ "column": "id", "min": 900000 }, { "column": "quest", "min": 900000 }]
+    },
+    "creature_questender": {
+      "keyColumns": ["id", "quest"],
+      "refs": [{ "column": "id", "min": 900000 }, { "column": "quest", "min": 900000 }]
+    },
+    "creature_loot_template": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "reference_loot_template": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "quest_template": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "quest_template_addon": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "quest_request_items": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "quest_offer_reward": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "quest_details": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "quest_greeting": {
+      "keyColumns": ["ID", "Type"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "quest_offer_items": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "gameobject": {
+      "keyColumns": ["guid", "id"],
+      "bands": [{ "column": "guid", "min": 9000000 }],
+      "refs": [{ "column": "id", "min": 900000 }]
+    },
+    "gameobject_template": {
+      "keyColumns": ["entry"],
+      "bands": [{ "column": "entry", "min": 900000 }]
+    },
+    "gameobject_queststarter": {
+      "keyColumns": ["guid", "quest"],
+      "refs": [{ "column": "quest", "min": 900000 }]
+    },
+    "gameobject_questender": {
+      "keyColumns": ["guid", "quest"],
+      "refs": [{ "column": "quest", "min": 900000 }]
+    },
+    "gameobject_loot_template": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "item_template": {
+      "keyColumns": ["entry"],
+      "bands": [{ "column": "entry", "min": 900000 }]
+    },
+    "item_loot_template": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "page_text": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "page_text_locales": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "gossip_menu": {
+      "keyColumns": ["MenuID"],
+      "bands": [{ "column": "MenuID", "min": 900000 }]
+    },
+    "gossip_menu_option": {
+      "keyColumns": ["MenuID"],
+      "bands": [{ "column": "MenuID", "min": 900000 }]
+    },
+    "gossip_greeting": {
+      "keyColumns": ["MenuID"],
+      "bands": [{ "column": "MenuID", "min": 900000 }]
+    },
+    "npc_vendor": {
+      "keyColumns": ["entry"],
+      "bands": [{ "column": "entry", "min": 900000 }]
+    },
+    "npc_trainer": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "npc_class_trainer": {
+      "keyColumns": ["TrainerId"],
+      "bands": [{ "column": "TrainerId", "min": 900000 }]
+    },
+    "npc_spellclick_spells": {
+      "keyColumns": ["npc_entry"],
+      "bands": [{ "column": "npc_entry", "min": 900000 }]
+    },
+    "smart_scripts": {
+      "keyColumns": ["entryorguid", "source_type"],
+      "bands": [],
+      "_note": "entryorguid is only reserved-band-checked for source_type 0 (CREATURE) and 1 (GAMEOBJECT) by convention; the gate requires the literal to be present and >= 900000 unless the table entry sets bandOff."
+    },
+    "smart_template": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "conditions": {
+      "keyColumns": ["SourceType", "SourceGroup", "SourceID"],
+      "bands": []
+    },
+    "spell_dbc": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "spell_loot_template": {
+      "keyColumns": ["Entry"],
+      "bands": [{ "column": "Entry", "min": 900000 }]
+    },
+    "spell_script_names": {
+      "keyColumns": ["spell_id"],
+      "bands": []
+    },
+    "spell_group": {
+      "keyColumns": ["id"],
+      "bands": []
+    },
+    "spell_learn_spell": {
+      "keyColumns": ["entry"],
+      "bands": []
+    },
+    "player_classlevelstats": {
+      "keyColumns": ["class", "level"],
+      "bands": []
+    },
+    "player_factionchange_achievement": {
+      "keyColumns": ["alliance_id", "horde_id"],
+      "bands": []
+    },
+    "achievement_criteria_tree": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "achievement_reward": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "creature_onkill_reputation": {
+      "keyColumns": ["creature_id"],
+      "bands": [{ "column": "creature_id", "min": 900000 }]
+    },
+    "creature_text": {
+      "keyColumns": ["CreatureID"],
+      "bands": [{ "column": "CreatureID", "min": 900000 }]
+    },
+    "factiontemplate": {
+      "keyColumns": ["id"],
+      "bands": []
+    },
+    "areatrigger_template": {
+      "keyColumns": ["id"],
+      "bands": [{ "column": "id", "min": 900000 }]
+    },
+    "areatrigger_involvedrelation": {
+      "keyColumns": ["id", "quest"],
+      "bands": [],
+      "refs": [{ "column": "quest", "min": 900000 }]
+    },
+    "areatrigger_scripts": {
+      "keyColumns": ["entry"],
+      "bands": []
+    },
+    "broadcast_text": {
+      "keyColumns": ["ID"],
+      "bands": [{ "column": "ID", "min": 900000 }]
+    },
+    "db_script_string": {
+      "keyColumns": ["id"],
+      "bands": []
+    },
+    "instance_template": {
+      "keyColumns": ["map"],
+      "bands": []
+    },
+    "map_template": {
+      "keyColumns": ["map"],
+      "bands": []
+    }
+  },
+
+  "customTables": {
+    "custom_class_template": { "keyColumns": ["template_key"] },
+    "unbound_class_catalog": { "keyColumns": ["class_id"] },
+    "unbound_milestones": { "keyColumns": ["milestone_id"] },
+    "module_string": { "keyColumns": ["module", "key"] },
+    "module_string_locale": { "keyColumns": ["module", "key", "locale"] },
+    "_note": "Custom tables are the only place a company migration may put new schema. keyColumns are checked against the live PRIMARY KEY at run time and a mismatch is reported as a warning; a custom table with no PK is a hard failure."
+  },
+
+  "allowUntrackedFiles": false,
+  "deadReferenceWarnOnly": true,
+  "hashCheck": {
+    "ignoreArchivedPairMismatch": true,
+    "emptyLedgerHashIsWarning": true
+  }
+}
