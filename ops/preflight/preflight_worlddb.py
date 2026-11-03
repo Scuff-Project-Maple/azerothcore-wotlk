@@ -885,10 +885,32 @@ UPDATE_HEAD_RE = re.compile(r"^\s*UPDATE\s*(?:(?:LOW_PRIORITY|IGNORE|HIGH_PRIORI
 DELETE_HEAD_RE = re.compile(r"^\s*DELETE\s*(?:(?:LOW_PRIORITY|QUICK|IGNORE|UNIQUE)\s+)*",
                             re.IGNORECASE)
 BACKTICKED_NAME_RE = re.compile(r"`([^`]+)`")
+BACKTICK_SPAN_RE = re.compile(r"`[^`]*`")
+# The syntax a single-table write region must be free of. Splitting on these is how
+# the rejection path decides which names in the region sit in a table position.
+REGION_SPLIT_RE = re.compile(
+    r"(?<![A-Za-z0-9_$])(?:JOIN|STRAIGHT_JOIN|INNER|OUTER|CROSS|NATURAL|USING)(?![A-Za-z0-9_$])|,",
+    re.IGNORECASE)
 # `UPDATE`smart_scripts` is legal MySQL: the backtick terminates the verb token.
 # The head patterns therefore allow the table to abut the verb; a verb that is not
 # UPDATE/DELETE never reaches here (parse_statement already decided), and anything
 # the region grammar does not understand fails closed.
+
+
+def blank_backticked(s: str) -> str:
+    """Blank the inside of every backticked run, keeping length and the backticks.
+
+    The multi-table region tests look for JOIN, `,` and `(` as *syntax*, and a name
+    is not syntax: ``UPDATE `creature` `join` SET`` and ``DELETE FROM `creature`
+    `using` WHERE`` are single-table writes that rev-3 refused because the alias
+    happened to be spelled like a keyword (PRO-179 review NB-3). Offsets survive so
+    the same span can be sliced out of the unblanked text for the name extraction.
+    """
+    out = list(s)
+    for m in BACKTICK_SPAN_RE.finditer(s):
+        for i in range(m.start() + 1, m.end() - 1):
+            out[i] = " "
+    return "".join(out)
 
 
 def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str],
@@ -898,8 +920,9 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
     Returns `([(schema, table), ...], aliases, error, region)`. A well-formed
     single-table write yields one target plus any alias, which the caller needs
     so `WHERE c.guid = 9002020` counts as bounding `creature.guid`. Anything
-    else yields an error string and, best effort, every backticked name the
-    region still mentions.
+    else yields an error string, the tables the region still names in a table
+    position (the ledger among them), and the other names it mentions — see
+    `_region_tables()`.
 
     Only one write target is accepted. MySQL's multi-table forms (`UPDATE a JOIN
     b`, `UPDATE a, b`, `DELETE a, b FROM ...`, derived tables, index hints) are
@@ -933,39 +956,62 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
 
     if pre.strip():
         region = masked[head.end():hi]
-        return _region_tables(masked, head.end(), hi), set(), \
+        tables, others = _region_tables(masked, head.end(), hi)
+        return tables, others, \
             f"table list {pre.strip()[:60]!r} before FROM is multi-table DELETE syntax", region
-    region_masked = PARTITION_CLAUSE_RE.sub(" ", masked[lo:hi])
+    region_names = PARTITION_CLAUSE_RE.sub(" ", masked[lo:hi])
+    # The three syntax tests read the region with backticked names blanked, so an
+    # alias spelled `join`/`using` or a name containing a comma cannot manufacture a
+    # multi-table write (PRO-179 review NB-3). Name extraction still reads the
+    # unblanked text, and PARTITION clauses stay visible because their contents are
+    # never quoted.
+    region_scan = blank_backticked(region_names)
     region = masked[lo:hi].strip()
     err = None
-    if WRITE_JOIN_RE.search(region_masked):
+    if WRITE_JOIN_RE.search(region_scan):
         err = "the write region contains a JOIN"
-    elif "," in region_masked:
+    elif "," in region_scan:
         err = "the write region is a comma-separated table list"
-    elif "(" in region_masked:
+    elif "(" in region_scan:
         err = ("the write region contains a parenthesised expression (derived table or index "
                "hint), which the gate does not attempt to parse")
-    m = WRITE_REGION_RE.match(region_masked)
+    m = WRITE_REGION_RE.match(region_names)
     if err is None and not m:
         err = "the write region is not a single table with an optional alias"
     if err is not None:
-        return _region_tables(masked, lo, hi), set(), err, region
+        tables, others = _region_tables(masked, lo, hi)
+        return tables, others, err, region
     schema, table = split_qualified(m.group("tbl"))
     aliases = {unquote_ident(m.group("alias")).lower()} if m.group("alias") else set()
     return [(schema, table)], aliases, None, region
 
 
-def _region_tables(masked: str, lo: int, hi: int) -> list[tuple[str | None, str]]:
-    """Every backticked name in the write region, in order of first appearance.
+def _region_tables(masked: str, lo: int, hi: int) -> tuple[list[tuple[str | None, str]], set[str]]:
+    """(tables, other names) for a rejected write region, in order of first appearance.
 
     Used only on the rejection path, so the report can name the table a rejected
-    statement was reaching for (the ledger among them).
+    statement was reaching for (the ledger among them). The region is split on the
+    *syntax* keywords with backticked names blanked, and inside each fragment the
+    first name is the table position while the rest are aliases and qualifiers:
+    ``UPDATE `creature` `c` JOIN `updates` `u` SET`` names two tables, `creature` and
+    `updates`, and `c`/`u` are names, not tables — running them through the
+    allow-list check reported a phantom `table-not-allowed` for each (PRO-179
+    review NB-2).
     """
-    seen: dict[str, tuple[str | None, str]] = {}
-    for name in BACKTICKED_NAME_RE.findall(masked[lo:hi]):
-        schema, table = split_qualified(name)
-        seen.setdefault(table.lower(), (schema, table))
-    return list(seen.values())
+    raw = masked[lo:hi]
+    scan = blank_backticked(PARTITION_CLAUSE_RE.sub(" ", raw))
+    bounds = [0] + [m.end() for m in REGION_SPLIT_RE.finditer(scan)] + [len(scan)]
+    tables: dict[str, tuple[str | None, str]] = {}
+    others: set[str] = set()
+    for a, b in zip(bounds, bounds[1:]):
+        names = BACKTICKED_NAME_RE.findall(raw[a:b])
+        for idx, name in enumerate(names):
+            schema, table = split_qualified(name)
+            if idx == 0 and table:
+                tables.setdefault(table.lower(), (schema, table))
+            else:
+                others.add(table.lower() if table else name.lower())
+    return list(tables.values()), others
 
 
 # --------------------------------------------------------------------------- #
@@ -986,6 +1032,7 @@ class Preflight:
         self.sql_root = Path(args.sql_root) if args.sql_root else Path(args.compose_root, "data", "sql")
         self.git_root = Path(args.git_root) if args.git_root else Path(args.compose_root)
         self.violations: list[dict] = []
+        self.policy_stats: dict = {}
 
     # -- helpers ------------------------------------------------------------- #
 
@@ -1595,6 +1642,8 @@ class Preflight:
                 verb_at = off + (len(masked) - len(masked.lstrip()))
                 line = self.line_of(text, verb_at)
                 self._policy_statement(f, st, line)
+        self.policy_stats = {"files": checked_files, "statements": statements,
+                             "exemptFiles": len(new_files) - checked_files}
         self.r.line("4", f"{checked_files} new file(s) under write policy, {statements} statement(s) "
                          f"inspected; reserved bands "
                          f"creature_template.entry/quest_template.ID>="
@@ -1710,12 +1759,16 @@ class Preflight:
         targets, qualifiers, err, region = write_targets(st)
         if err:
             extra = ", ".join(sorted({t for _, t in targets})) or "none identifiable"
+            named = f"tables named: {extra}"
+            if qualifiers:
+                named += f"; other names in region: {', '.join(sorted(qualifiers))}"
             bad("multi-table-write",
                 f"{st.verb} is not a single-table write: {err} (write region {region!r}; "
-                f"tables named: {extra}). Split it into one statement per table, each "
+                f"{named}). Split it into one statement per table, each "
                 f"WHERE-bounded on that table's natural key.")
-            # Still name every table the region mentions, so the report says
-            # *what* the statement was reaching for even though it is rejected.
+            # Still name every table the region mentions in a table position, so the
+            # report says *what* the statement was reaching for even though it is
+            # rejected. Aliases are excluded: they are names, not write targets.
             for _schema, table in targets:
                 self._check_write_target(bad, st, table, _schema, base, custom)
             return
@@ -1753,10 +1806,16 @@ class Preflight:
             bad("on-duplicate-key", "INSERT ... ON DUPLICATE KEY UPDATE is rejected: use the "
                                     "documented DELETE-then-INSERT idempotency pattern")
             return
+        # MySQL puts INSERT's PARTITION clause before the column list; the review POC
+        # wrote it after, the way UPDATE/DELETE carry it. Accept either position — the
+        # clause selects partitions to write to, it cannot change which ids the VALUES
+        # rows contain, and every id is still band-checked (PRO-179 review NB-4).
+        part = f"(?:{PARTITION_CLAUSE_RE.pattern})?\\s*"
         m = re.match(
             r"^\s*(?:INSERT|REPLACE)\s+(?:(?:LOW_PRIORITY|DELAYED|HIGH_PRIORITY|IGNORE)\s+)*"
-            r"(?:INTO\s+)?" + TBL_CAP + r"\s*(?:\((?P<cols>[^()]*(?:\([^()]*\)[^()]*)*)\))?\s*"
-            r"[^()]*?(?P<how>VALUES|VALUE|SET)\b", masked, re.IGNORECASE)
+            r"(?:INTO\s+)?" + TBL_CAP + r"\s*" + part
+            + r"(?:\((?P<cols>[^()]*(?:\([^()]*\)[^()]*)*)\))?\s*" + part
+            + r"[^()]*?(?P<how>VALUES|VALUE|SET)\b", masked, re.IGNORECASE)
         if not m:
             bad("unparsable", "could not parse the INSERT target/column list — fail closed")
             return
@@ -1914,10 +1973,17 @@ class Preflight:
                 break
             if best is None or len(problems) < len(best):
                 best = problems
+        why = ""
+        if where_text:
+            scan = blank_subqueries(mask_sql(where_text))
+            if has_expression_negation(scan, 0, len(scan)):
+                why = ("; a negated group (NOT ...) in the WHERE is the reason: it admits every "
+                       "row outside the group, so the key bounds present cannot bound the "
+                       "statement. Rewrite without NOT, or name the ids explicitly.")
         bad("unbounded-write",
             f"{verb} on {st.table} is not WHERE-bounded on a complete natural key "
             f"(keys tried: {key_sets}; closest: {'; '.join(best or [])}; "
-            f"columns bounded on every branch: {sorted(bound) or 'none'})")
+            f"columns bounded on every branch: {sorted(bound) or 'none'}){why}")
 
     def _check_literals(self, bad, st, preds, bands, refs, verb):
         rules: dict[str, tuple[int, str]] = {}

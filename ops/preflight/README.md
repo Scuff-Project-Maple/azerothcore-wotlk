@@ -21,6 +21,12 @@ Recognised compose flags (`--force-recreate`, `-f/--file`, `-p/--project-name`, 
 reads, to the gate as well; `COMPOSE_FILE` is honoured the same way. That closes the
 "boot straight past the gate" gap the wrapper would otherwise leave.
 
+Everything after a bare `--` is passed to `docker compose` untouched, which is exactly why the
+wrapper refuses it by **shape** rather than by exact token: `-f…`, `-p…`, `--file…`, `--env…`,
+`--project…` and `--compose-*` are refused in any form — `-- -f=/tmp/evil.yml`, `-- -f/tmp/evil.yml`
+and `-- -p=proj` all fail closed, while `-- --force-recreate` and `-- ac-worldserver` pass through
+(rev-3 NB-1). A compose file the gate never read must never reach the boot.
+
 ## Checks
 
 | # | Check | Failure mode it prevents |
@@ -84,12 +90,21 @@ For a file under policy, every statement must satisfy:
   `UPDATE creature c JOIN updates u SET ...`, `UPDATE a, b SET ...`, `DELETE a, b FROM a JOIN b` —
   is a `multi-table-write` failure, and every table named in that region is still checked against
   the ledger and the allow-list, so a JOIN cannot smuggle `updates` past check 4;
+- **aliases are names, not write targets.** `UPDATE \`creature\` \`c\` SET ...` writes one table; `c`
+  is reported as `other names in region: c` and is never tested against the allow-list, so an alias
+  cannot manufacture a `table-not-allowed` (rev-3 NB-2). The syntax test for a second table ignores
+  what is inside backticks, so an alias spelled like syntax — `UPDATE \`creature_template\` \`join\`
+  SET ...`, `DELETE FROM \`creature\` \`using\` WHERE ...` — is still a single-table write (NB-3);
+  a real `JOIN` is refused regardless of the quoting;
 - every `UPDATE`/`DELETE` is `WHERE`-bounded on a **complete** natural key: every column of one
   of the table's `keySets` groups compared to literals with `=`/`<=>`/`IN`, no `OR` that decides
   which rows are reached. Grouping parentheses do not hide a disjunction
   (`WHERE (source_type=0 OR entryorguid=9002020)` fails), a key bounded only on one side of an
   `OR` does not bound the statement, a column bounded only inside `IN (SELECT ...)` does not
-  count at all, and `NOT (entry=...)` bounds nothing. `key = 1 AND (x='a' OR x='b')` stays legal.
+   count at all, and `NOT (entry=...)` bounds nothing — the failure says so, naming the negated
+   group as the reason rather than blaming the key columns that are present (rev-3 NB-5).
+   `key = 1 AND (x='a' OR x='b')` stays legal.
+
   Predicates after the key are read up to the first top-level `ORDER BY`/`LIMIT`, so trailing
   clauses cannot make a literal look like a non-literal.
   With no `keySets`, the whole `keyColumns` list is one required group. Bounding on part of a
@@ -102,6 +117,29 @@ For a file under policy, every statement must satisfy:
   (`creature_template.entry` / `quest_template.ID` >= 900000, `creature.guid` >= 9000000,
   plus the reference columns in `refs`), as a literal in a named column;
 - no `INSERT ... SELECT`, no `ON DUPLICATE KEY UPDATE`, no `INSERT SET` syntax.
+
+`INSERT`, `UPDATE` and `DELETE` may all carry a `PARTITION (pN)` clause (`INSERT` puts it before
+the column list; both positions are parsed). The clause picks partitions, not rows, so it changes
+nothing about which ids a statement touches and every id is still band-checked (rev-3 NB-4).
+
+## Measuring the policy over the whole corpus
+
+`ops/preflight/corpus_sweep.py` runs the same check-4 engine over every `.sql` in the four included
+directories (3 060 files / 131 625 statements at the time of writing) and tallies findings per rule,
+per provenance class and per directory. It is the only honest way to review a parser change: the
+boot gate only policy-checks files the updater has not applied yet, so a regression that starts
+refusing upstream syntax is invisible to it until someone tries to boot.
+
+```
+python3 ops/preflight/corpus_sweep.py --out /tmp/before.json   # add --strict-all for the full corpus
+# ...change the engine...
+python3 ops/preflight/corpus_sweep.py --diff /tmp/before.json   # per-rule deltas, nothing else
+python3 ops/preflight/corpus_sweep.py --rule table-not-allowed  # offending file:line
+```
+
+The number that matters is the `company` column: it must stay 0, because a finding in
+company-authored SQL is a boot refusal. The `upstream` columns are the corpus the gate exempts by
+default, and are measured with `--strict-all` to see how much syntax the engine understands.
 
 ## Dry run (check 5)
 

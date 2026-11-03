@@ -158,12 +158,14 @@ while [[ $# -gt 0 ]]; do
       shift
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          -f|--file|--file=*|--env-file|--env-file=*|-p|--project-name|--project-name=*|\
---compose-file|--compose-file=*|--compose-project|--compose-project=*)
+          -[fp]*|--file*|--env*|--project*|--compose-file*|--compose-project*)
             # Everything after `--` goes to `docker compose` verbatim, so a
-            # compose file or project named here would boot without the gate
-            # having read it (PRO-179 review N-2). Pass them before `--`, where
-            # they are also forwarded to the gate.
+            # compose file, env file or project named here would boot without the
+            # gate having read it (PRO-179 review N-2). Matched by *shape*, not by
+            # exact token: rev-3 refused `-- -f x` but let `-- -f=/tmp/evil.yml`,
+            # `-- -f/tmp/evil.yml` and `-- -p=proj` sail through to the boot
+            # (PRO-179 review NB-1). Pass them before `--`, where they are also
+            # forwarded to the gate.
             die "refusing to forward $1 to docker compose: it selects what boots, and the gate must read exactly that. Pass it before -- instead."
             ;;
         esac

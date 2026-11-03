@@ -59,6 +59,19 @@ def lines_for(sql: str) -> list[int]:
     return out
 
 
+def findings_for(sql: str) -> list[tuple[str, str]]:
+    """(rule, message) for every FAIL a statement earns — for assertions on wording."""
+    pf = make_preflight()
+    fake_file = {"rel": "fixture.sql", "path": Path("fixture.sql")}
+    for text, offset in split_statements(sql):
+        masked = mask_sql(text)
+        if not masked.strip():
+            continue
+        pf._policy_statement(fake_file, parse_statement(text, masked, offset),
+                             pf.line_of(sql, offset))
+    return [(f.rule, f.message) for f in pf.r.findings if f.severity == "FAIL"]
+
+
 class TestStatements(unittest.TestCase):
     def test_semicolon_in_string_does_not_split(self):
         sql = "INSERT INTO `custom_class_template` (`template_key`,`label`) VALUES ('a;b','c');\n" \
@@ -690,6 +703,91 @@ class TestDirtyWorktree(unittest.TestCase):
         f = self._file(pf, "DELETE FROM `creature` WHERE `script_name` = 'x';")
         pf._dirty_cache = None          # git could not answer
         self.assertTrue(pf.is_dirty(f["path"]))
+
+
+class TestRev3NonBlocking(unittest.TestCase):
+    """PRO-179 rev-3 NB-1..NB-5: report noise, name-vs-syntax, INSERT PARTITION, NOT."""
+
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+
+    # NB-2 — aliases are names, not write targets.
+    def test_aliases_are_not_reported_as_unallowlisted_tables(self):
+        found = findings_for("UPDATE `creature` `c` JOIN `updates` `u` SET u.hash = 'x' "
+                             "WHERE c.guid = 9002020;")
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules)
+        self.assertEqual([], [m for r, m in found if r == "table-not-allowed"],
+                         "aliases were blamed as write targets")
+        msg = next(m for r, m in found if r == "multi-table-write")
+        self.assertIn("creature", msg)
+        self.assertIn("updates", msg)
+        self.assertIn("other names in region: c, u", msg)
+
+    # NB-3 — a name spelled like syntax is not syntax.
+    def test_alias_named_like_a_keyword_is_a_single_table_write(self):
+        self.assertEqual([], rules_for(
+            "UPDATE `creature_template` `join` SET `npcflag` = 3 WHERE `entry` = 900200;"))
+        self.assertEqual([], rules_for(
+            "DELETE FROM `creature` `using` WHERE `guid` = 9002020;"))
+
+    def test_real_join_is_still_refused_despite_the_blanking(self):
+        self.assertIn("multi-table-write", rules_for(
+            "UPDATE `creature_template` `c` JOIN `game_event` `ge` ON c.entry = ge.guid "
+            "SET c.npcflag = 3 WHERE c.entry = 900200;"))
+
+    # NB-4 — INSERT carries the same PARTITION clause UPDATE/DELETE do.
+    def test_insert_partition_clause_is_parsed(self):
+        self.assertEqual([], rules_for(
+            "INSERT INTO `page_text` (`ID`,`Text`) PARTITION (p1) VALUES (900001,'a');"))
+        self.assertEqual([], rules_for(
+            "INSERT INTO `page_text` PARTITION (p1) (`ID`,`Text`) VALUES (900001,'a');"))
+        self.assertIn("reserved-band", rules_for(
+            "INSERT INTO `page_text` (`ID`,`Text`) PARTITION (p1) VALUES (42,'a');"))
+        self.assertIn("band-column-missing", rules_for(
+            "INSERT INTO `page_text` (`Text`) PARTITION (p1) VALUES ('a');"))
+
+    # NB-5 — the refusal must blame the negation, not the key that is present.
+    def test_negated_group_says_so(self):
+        found = findings_for(
+            "UPDATE `smart_scripts` SET `comment` = 'x' WHERE `entryorguid` = 9002020 "
+            "AND `source_type` = 0 AND NOT (`comment` = 'y');")
+        rules = [r for r, _ in found]
+        self.assertIn("unbounded-write", rules)
+        msg = next(m for r, m in found if r == "unbounded-write")
+        self.assertIn("NOT", msg)
+        self.assertIn("entryorguid", msg)
+
+    # NB-1 — the post-`--` refusal must match shapes, not exact tokens.
+    def _run_wrapper(self, argv):
+        """Run the wrapper against an empty COMPOSE_ROOT.
+
+        The root has no `.stack/lease`, so a run that gets past argument parsing
+        dies at the lease check: these tests can never reach `docker compose`, even
+        on the deploy host where a real lease may be held.
+        """
+        import os
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, COMPOSE_ROOT=tmp, LEASE_FILE=str(Path(tmp) / "lease"))
+            return subprocess.run(["bash", str(self.WRAPPER), *argv],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, timeout=60, env=env)
+
+    def test_wrapper_refuses_compose_selectors_after_double_dash(self):
+        for tail in (["--", "-f=/tmp/evil.yml"], ["--", "-f/tmp/evil.yml"], ["--", "-p=proj"],
+                     ["--", "-f", "x"], ["--", "--env-file", "x"], ["--", "--project-name=proj"],
+                     ["--", "--compose-file=x.yml"]):
+            proc = self._run_wrapper(tail)
+            self.assertEqual(proc.returncode, 2, f"{tail}: {proc.stdout[:200]}")
+            self.assertIn("refusing to forward", proc.stdout, f"{tail}")
+
+    def test_wrapper_still_forwards_benign_flags_after_double_dash(self):
+        for tail in (["--", "--force-recreate"], ["--", "--wait"], ["--", "ac-worldserver"]):
+            proc = self._run_wrapper(tail)
+            self.assertNotIn("refusing to forward", proc.stdout, f"{tail}")
+            self.assertIn("lease", proc.stdout, f"{tail}")
 
 
 if __name__ == "__main__":
