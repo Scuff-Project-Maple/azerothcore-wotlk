@@ -173,6 +173,8 @@ public:
     ~PreparedStatementTask() override;
 
     bool Execute() override;
+    void ResolveFutureOnStall() override;
+    std::string_view GetOperationName() const override { return "PreparedStatementTask"; }
     PreparedQueryResultFuture GetFuture() { return m_result->get_future(); }
 
 protected:

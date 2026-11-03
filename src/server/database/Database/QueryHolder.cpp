@@ -74,6 +74,12 @@ void SQLQueryHolderBase::SetSize(std::size_t size)
 
 SQLQueryHolderTask::~SQLQueryHolderTask() = default;
 
+void SQLQueryHolderTask::ResolveFutureOnStall()
+{
+    if (ClaimCompletion())
+        m_result.set_value();
+}
+
 bool SQLQueryHolderTask::Execute()
 {
     /// execute all queries in the holder and pass the results
@@ -81,7 +87,8 @@ bool SQLQueryHolderTask::Execute()
         if (PreparedStatementBase* stmt = m_holder->m_queries[i].first)
             m_holder->SetPreparedResult(i, m_conn->Query(stmt));
 
-    m_result.set_value();
+    if (ClaimCompletion())
+        m_result.set_value();
     return true;
 }
 

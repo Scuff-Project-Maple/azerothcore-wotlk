@@ -23,6 +23,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 template <typename T>
@@ -84,6 +85,8 @@ public:
     void Ping();
 
     uint32 GetLastError();
+
+    [[nodiscard]] std::string_view GetDatabaseName() const { return m_connectionInfo.database; }
 
 protected:
     /// Tries to acquire lock. If lock is acquired by another thread

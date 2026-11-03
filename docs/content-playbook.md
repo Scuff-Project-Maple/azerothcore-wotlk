@@ -149,18 +149,88 @@ against this section.
 - Never run a destructive migration against a live world database without
   naming the backup you took first.
 
-### 2.4 Guid and entry strategy
+### 2.4 Id spaces: template entries vs. spawn guids
 
+**There are two id spaces here and they have two different reserved ranges.
+Never read the reservation for one as the reservation for the other.** The
+`900000+` reservation below is for template entries **only**. Copying it
+literally into a spawn guid writes into upstream data, and because §2.2 makes
+migrations idempotent with `INSERT IGNORE`, the row is silently skipped
+instead of erroring — the content simply never appears in game and the
+migration still reports success.
+
+**(a) Template entries — company-reserved at `900000` and up.**
+
+- Applies to the id column of the content tables: `creature_template.entry`,
+  `item_template.entry`, `gameobject_template.entry`, `quest_template.ID`,
+  `achievement.ID` and the other content-table id columns.
+- Precedents: creature entry `900001` (The Mentor), item entry `900100`
+  (Unbounding Mentor Stone).
+- Allocate from `900000` upward, never reuse an entry, and record the
+  allocation in the migration file header so the next engineer sees it.
+
+**(b) Spawn guids — a different id space, company-reserved at `9000000` and
+up.**
+
+- Applies to `creature.guid` and `gameobject.guid`: the primary keys of the
+  spawn tables, and the columns `creature_addon`, `gameobject_addon`, the
+  `pool_*` tables and most scripting joins hang off. A `creature` row is
+  `(guid, id)` — `guid` is the spawn, `id` is an entry from (a). They are
+  separate tables with separate counters, but reserve the **same band for
+  both** so there is one rule to remember.
 - **Guids are coordinates, not decoration.** A hard-coded guid collides the
   moment two pieces of content want the same spawn. Where practical, use
   guid columns or reserved ranges instead of literals.
-- **Company-reserved custom entry range: `900000` and up.** Precedents:
-  creature entry `900001` (The Mentor), item entry `900100` (Unbounding
-  Mentor Stone). Allocate from this range upward, never reuse an entry, and
-  record the allocation in the migration file header so the next engineer
-  sees it. Flag every hard-coded guid you add in the task update.
+- **Six-digit guids are stock data.** Measured read-only against the live
+  `acore_world` on 2026-11-03: stock spawn guids run `1..5300678`
+  (`MAX(guid)` under `9000000`), and stock rows already sit inside the
+  six-digit band — `guid 945802` and `945803` both exist, both `id 10644`.
+  So `guid 900200` is not "in our reserved range", it is somebody else's
+  spawn row. The base dump agrees: `data/sql/base/db_world/creature.sql`
+  ships `AUTO_INCREMENT=5300679` and `gameobject.sql` ships `5714438`.
+- Do not mistake those watermarks for guids. `5300679` is an auto-increment
+  value, not a spawn guid, and no `creature` row has it — the correction and
+  the `.npc load` re-run this owes are recorded in
+  [docs/dev-environment.md § Worldserver console vs in-game GM commands](dev-environment.md#worldserver-console-vs-in-game-gm-commands).
+- **Preferred shape: `900<entry><seq>`.** Entry `900200` → spawns `9002001`,
+  `9002002`, … Understand *why* it is safe: the trailing sequence digit makes
+  the value seven digits, i.e. `>= 9000000`, i.e. inside band (b). The shape
+  carries no protection on its own — drop the sequence digit, pick `900200`,
+  and you are writing into stock data again.
+- Precedents in the band: `9002001` Ranger Vex (`creature.id 900200`,
+  committed by `2026_10_19_00.sql`), `9002020` The Mentor (`creature.id
+  900001`, committed by `2026_11_03_00.sql`). `9002020` deliberately does not
+  follow the shape: the live database and the dev-environment doc already
+  name it, and the tree must agree with what runs. Renumber it only as one
+  paired `DELETE` + `INSERT` taken under the single-writer lease, never as a
+  free edit.
+- **Check the ceiling before you open a new band.** Before allocating a guid
+  anywhere in (b) the team has not used before, read these SELECT-only and
+  put both numbers in the migration header — stock ceiling and stock rows in
+  the band:
+
+  ```sql
+  SELECT MAX(`guid`) FROM `creature`   WHERE `guid` <  9000000; -- stock ceiling
+  SELECT COUNT(*)    FROM `creature`   WHERE `guid` >= 9000000
+                                       AND `id` < 900000;        -- stock rows in band
+  SELECT COUNT(*)    FROM `gameobject` WHERE `guid` >= 9000000; -- band contents
+  ```
+
+  Ship them as a SELECT-only sibling validation file (§2.1) asserting
+  `stock_in_custom_band = 0`, `unmapped_custom_guids = 0` and the expected
+  `max_stock_guid`, so drift in either direction is caught rather than
+  discovered in game (precedent: `2026_11_03_01.sql` query 4).
 - Fixed world objects (stones, beacons, world-boss spawns) may use fixed
-  spawn guids; record them next to the spawn data in the same migration.
+  spawn guids from band (b). Flag every hard-coded guid you add in the task
+  update, and record it in an allocation block in the file header next to the
+  spawn data:
+
+  ```
+  -- HARD-CODED GUID (flagged per playbook section 2.4b): creature.guid 9002001
+  --   Guid allocation record for the custom band in this fork:
+  --     9002001 -> Ranger Vex (creature_template 900200) spawn
+  ```
+
 - New **maps/zones**: map and area data is DBC-side. Our toolchain does not
   author DBC; a spec that needs a new map must say so at breakdown time and
   route to the manager — it is not a SQL task.
@@ -190,7 +260,9 @@ against this section.
 
 - Adding **new rows** to upstream content tables (`creature_template`,
   `item_template`, `quest_template`, `smart_scripts`, spawns, …) with new
-  ids in our reserved range is the normal way to add world content. Do it.
+  ids in our reserved range is the normal way to add world content. Do it —
+  using the right range for the right column: entries from §2.4a, spawn
+  `guid`s from §2.4b.
 - **Never modify an existing upstream row in place** — add a new entry with
   a new id instead.
 - **Never modify an upstream base table's schema in place** (new columns,
@@ -286,9 +358,12 @@ A quest, event, dungeon, or world-boss spec contains all of:
    state is), not "the player does stuff".
 3. **Content inventory** — every NPC, creature, item, spell, quest,
    gameobject, faction, achievement, pet, and cosmetic the feature needs,
-   with the world ids it expects, or "allocate from the `900000`+ reserved
-   range" (§2.4) where the designer does not pin the id. Vague entries here
-   become wrong work downstream.
+   with the world ids it expects, or "allocate from the reserved range"
+   where the designer does not pin the id — and say **which id space** each
+   id lives in: template entries are reserved at `900000`+, spawn guids at
+   `9000000`+ (§2.4a / §2.4b). "The NPC is 900000+" is ambiguous; a spawn
+   guid pinned to six digits collides stock data and silently fails to
+   load. Vague entries here become wrong work downstream.
 4. **Mechanics with numbers** — damage, thresholds, timings, respawn
    windows, cooldowns, scaling rules. "Enraged at 50%" is a mechanic;
    "it gets harder" is not.
@@ -308,7 +383,7 @@ A quest, event, dungeon, or world-boss spec contains all of:
 
 | Spec material | Layer | Owner | Task content |
 |---|---|---|---|
-| Content inventory entries | SQL | `Scuff (SQL)` | id allocation (§2.4), rows in content tables or new custom table, migration with rollback, reference cross-checks (§2.5), validation query |
+| Content inventory entries | SQL | `Scuff (SQL)` | id allocation (§2.4a entries / §2.4b spawn guids), rows in content tables or new custom table, migration with rollback, reference cross-checks (§2.5), validation query |
 | Trigger/flow, mechanics, edge-case behaviour | Lua | `Scuff (Lua)` | ALE script(s) in `env/dist/etc/modules/lua_scripts/`, defensive nil-checks, reload-idempotent registration, data requested from SQL (no hard-coded content ids in Lua where a query or a constant file suffices) |
 | Framework, registry, mask, stat-base, learn-gate, or other system behaviour (§3.1 step 3–4) | Core | `Scuff (Core)` | module code and/or the core hook patch, with §3.2 evidence |
 | Acceptance criteria | QA | `Scuff (QA)` | player-path verification plan; findings as expected/actual + reproduction + evidence |
@@ -350,8 +425,9 @@ self-certifies.
   no real player data. Every commit carries
   `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
 - **The task update says:** what was verified in game vs. what was only
-  verified against the database or the build; every hard-coded guid (§2.4);
-  for any core patch, the §3.2 evidence; and the exact command to re-run the
+  verified against the database or the build; every hard-coded id with its
+  id space named — template entry or spawn guid (§2.4a / §2.4b); for any
+  core patch, the §3.2 evidence; and the exact command to re-run the
   key check (§6).
 
 ### 5.2 Review (`Scuff (Rev)` — the merge gate)
@@ -364,8 +440,10 @@ idea of the feature. Checks:
   preservation of the unbound module's expectations (the six patched files,
   `Player::GetUnboundClassMask()` consult sites).
 - **Database safety** — idempotent and reversible (§2.2–2.3), no colliding
-  hard-coded guids (§2.4), no upstream base-table modification in place
-  (§2.6), every referenced spell/creature/item/quest present (§2.5).
+  ids (§2.4: template entries in `900000`+, spawn guids in `9000000`+; a
+  band opened without the stock-ceiling check), no upstream base-table
+  modification in place (§2.6), every referenced spell/creature/item/quest
+  present (§2.5).
 - **Scripting safety** — can the script take down a live worldserver (nil
   dereference on a missing entry, unguarded player, event double-registered
   on reload)? Does it grant items/levels/gold outside a designed path?

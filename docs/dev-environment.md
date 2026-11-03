@@ -71,7 +71,11 @@ This repo's `.gitignore` intentionally keeps provisioned content out of the
 git index: `/modules/*`, `/env/dist/*`, and `/*.override.yml` are all
 gitignored. Provisioned files therefore live in the **working tree** of this
 checkout; only the core-source changes (`worldserver.conf.dist`), this doc,
-and the `wrath-unbound/` snapshot are tracked in git.
+the `scripts/compose-sync.sh` installer, and the `wrath-unbound/` snapshot are
+tracked in git. The two root compose overrides are **generated** copies of
+their `wrath-unbound/` snapshots and must not be hand-edited — see
+[Keep the compose overrides in sync](#keep-the-compose-overrides-in-sync-pre-boot-assertion)
+(PRO-180).
 
 ```
 <repo root>  (= this checkout of azerothcore-wotlk @ 7f12e89e…)
@@ -93,8 +97,9 @@ and the `wrath-unbound/` snapshot are tracked in git.
  │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
  │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
-├── docker-compose.override.yml            # 50 random bots (DB auto-updates), Warden off for e2e, ./modules mount
-├── docker-compose.loadtest.override.yml  # PRO-33: restores the 1600–2000 randombot volume for load tests (opt-in)
+ ├── docker-compose.override.yml           # generated copy of wrath-unbound/docker-compose.override.yml (PRO-178): 50 randombots, world-DB auto-updates, Warden off, ./modules + ./data/sql + mysql-dev.cnf mounts
+ ├── docker-compose.loadtest.override.yml   # generated copy of wrath-unbound/docker-compose.loadtest.override.yml (PRO-33 profile, tracked since PRO-180): 1600–2000 randombots; only loaded via COMPOSE_FILE
+ ├── scripts/compose-sync.sh               # tracked: installs both generated copies from wrath-unbound/; `--check` is the pre-boot drift assertion (PRO-180)
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
 └── wrath-unbound/                        # tracked snapshot of the provisioned payload (reprovisioning source)
@@ -200,24 +205,47 @@ docker compose stop ac-worldserver               # fine — updater does not run
 bash ops/deploy/worldserver-up.sh                # gate, then up -d ac-worldserver
 ```
 
-### Load testing (randombot volume, PRO-33)
+### Keep the compose overrides in sync (pre-boot assertion)
 
-Default boots load **50** randombots
-(`AC_AI_PLAYERBOT_MIN_RANDOM_BOTS`/`MAX_RANDOM_BOTS` = `50` in
-`docker-compose.override.yml`). The former 1600–2000 load-test volume is
-restored by `docker-compose.loadtest.override.yml`, which is **not** picked
-up by a plain `docker compose up`. From the repo root:
+`docker compose` only ever reads the two **gitignored root** overrides, so a
+stale root copy is a silent config regression — that is how PRO-33, PRO-65 and
+PRO-178 all drifted (the tracked snapshot and the root copy were hand-edited
+independently). Since PRO-180 the `wrath-unbound/` snapshots are the single
+source of truth and `scripts/compose-sync.sh` owns the root copies:
 
 ```bash
-# load-test boot (1600–2000 randombots) — gate first, boot only on PASS
-PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh   # REFUSING BOOT on failure
+cd <repo root>
+scripts/compose-sync.sh --check   # pre-boot assertion; non-zero exit = drift
+scripts/compose-sync.sh           # install the snapshots over the root copies
+```
+
+Run `--check` **before** any `docker compose up`/`build`, and as the first step
+of the worldserver rebuild loop above. There is deliberately no allowlist: each
+pair must be byte-identical (`cmp`). Edit `wrath-unbound/*.override.yml`, never
+the root copies.
+
+### Load testing (randombot volume, PRO-33)
+
+The stack runs **50/50** randombots in normal operation
+(`AC_AI_PLAYERBOT_MIN/MAX_RANDOM_BOTS` in `docker-compose.override.yml`). The
+1600–2000 volume is the PRO-33 load-test profile and lives only in
+`wrath-unbound/docker-compose.loadtest.override.yml` (tracked since PRO-180;
+the root copy is generated). It is **not** merged by a plain
+`docker compose up`:
+
+```bash
+cd <repo root>
+scripts/compose-sync.sh --check
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
   docker compose up -d --force-recreate ac-worldserver
-
-# back to the 50-bot default — gate first, boot only on PASS
-PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh
+# back to the 50-bot default:
+PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh   # REFUSING BOOT on failure
 docker compose up -d --force-recreate ac-worldserver
 ```
+
+Take the single-writer lease (`/mnt/data/wow-server/.stack/lease`) before any
+recreate, and health-check afterwards (`RestartCount=0`, empty `Errors.log`,
+the expected number of `Bot … logged in` lines).
 
 Verify the loaded count after boot: the `bot_count` row in
 `acore_playerbots.playerbots_random_bots` (owner=0, bot=0) should read 50
@@ -443,13 +471,21 @@ exposes only a **subset** of GM commands. In this build
 
 `<spawn guid>` is the primary key of the `acore_world.creature` table, not
 the creature template id. For "The Mentor" (template 900001) the persistent
-spawn row is **`guid 9002020`** (Eastern Kingdoms, -8830/614/93.5; the
-earlier row `guid 5300679` was replaced during later data work):
+spawn row is `guid 9002020` (`creature.id = 900001`, Eastern Kingdoms,
+-8830/614/93.5). The row is owned by
+`data/sql/updates/pending_db_world/2026_11_03_00.sql` (committed 2026-11-03,
+PRO-114). The guid previously documented here, `5300679`, was never a spawn
+guid: it is only the `AUTO_INCREMENT` value in
+`data/sql/base/db_world/creature.sql`, and no `creature` row with that guid
+exists (measured read-only on the live `acore_world` 2026-11-03):
 
 ```
 .npc load 9002020
-# → "Creature spawn 9002020 is already loaded."  (console-side proof the
-#   NPC is in the live world; re-verified 2026-10-27)
+# → "Creature spawn 9002020 is already loaded."
+#   The row is created by data/sql/updates/pending_db_world/
+#   2026_11_03_00.sql. The 2026-10-19 run of this check was recorded against
+#   guid 5300679, which does not exist in acore_world.creature, so the check
+#   is owed a re-run on PRO-108 (single-writer lease).
 ```
 
 All other `.npc` subcommands — including `.npc add` — are `Console::No`
@@ -516,8 +552,9 @@ mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
-cp wrath-unbound/docker-compose.override.yml .
-cp wrath-unbound/docker-compose.loadtest.override.yml .
+scripts/compose-sync.sh
+# both root overrides are generated copies (PRO-178/PRO-180): never hand-edit
+# them; edit wrath-unbound/*.override.yml and re-run scripts/compose-sync.sh
 
 # the core hook patches are committed IN-TREE on Playerbot
 # (f5b197b8d mod-unbound, 6 files; b732dfd71 mod-custom-classes, 6 files)
@@ -575,18 +612,118 @@ verify per the sections above.
   on login).
 - **D3 — Tracked snapshot in `wrath-unbound/`.** The fork gitignores all
   provisioned content, so the payload's only upstream home is the embedded
-  heredocs in Dad's installer script. `wrath-unbound/` vendors an
-  extracted copy (byte-identical, provenance in its README) plus the
-  compose override so the tree can be rebuilt without re-downloading the
-  installer.
+   heredocs in Dad's installer script. `wrath-unbound/` vendors an
+   extracted copy (byte-identical, provenance in its README) plus **both**
+   compose overrides (the load-test one was added in PRO-180 — until then it
+   existed only as an untracked root file, so a clean-clone reprovision lost
+   it) so the tree can be rebuilt without re-downloading the
+   installer.
 - **D4 — mod-playerbots shallow clone.** `--depth 1` exactly as the base
   installer does it; its pinned head is recorded above. The team does not
   patch mod-playerbots; if they start to, fetch history first.
+
+- **D5 — Dev DB durability relaxed (PRO-30).** `conf/mysql-dev.cnf`
+  (tracked via the `!/conf/mysql-dev.cnf` gitignore exception added in
+  PRO-178 — before that it was gitignored and unmounted) is bind-mounted
+  into `ac-database` at `/etc/mysql/conf.d/maple-dev.cnf` by the **tracked**
+  `wrath-unbound/docker-compose.override.yml`; the root
+  `docker-compose.override.yml` is a generated copy of it (PRO-178).
+  Values: `innodb_flush_log_at_trx_commit = 2`,
+  `sync_binlog = 10000`, `binlog_expire_logs_seconds = 172800`,
+  `max_binlog_size = 104857600`. The dev box is a KVM VM on shared storage;
+  per-commit fsyncs (InnoDB log + binlog) wedged the worldserver main thread
+  for minutes under I/O pressure, stalling external-client auth (see
+  [PRO-30](/PRO/issues/PRO-30) and the section below). Trade-off: on power
+  failure the dev DB may lose up to ~1 s of transactions. Do not carry these
+  values into a production stack.
+  Verify the mount and values are live:
+  `docker inspect ac-database --format '{{json .Mounts}}'` lists the cnf
+  bind mount, and `docker exec ac-database mysql -u root -ppassword -N -e
+  "SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog;"` returns `2
+  10000`.
+## PRO-30: auth hang defect, dev DB durability, and host I/O notes
+
+**Defect (found by QA on 2026-10-19, tracked in
+[PRO-30](/PRO/issues/PRO-30)):** every external WotLK client login hung at
+auth — no `SMSG_AUTH_RESPONSE`, no server log line, no stuck MySQL query
+visible from the client side. In-process playerbot logins were unaffected
+until the stall.
+
+**Root cause (verified with live backtraces on the host):**
+
+1. The worldserver **main thread** executes synchronous DB commits on the
+   per-tick bot-update path: `World::Update` -> `RandomPlayerbotMgr::UpdateAI`
+   -> `SetEventValue` -> `PlayerbotsDatabasePool::CommitTransaction`
+   (`DirectCommitTransaction`, mod-playerbots). The same pattern exists on
+   the characters pool via async transaction tasks.
+2. With `innodb_flush_log_at_trx_commit = 1` + `sync_binlog = 1` (MySQL
+   defaults), every commit forces fsyncs on the shared KVM storage.
+3. Under host I/O pressure (concurrent docker builds; root disk near full),
+   commit flushes took minutes ("waiting for handler commit" in
+   `information_schema.processlist`; transactions stuck in InnoDB
+   `ACTIVE (PREPARED)` waiting on the binlog flush). The main thread sat in
+   `SSL_read` inside `mysql_real_query("COMMIT")`, so `World::Update` never
+   advanced, auth query callbacks were never processed, and external clients
+   timed out.
+
+**Fix applied (dev stack):**
+
+- `conf/mysql-dev.cnf` (D5): no per-commit fsyncs; commits complete in
+  microseconds even under I/O pressure. Historical note (PRO-178): at the
+  October verification this file was gitignored and no compose mount
+  referenced it, so the running server kept MySQL defaults
+  (`@@innodb_flush_log_at_trx_commit = 1`, `@@sync_binlog = 1`); the tuning
+  was never actually in effect until the tracked override mounted it on
+  2026-11-03.
+- Disk hygiene on the build host: `docker builder prune` (41 GB build cache
+  -> ~31 GB) and `PURGE BINARY LOGS BEFORE` (16.5 GB binlogs -> 5 files).
+  Root disk went 98% -> ~82%. Keep an eye on it: the MySQL data volume and
+  the docker build cache share the 62 GB root disk.
+
+**Verification:**
+
+- `docker compose up -d --build`-fresh boot on the host: `ready...`,
+  `[UNBOUND] Prereq map built.`, custom-class registry line, 1865/1865
+  playerbots logged in, zero "waiting for handler commit" sessions under
+  the bot login storm.
+- External login re-verified with the tracked e2e suite
+  (`e2e/smoke/smoke_e2e_test.go`, AzerothGhost harness v1.0.8):
+  `TestSmoke_ValidLoginEnterWorld` PASS (auth -> `SMSG_AUTH_RESPONSE` ->
+  in-world at Eastern Kingdoms). QA re-run is tracked as
+  [PRO-31](/PRO/issues/PRO-31).
+
+**Hardening (implemented + deployed, under independent review):** the
+main-thread commit storm is batched in
+`modules/mod-playerbots/src/Bot/RandomPlayerbotMgr.{h,cpp}` — per-tick
+event writes are deferred into one transaction committed once at the end
+of `UpdateAIInternal` (was: one commit per event), and the boot top-up
+uses single `IN`-list SELECTs (was: per-row SELECTs). Crash-durability
+delta: up to one tick (~1s) of event writes, re-synced from DB at next
+boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
+(independent verification by Scuff Rev).
+
+**Debugging notes (reused during PRO-30):**
+
+- The worldserver container has no capabilities (`CapEff=0`) and the
+  rebuilt image has no gdb; attach with a PID-namespace-sharing helper:
+  `docker run --rm --cap-add SYS_PTRACE --pid=container:ac-worldserver
+  scuff/gdbprobe gdb -batch -p 1 -ex "thread apply all bt 20"`.
+- Per-pool commit state: `SELECT id,db,command,time,state FROM
+  information_schema.processlist WHERE command <> 'Sleep';` (stuck commits
+  show `waiting for handler commit`; `SHOW ENGINE INNODB STATUS` shows the
+  stuck trx as `ACTIVE (PREPARED)` when waiting on the binlog).
 
 ## Rules
 
 - Never disable an upstream patch or core check to make a build pass —
   report the real error on the issue instead.
+- **Compose overrides are generated (PRO-180):** the gitignored root
+  `docker-compose.override.yml` and `docker-compose.loadtest.override.yml` are
+  installed by `scripts/compose-sync.sh` from their `wrath-unbound/` snapshots.
+  Edit the snapshots only, run `scripts/compose-sync.sh` (then
+  `docker compose up -d --force-recreate ac-worldserver` to apply), and run
+  `scripts/compose-sync.sh --check` before any `up`/`build`. Hand-editing the
+  root copies is what produced the PRO-33/PRO-65/PRO-178 drift.
 - This fork's `AGENTS.md`: SQL outside `data/sql/updates/pending_db_*/` is
   immutable; module work lives under `modules/`; C++ is 4-space, no tabs,
   LF, ≤120 cols.
@@ -626,5 +763,5 @@ verify per the sections above.
 - [x] Setup doc in the repo (this file)
 - [x] Build worldserver (on the build host; current running rev `34d6f4b0e8c7+`, 2026-10-25; first verified `fd6df4549+`, 2026-10-19)
 - [x] Clean boot + `[UNBOUND] Prereq map built.` (re-verified 2026-10-27 on `rev. 34d6f4b0e8c7+`; no errors/crash)
-- [x] NPC 900001 in the live world — template 900001 "The Mentor" + persistent spawn row **guid 9002020** in `acore_world`; `.npc load 9002020` → "already loaded" (console-side proof)
+- [x] NPC 900001 in the live world — template 900001 "The Mentor" (upstream addon `wrath-unbound/modules/mod-unbound/npc_setup.sql`, which ships no spawn row) + persistent spawn row (guid 9002020, `creature.id = 900001`, map 0 at -8830/614/93.5, `spawntimesecs` 300) in `acore_world`, owned by `data/sql/updates/pending_db_world/2026_11_03_00.sql`; `.npc load 9002020` is the console-side check — re-run owed on PRO-108, because the earlier `5300679` guid never existed
 - [x] `.npc add 900001` from an in-game GM3 character — **PASS** in [PRO-43](/PRO/issues/PRO-43) (2026-10-27): new live unit + persisted `creature` row, no errors; test spawn deleted, persistent `9002020` intact

@@ -1,0 +1,8 @@
+# Project Maple dev DB: relax durability so per-commit fsyncs cannot wedge the
+# worldserver main thread under shared-storage I/O pressure (PRO-30).
+# Trade-off: on power failure, up to ~1s of InnoDB redo + binlog may be lost.
+[mysqld]
+innodb_flush_log_at_trx_commit = 2
+sync_binlog = 10000
+binlog_expire_logs_seconds = 172800
+max_binlog_size = 104857600

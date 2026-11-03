@@ -1,0 +1,48 @@
+-- ============================================================================
+-- 2026_10_19_01 -> T4.1 Ranger Vex (900200) npcflag correction (PRO-28)
+-- Authority: PRO-5 spec v3 revision a627e583 section 3 pins the corrected
+-- constant npcflag 3 for Ranger Vex; PRO-28 reports the defect (the NPC
+-- offers no quests).
+--
+-- Content of this file (one constant-set UPDATE; it does not modify an
+-- upstream row - playbook section 2.6: creature_template entry 900200 is
+-- company reserved-range content created by 2026_10_19_00.sql):
+--   1. creature_template.npcflag for entry 900200 "Ranger Vex": 1 -> 3.
+--      3 = UNIT_NPC_FLAG_GOSSIP (0x1) | UNIT_NPC_FLAG_QUESTGIVER (0x2),
+--      verified against this fork's enum NPCFlags in
+--      src/server/game/Entities/Unit/UnitDefines.h.
+--      2026_10_19_00.sql inserts the row with npcflag 1 (gossip only, copied
+--      from 900001 The Mentor), so Vex carries no quest-giver bit: the client
+--      shows no "!" over him and the quest relation between creature 900200
+--      and quests 900101/900102 is not exposed, so the T4.1 Murloc Tide chain
+--      cannot be started from him. That is the PRO-28 defect closed here.
+--      Filename ordering is load-bearing (playbook section 2.1): this file
+--      must sort after 2026_10_19_00.sql so 3 is the final applied value; the
+--      world DB updater applies pending_db_world in filename order.
+--      2026_10_25_00.sql already expects this correction to exist ("npcflag
+--      corrected by the PRO-28 fix") but names no file; NN = 01 on the same
+--      date as 2026_10_19_00.sql is the playbook 2.1 sequence, and this
+--      filename has never existed on any branch (PRO-114), so no previously
+--      applied file is being redefined. Neither T4 file is registered in
+--      `updates` yet, so there is no risk of a hash mismatch on a name the
+--      updater has already consumed.
+--
+-- Target database: acore_world
+--
+-- Idempotent: constant assignment on the table's primary key (entry) - no
+-- arithmetic on the current value, so the statement is a no-op from the
+-- second application onward; 0 affected rows is not an error; no ALTER
+-- statements (playbook section 2.2).
+--
+-- Live DB state at authoring time (verified read-only 2026-11-03):
+--   creature_template.entry 900200 npcflag = 3 (corrected by hand during the
+--   T4 rehearsal, while the tracked tree still said 1). This file makes the
+--   tree agree with the value QA verified in-game on PRO-71 (chain completes,
+--   45g total + Bluegill Kukri).
+--
+-- ROLLBACK (reverses this file exactly; restores the value written by
+-- 2026_10_19_00.sql):
+--   UPDATE `creature_template` SET `npcflag` = 1 WHERE `entry` = 900200;
+-- ============================================================================
+
+UPDATE `creature_template` SET `npcflag` = 3 WHERE `entry` = 900200;

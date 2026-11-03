@@ -30,6 +30,8 @@ public:
     ~BasicStatementTask();
 
     bool Execute() override;
+    void ResolveFutureOnStall() override;
+    std::string_view GetOperationName() const override { return "BasicStatementTask"; }
     QueryResultFuture GetFuture() const { return m_result->get_future(); }
 
 private:

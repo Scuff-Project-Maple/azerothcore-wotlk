@@ -30,10 +30,23 @@ Companion guide: `guides/unbound-wrath/Wrath-Unbound-Addon-HOWTO.md` (blob
 | `env/dist/etc/modules/mod_custom_classes.conf` | `env/dist/etc/modules/mod_custom_classes.conf` |
 | `env/dist/etc/modules/lua_scripts/unbound_mentor.lua` | `env/dist/etc/modules/lua_scripts/unbound_mentor.lua` |
 | `docker-compose.override.yml` | `docker-compose.override.yml` (repo root) |
-| `docker-compose.loadtest.override.yml` | `docker-compose.loadtest.override.yml` (repo root) |
+| `docker-compose.loadtest.override.yml` | `docker-compose.loadtest.override.yml` (repo root; PRO-33 load-test profile, not loaded by a plain `docker compose up`) |
+| `../scripts/compose-sync.sh` | repo `scripts/compose-sync.sh` — installs both root overrides above from these snapshots; `--check` is the pre-boot drift assertion |
 
 Notes:
 
+- `docker-compose.override.yml` here is the **source of truth** (PRO-178):
+  the root `docker-compose.override.yml` is a gitignored, generated copy.
+  Edit this file and run `scripts/compose-sync.sh` (PRO-180) to install it;
+  never hand-edit the root copy (hand-editing it is what caused the PRO-178
+  drift). `docker-compose.loadtest.override.yml` works the same way and is
+  tracked here for the first time in PRO-180 — before PRO-180 it existed only
+  as an untracked root file, so a clean-clone reprovision silently lost the
+  1600–2000 randombot load-test profile. `scripts/compose-sync.sh --check`
+  fails if either root copy drifts from its snapshot; there is no allowlist.
+  The override also mounts the
+  PRO-30 dev DB tuning `conf/mysql-dev.cnf`, which is tracked in the fork
+  itself (gitignore exception `!/conf/mysql-dev.cnf`) and needs no staging.
 - `modules/mod-unbound` needs **no CMakeLists.txt**: with the docker build's
   `MODULES=static`, AzerothCore's `modules/CMakeLists.txt`
   (`GetModuleSourceList` → `CollectSourceFiles`) auto-collects
@@ -64,8 +77,9 @@ mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
-cp wrath-unbound/docker-compose.override.yml .
-cp wrath-unbound/docker-compose.loadtest.override.yml .
+# root overrides are generated copies of the snapshots above (PRO-180):
+# scripts/compose-sync.sh installs them; --check is the pre-boot assertion
+scripts/compose-sync.sh
 # core hook patches are in-tree on Playerbot (f5b197b8d, b732dfd71):
 # verify, do not re-apply (on a base-pinned tree, git-apply both patches
 # instead, unbound first):
