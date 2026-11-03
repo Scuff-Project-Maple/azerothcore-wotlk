@@ -36,6 +36,11 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_ERROR = 2
 
+# Hard-coded (PRO-179 review N5): the scratch schema name is validated against this
+# immediately before the run's `DROP DATABASE`, so it must not be operator-settable.
+SCRATCH_PREFIX = "acore_world_preflight"
+SCRATCH_NAME_RE = re.compile(r"^acore_world_preflight_[A-Za-z0-9_]{1,48}$")
+
 IDENT_RE = re.compile(r"^[A-Za-z0-9_$]+$")
 NAME_TOKEN = r"`?[A-Za-z0-9_$]+`?"
 
@@ -530,6 +535,9 @@ class Statement:
 
 
 BACKTICK_NAME_RE = re.compile(r"`([^`]+)`")
+# bare identifiers, not preceded by a dot (schema/table qualifier) and not inside a
+# backticked run, which mask_sql leaves intact
+BARE_NAME_RE = re.compile(r"(?<![`A-Za-z0-9_$.])[A-Za-z_][A-Za-z0-9_$]{2,}(?![`A-Za-z0-9_$])")
 FIRST_WORD_RE = re.compile(r"^\s*[(\s]*(?:\d+\s*)?(?P<w>[A-Za-z_]+)")
 TBL = r"(?:" + NAME_TOKEN + r"(?:\s*\.\s*" + NAME_TOKEN + r")?)"
 TBL_CAP = "(" + TBL + ")"
@@ -611,8 +619,12 @@ class Preflight:
         offset += len(tail) - len(tail.lstrip())
         return text.count("\n", 0, offset) + 1
 
-    def git_origin(self, path: Path) -> tuple[str, str]:
-        """Provenance of a file inside the compose tree: ('company'|'upstream'|'unknown', detail)."""
+    def git_author_origin(self, path: Path) -> tuple[str, str]:
+        """Last-commit author provenance: ('company'|'upstream'|'unknown', detail).
+
+        This is author metadata only. It is never the whole answer — see
+        classify_origin(), which combines it with the directory tag from policy.
+        """
         rel = os.path.relpath(path, self.git_root)
         try:
             proc = subprocess.run(
@@ -630,6 +642,32 @@ class Preflight:
         if any(email.endswith("@" + d) for d in domains):
             return "company", line
         return "upstream", line
+
+    def classify_origin(self, f: dict, author: tuple[str, str] | None = None
+                        ) -> tuple[str, str]:
+        """Provenance used for write-policy exemption: ('company'|'upstream'|'unknown', detail).
+
+        Rule (PRO-179 review B1): a file is company-authored when EITHER the
+        directory it lives in is a company-authored directory (policy
+        includedDirs[].origin == 'company') OR its last commit author is inside a
+        company email domain. 'upstream' — the only value the write policy is
+        exempt for — requires BOTH an upstream-tagged directory AND an author
+        outside the company domains. Anything git cannot attribute is 'unknown'
+        and gets no exemption, so a file dropped in or committed with a foreign
+        --author inside a company directory can never skip checks 2-5.
+        """
+        dir_origin = (f.get("dir") or {}).get("origin", "unknown")
+        author_origin, detail = author if author else self.git_author_origin(f["path"])
+        if author_origin == "company":
+            return "company", f"author {detail}"
+        if author_origin == "unknown":
+            return "unknown", f"cannot attribute: {detail}"
+        if dir_origin == "company":
+            return "company", f"company directory {f['dir']['db_path']}, " \
+                              f"foreign commit author {detail}"
+        if dir_origin == "upstream":
+            return "upstream", f"upstream directory and author: {detail}"
+        return "unknown", f"unrecognised directory origin {dir_origin!r} for {f['dir']['db_path']}"
 
     def git_tracked(self, path: Path) -> bool:
         rel = os.path.relpath(path, self.git_root)
@@ -741,6 +779,217 @@ class Preflight:
                              f"UpdateFetcher skips MODULE rows during cleanup, so this is not fatal.",
                         rule="module-rows")
 
+    # -- check 0b: boot path (PRO-179 review B2) ------------------------------ #
+
+    def compose_config(self) -> dict | None:
+        """Resolved compose model for the stack, or None (after reporting)."""
+        argv = ["docker", "compose"]
+        for f in self.a.compose_file:
+            argv += ["-f", f]
+        if self.a.compose_project:
+            argv += ["-p", self.a.compose_project]
+        argv += ["config", "--format", "json"]
+        try:
+            proc = subprocess.run(argv, cwd=str(Path(self.a.compose_root)),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            self.r.fail("0b", f"cannot run `docker compose config`: {exc}. Without the resolved "
+                              f"compose model the gate cannot prove that the SQL it scanned is the "
+                              f"SQL the boot will apply.", rule="boot-path-unreadable")
+            return None
+        if proc.returncode != 0:
+            self.r.fail("0b", f"`docker compose config --format json` exited {proc.returncode}: "
+                              f"{proc.stderr.decode('utf-8', 'replace').strip()[:300]}",
+                        rule="boot-path-unreadable")
+            return None
+        try:
+            return json.loads(proc.stdout.decode("utf-8", "replace"))
+        except ValueError as exc:
+            self.r.fail("0b", f"`docker compose config --format json` returned unparseable "
+                              f"output ({exc}); refusing to guess the boot path.",
+                        rule="boot-path-unreadable")
+            return None
+
+    @staticmethod
+    def normalize_volumes(svc: dict) -> list[dict]:
+        """Compose volumes in either syntax -> [{source,target,ro,type}]."""
+        out = []
+        for v in svc.get("volumes") or []:
+            if isinstance(v, str):
+                parts = v.split(":")
+                if len(parts) < 2:
+                    out.append({"source": None, "target": parts[0], "ro": None, "type": "unknown"})
+                    continue
+                ro = None
+                if len(parts) > 2:
+                    ro = "ro" in [p for p in parts[2].split(",") if p] and "rw" not in [
+                        p for p in parts[2].split(",") if p]
+                out.append({"source": parts[0], "target": parts[1], "ro": ro,
+                            "type": "bind" if parts[0].startswith(("/", ".", "~")) else "volume"})
+                continue
+            src = v.get("source", v.get("Source"))
+            tgt = v.get("target", v.get("destination", v.get("Destination")))
+            ro = v.get("read_only", v.get("readonly", v.get("ReadOnly")))
+            typ = str(v.get("type", v.get("Type") or "")).lower() or (
+                "bind" if str(src or "").startswith(("/", ".", "~")) else "volume")
+            out.append({"source": src, "target": tgt, "ro": ro, "type": typ})
+        return out
+
+    @staticmethod
+    def normalize_env(svc: dict) -> dict:
+        env = svc.get("environment") or {}
+        if isinstance(env, dict):
+            return {str(k): ("" if v is None else str(v)) for k, v in env.items()}
+        out = {}
+        for item in env:
+            if isinstance(item, str) and "=" in item:
+                k, _, v = item.partition("=")
+                out[k.strip()] = v.strip()
+            elif isinstance(item, str):
+                out[item.strip()] = os.environ.get(item.strip(), "")
+        return out
+
+    def _sql_mount_target(self) -> str:
+        src_dir = str(self.p.get("expectedSourceDirectory", "/azerothcore")).strip().strip('"')
+        return src_dir.rstrip("/") + "/data/sql"
+
+    def check_boot_path(self):
+        """Prove the tree that was scanned IS the tree the updater will read.
+
+        The updater reads `$/...` paths from inside the worldserver container, so
+        the gate is only meaningful if (a) the container's /azerothcore/data/sql
+        is a bind mount of exactly the directory the gate walked, (b) it is
+        read-only, and (c) the world updater is the only updater the core enable
+        flag turns on. Anything else and a green gate proves nothing.
+        """
+        bp = self.p.get("bootPath", {})
+        svc_name = bp.get("worldserverService", "ac-worldserver")
+        cfg = self.compose_config()
+        if cfg is None:
+            return
+        svc = (cfg.get("services") or {}).get(svc_name)
+        if svc is None:
+            self.r.fail("0b", f"service {svc_name!r} is not in the resolved compose config, so the "
+                              f"gate cannot verify the boot path for it", rule="boot-path-service")
+            return
+        target = self._sql_mount_target()
+        vols = self.normalize_volumes(svc)
+        norm = lambda p: (p or "").rstrip("/")
+        matched = [v for v in vols if norm(v["target"]) == norm(target)]
+        scanned = os.path.realpath(self.sql_root)
+        if not matched:
+            self.r.fail("0b", f"{svc_name} has no mount on {target}. The updater would read "
+                              f"{target} out of the container image, not from {scanned}, so this "
+                              f"gate has not inspected the files the boot will apply.",
+                        rule="sql-mount-missing")
+        for v in matched:
+            if v["type"] not in ("bind",):
+                self.r.fail("0b", f"{target} is mounted as {v['type']!r} (source {v['source']}), "
+                                  f"not a bind mount of the working tree. A named volume keeps "
+                                  f"whatever SQL an earlier boot put in it.", rule="sql-mount-type")
+                continue
+            source = v["source"] or ""
+            if not os.path.isabs(source):
+                source = os.path.join(str(Path(self.a.compose_root)), source)
+            if os.path.realpath(source) != scanned:
+                self.r.fail("0b", f"{target} is bound to {source}, but the gate scanned {scanned}. "
+                                  f"Fix --compose-root/--sql-root or the compose file; a green "
+                                  f"result here would be about the wrong files.",
+                            rule="sql-mount-source")
+            if bp.get("requireReadOnlySqlMount", True):
+                if v["ro"] is not True:
+                    self.r.fail("0b", f"the {target} mount is not read-only (ro={v['ro']}). The "
+                                      f"container could rewrite a file after the gate hashed it.",
+                                rule="sql-mount-writable")
+        # a mount higher up the tree can shadow the one we verified
+        for v in vols:
+            t = norm(v["target"])
+            if t and t != norm(target) and norm(target).startswith(t + "/"):
+                self.r.warn("0b", f"{v['target']} is mounted over a parent of {target}; check it "
+                                  f"does not shadow the SQL tree.", rule="sql-mount-shadow")
+        env = self.normalize_env(svc)
+        flag = bp.get("updaterEnableEnv", "AC_UPDATES_ENABLE_DATABASES")
+        raw = env.get(flag)
+        if raw is None:
+            self.r.fail("0b", f"{flag} is not set in the resolved compose config for {svc_name}. "
+                              f"The gate cannot tell which databases the core updater will touch; "
+                              f"set it explicitly (4 = DATABASE_WORLD only) rather than relying on "
+                              f"an env_file the gate cannot resolve.", rule="updater-env-unknown")
+        else:
+            try:
+                bits = int(str(raw).strip(), 0)
+            except ValueError:
+                bits = -1
+                self.r.fail("0b", f"{flag}={raw!r} is not numeric; cannot map it onto "
+                                  f"DatabaseLoadFlags", rule="updater-env-unknown")
+            if bits >= 0:
+                want = int(bp.get("requireUpdaterBit", 4))
+                if not bits & want:
+                    self.r.fail("0b", f"{flag}={raw} does not include bit {want} "
+                                      f"(DATABASE_WORLD), yet the world updater is what this gate "
+                                      f"guards.", rule="updater-env-world-off")
+                if bits & ~want:
+                    self.r.fail("0b", f"{flag}={raw} enables more than DATABASE_WORLD "
+                                      f"(bit {want}). PRO-65/PRO-177 fixed this at 4; auth and "
+                                      f"hotfixes must not be fed by the same pull.",
+                                rule="updater-env-widened")
+        pb_flag = bp.get("playerbotsEnableEnv", "AC_PLAYERBOTS_UPDATES_ENABLE_DATABASES")
+        if pb_flag in env:
+            self.r.line("0b", f"{pb_flag}={env[pb_flag]} belongs to the Playerbots updater "
+                              f"(separate acore_playerbots ledger); this gate does not read or "
+                              f"write it")
+        restart = (svc.get("restart") or "").lower()
+        if restart in ("unless-stopped", "always"):
+            self.r.line("0b", f"restart={restart}: a bad update file crash-loops the stack, which "
+                              f"is why this gate runs before every boot")
+        self.r.line("0b", f"sql mount {scanned} -> {target} (read-only bind) for {svc_name}; "
+                          f"{flag}={env.get(flag)}")
+        self._check_live_container(svc_name, target, scanned, bp)
+
+    def _check_live_container(self, svc_name: str, target: str, scanned: str, bp: dict):
+        """If a container already exists, its ACTUAL mounts win over the compose file."""
+        base = ["docker", "compose"]
+        for f in self.a.compose_file:
+            base += ["-f", f]
+        if self.a.compose_project:
+            base += ["-p", self.a.compose_project]
+        try:
+            ids = subprocess.run(base + ["ps", "-q", svc_name], cwd=str(Path(self.a.compose_root)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
+        cid = ids.stdout.decode("utf-8", "replace").strip().splitlines()
+        if ids.returncode != 0 or not cid or not cid[0].strip():
+            self.r.line("0b", f"no existing {svc_name} container; asserted against the compose "
+                              f"config only")
+            return
+        try:
+            insp = subprocess.run(["docker", "inspect", cid[0].strip()],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+            data = json.loads(insp.stdout.decode("utf-8", "replace"))
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            self.r.warn("0b", f"could not inspect the existing {svc_name} container; compose "
+                              f"config only", rule="boot-path-inspect")
+            return
+        if not data:
+            return
+        mounts = [m for m in (data[0].get("Mounts") or [])
+                  if (m.get("Destination") or "").rstrip("/") == target.rstrip("/")]
+        if not mounts:
+            self.r.fail("0b", f"the existing {svc_name} container has no mount on {target}; "
+                              f"`up -d` may leave it running against the image copy of the SQL",
+                        rule="container-mount-missing")
+            return
+        m = mounts[0]
+        if os.path.realpath(m.get("Source") or "") != scanned:
+            self.r.fail("0b", f"the existing {svc_name} container binds {target} to "
+                              f"{m.get('Source')}, not {scanned}. Recreate it before trusting a "
+                              f"green gate.", rule="container-mount-source")
+        if bp.get("requireReadOnlySqlMount", True) and m.get("RW", True):
+            self.r.fail("0b", f"the existing {svc_name} container mounts {target} read-write "
+                              f"(RW={m.get('RW')}). The compose file may say ro while the running "
+                              f"container says otherwise.", rule="container-mount-writable")
+
     # -- check 1: duplicate basenames ---------------------------------------- #
 
     def check_duplicates(self, files: list[dict]):
@@ -775,22 +1024,34 @@ class Preflight:
         rows = self.db.query(
             "SELECT `name`, `hash`, `state`, UNIX_TIMESTAMP(`timestamp`) FROM `updates` "
             "ORDER BY `name`", self.live_db)
-        return {r[0]: {"hash": r[1] or "", "state": r[2], "ts": r[3] if len(r) > 3 else ""}
-                for r in rows}
+        # `updates.name` is a utf8mb4_unicode_ci primary key, so the updater itself
+        # compares names case-insensitively (PRO-179 review N4). Mirror that here or a
+        # file renamed only in case looks "new" and gets silently re-applied.
+        return {r[0].lower(): {"hash": r[1] or "", "state": r[2],
+                               "ts": r[3] if len(r) > 3 else ""} for r in rows}
 
     def check_ledger(self, files: list[dict]) -> list[dict]:
         led = self.ledger()
+        # Reverse index for rename detection (PRO-179 review N8). UpdateFetcher does not
+        # treat every hash mismatch as a re-apply: if the file's current hash equals some
+        # *other* ledger row's hash it renames that row instead (UpdateFetcher.cpp:335-345).
+        by_hash: dict[str, list[str]] = {}
+        for name, row in led.items():
+            if row["hash"]:
+                by_hash.setdefault(row["hash"].lower(), []).append(name)
         new_files = []
         checked = 0
         seen = set()
         for f in files:
-            seen.add(f["basename"])
-            row = led.get(f["basename"])
+            seen.add(f["key"])
+            row = led.get(f["key"])
             if row is None:
-                origin, detail = self.git_origin(f["path"])
+                author = self.git_author_origin(f["path"])
+                origin, prov = self.classify_origin(f, author)
                 f["origin"] = origin
-                f["provenance"] = detail
-                if origin == "unknown" and detail == "untracked" and not self.p.get("allowUntrackedFiles"):
+                f["provenance"] = prov
+                if author[0] == "unknown" and author[1] == "untracked" \
+                        and not self.p.get("allowUntrackedFiles"):
                     self.r.warn("2", f"{f['rel']} is not tracked by git. A file that is not in the "
                                      f"tree cannot be reviewed or reproduced; treat it as an "
                                      f"unexpected drop-in.", file=f["rel"], rule="untracked-file")
@@ -816,14 +1077,30 @@ class Preflight:
                 elif row["state"] == "ARCHIVED" and f["dir"]["state"] == "ARCHIVED":
                     self.r.warn("3", msg, file=f["rel"], rule="hash-mismatch")
                 else:
-                    self.r.fail("3", msg + " — ApplyUpdateFile() re-applies the changed file "
-                                           "silently (UpdateFetcher.cpp:350).",
-                                file=f["rel"], rule="hash-mismatch")
+                    # A mismatch is only a silent re-apply when the content is genuinely
+                    # new. If the bytes match another ledger row this is a rename, which
+                    # UpdateFetcher answers by renaming that row (UpdateFetcher.cpp:335-345),
+                    # not by re-running the file (PRO-179 review N8).
+                    same = [n for n in by_hash.get(disk.lower(), []) if n != f["key"]]
+                    if same:
+                        self.r.fail("3", msg + f" — the bytes match ledger row(s) "
+                                               f"{', '.join(same[:3])}, so this reads as a rename: "
+                                               f"UpdateFetcher renames that entry "
+                                               f"(UpdateFetcher.cpp:335-345) rather than re-applying. "
+                                               f"Confirm the rename is the intended change.",
+                                    file=f["rel"], rule="hash-rename")
+                    else:
+                        self.r.fail("3", msg + " — ApplyUpdateFile() re-applies the changed file "
+                                               "silently (UpdateFetcher.cpp:350).",
+                                    file=f["rel"], rule="hash-mismatch")
             elif row["state"] != f["dir"]["state"]:
                 self.r.info("3", f"{f['rel']} state will move {row['state']} -> "
                                  f"{f['dir']['state']} (harmless UpdateState).", file=f["rel"],
                             rule="state-move")
         dead = sorted(set(led) - seen)
+        # UpdateFetcher::CleanOrphanUpdates compares the whole ledger against the whole
+        # file list (UpdateFetcher.cpp:409-416), so the CleanDeadRefMaxCount threshold has
+        # to be measured the same way; the listing stays non-MODULE for signal.
         dead_non_module = [n for n in dead if led[n]["state"] != "MODULE"]
         self.r.line("2", f"{len(files)} file(s) on disk, {checked} already in the ledger, "
                          f"{len(new_files)} will be applied on next boot")
@@ -836,8 +1113,9 @@ class Preflight:
             self.r.line("2", f"  {len(dead)} ledger row(s) have no file on disk "
                              f"({len(dead_non_module)} non-MODULE)")
             max_clean = self.a.clean_dead_ref_max_count
-            if dead_non_module and max_clean >= 0 and len(dead_non_module) > max_clean:
-                self.r.warn("2", f"{len(dead_non_module)} non-MODULE ledger rows are orphaned but "
+            if dead and max_clean >= 0 and len(dead) > max_clean:
+                self.r.warn("2", f"{len(dead)} ledger row(s) are orphaned "
+                                 f"({len(dead_non_module)} non-MODULE) but "
                                  f"Updates.CleanDeadRefMaxCount={max_clean}: cleanup is skipped with "
                                  f"LOG_ERROR (not fatal). If a git pull deleted those files, confirm "
                                  f"that is intentional.", rule="dead-reference")
@@ -951,15 +1229,19 @@ class Preflight:
             return
         is_custom = st.table in custom
         key_cols = [c.lower() for c in entry.get("keyColumns", [])]
+        # A partial key is only accepted where policy says so explicitly (keySets);
+        # by default the WHOLE natural key has to be bounded (PRO-179 review N1).
+        key_sets = [[c.lower() for c in grp] for grp in entry.get("keySets", []) if grp] \
+            or ([key_cols] if key_cols else [])
         bands = entry.get("bands", [])
         refs = entry.get("refs", [])
 
         if st.verb in ("INSERT", "REPLACE"):
             self._policy_insert(f, st, line, digest, bad, key_cols, bands, refs, is_custom)
         elif st.verb == "UPDATE":
-            self._policy_update(f, st, line, bad, key_cols, bands, refs, entry)
+            self._policy_update(f, st, line, bad, key_cols, bands, refs, entry, key_sets)
         elif st.verb == "DELETE":
-            self._policy_delete(st, bad, key_cols, bands, refs)
+            self._policy_delete(st, bad, key_cols, bands, refs, key_sets)
 
     def _policy_insert(self, f, st, line, digest, bad, key_cols, bands, refs, is_custom):
         masked = st.masked
@@ -1030,7 +1312,7 @@ class Preflight:
                                          f"the company reserved band {limit}+ "
                                          f"(docs/content-playbook.md 2.4)")
 
-    def _policy_update(self, f, st, line, bad, key_cols, bands, refs, entry):
+    def _policy_update(self, f, st, line, bad, key_cols, bands, refs, entry, key_sets):
         masked = st.masked
         where_positions = top_level_positions(masked, "WHERE")
         if not where_positions:
@@ -1047,7 +1329,7 @@ class Preflight:
             bad("or-in-where", f"UPDATE {st.table}: top-level OR in WHERE is rejected; use an "
                                f"explicit IN list of reserved-band ids")
         preds = scan_predicates(where_text)
-        self._bounded_on(bad, st, preds, key_cols, "UPDATE")
+        self._bounded_on(bad, st, preds, key_sets, "UPDATE")
         forbidden_assign = set(key_cols)
         for b in bands:
             forbidden_assign.add(b["column"].lower())
@@ -1059,7 +1341,7 @@ class Preflight:
                     f"UPDATE {st.table} assigns the natural-key/reserved column {target!r}")
         self._check_literals(bad, st, preds, bands, refs, "UPDATE")
 
-    def _policy_delete(self, st, bad, key_cols, bands, refs):
+    def _policy_delete(self, st, bad, key_cols, bands, refs, key_sets):
         masked = st.masked
         where_positions = top_level_positions(masked, "WHERE")
         if not where_positions:
@@ -1070,32 +1352,45 @@ class Preflight:
             bad("or-in-where", f"DELETE FROM {st.table}: top-level OR in WHERE is rejected; use an "
                                f"explicit IN list of reserved-band ids")
         preds = scan_predicates(where_text)
-        self._bounded_on(bad, st, preds, key_cols, "DELETE")
+        self._bounded_on(bad, st, preds, key_sets, "DELETE")
         self._check_literals(bad, st, preds, bands, refs, "DELETE")
 
-    def _bounded_on(self, bad, st, preds, key_cols, verb):
-        """At least one designated natural-key column must be equality/IN bound to literals."""
-        if not key_cols:
+    def _bounded_on(self, bad, st, preds, key_sets, verb):
+        """Bound means: EVERY column of at least one key set is equality/IN bound to literals.
+
+        The old rule accepted any single key column, so
+        `DELETE FROM module_string WHERE module='mod-x'` passed while deleting rows
+        unrelated to the file that shipped them (PRO-179 review N1). keyColumns is the
+        whole key and must be bounded as a unit; policy `keySets` lists alternative keys
+        only where a partial key really is selective.
+        """
+        if not key_sets:
             bad("no-natural-key-configured",
                 f"{verb} on {st.table}: no natural key configured in the policy — fail closed")
             return
-        problems = []
-        for kc in key_cols:
-            hits = preds.get(kc)
-            if not hits:
-                problems.append(f"{kc!r} absent from WHERE")
-                continue
-            if not any(op in ("=", "IN", "<=>") for op, _, _ in hits):
-                problems.append(f"{kc!r} only tested with "
-                                f"{sorted({op for op, _, _ in hits})}")
-                continue
-            if any(kind == "unknown" for _, kind, _ in hits):
-                problems.append(f"{kc!r} compared against a non-literal operand")
-                continue
-            return  # this key column bounds the statement
+        best: list[str] | None = None
+        for group in key_sets:
+            problems: list[str] = []
+            for kc in group:
+                hits = preds.get(kc)
+                if not hits:
+                    problems.append(f"{kc!r} absent from WHERE")
+                    continue
+                if not any(op in ("=", "IN", "<=>") for op, _, _ in hits):
+                    problems.append(f"{kc!r} only tested with "
+                                    f"{sorted({op for op, _, _ in hits})}")
+                    continue
+                if any(kind == "unknown" for _, kind, _ in hits):
+                    problems.append(f"{kc!r} compared against a non-literal operand")
+                    continue
+            if not problems:
+                return  # every column of this key set bounds the statement
+            if best is None or len(problems) < len(best):
+                best = problems
         bad("unbounded-write",
-            f"{verb} on {st.table} is not WHERE-bounded on the natural key "
-            f"({'; '.join(problems)}; bounded columns found: {sorted(preds) or 'none'})")
+            f"{verb} on {st.table} is not WHERE-bounded on a complete natural key "
+            f"(keys tried: {key_sets}; closest: {'; '.join(best or [])}; "
+            f"bounded columns found: {sorted(preds) or 'none'})")
 
     def _check_literals(self, bad, st, preds, bands, refs, verb):
         rules: dict[str, tuple[int, str]] = {}
@@ -1118,18 +1413,16 @@ class Preflight:
 
     def scratch_name(self) -> str:
         name = self.a.scratch_db
-        if not IDENT_RE.match(name):
-            raise OperationalError(f"scratch database name {name!r} is not [A-Za-z0-9_$]+")
+        if not SCRATCH_NAME_RE.match(name):
+            raise OperationalError(
+                f"scratch database name {name!r} must match {SCRATCH_NAME_RE.pattern}. The prefix "
+                f"is hard-coded, not a CLI flag, because this run ends with a DROP DATABASE")
         if name.lower() == self.live_db.lower():
             raise OperationalError("refusing to use the live database as the scratch schema")
-        if name.lower() in {self.live_db.lower(), "acore_world", "acore_auth",
+        if name.lower() in {"acore_world", "acore_auth",
                             "acore_characters", "acore_playerbots", "mysql",
                             "information_schema", "performance_schema", "sys"}:
             raise OperationalError(f"refusing to use {name!r} as the scratch schema")
-        if not name.startswith(self.a.scratch_prefix):
-            raise OperationalError(
-                f"scratch database {name!r} must start with {self.a.scratch_prefix!r} "
-                f"so a drop can never target a real schema")
         return name
 
     def table_row_counts(self) -> dict[str, int]:
@@ -1160,6 +1453,12 @@ class Preflight:
             text = f["path"].read_text(encoding="utf-8", errors="replace")
             masked = mask_sql(text)
             for name in BACKTICK_NAME_RE.findall(masked):
+                low = name.lower()
+                if low in all_live:
+                    hits.add(low)
+            # most update files write bare identifiers; a clone that missed one of them
+            # turns a passing dry run into a false negative (PRO-179 review N6)
+            for name in BARE_NAME_RE.findall(masked):
                 low = name.lower()
                 if low in all_live:
                     hits.add(low)
@@ -1331,6 +1630,12 @@ class Preflight:
         dirs = self.included_dirs()
         self.check_wiring()
         files = self.collect_files(dirs)
+        if self.a.boot_path:
+            self.check_boot_path()
+        else:
+            self.r.warn("0b", "boot-path verification skipped by --no-boot-path-check. The gate has "
+                              "NOT proved that the tree it scanned is the tree the container will "
+                              "read.", rule="boot-path-skipped")
         self.check_duplicates(files)
         new_files = self.check_ledger(files)
         self.check_policy(new_files)
@@ -1395,8 +1700,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--git-root", default=None)
     ap.add_argument("--policy", default=str(here / "preflight-policy.json"))
     ap.add_argument("--live-db", default=None)
-    ap.add_argument("--scratch-db", default=None)
-    ap.add_argument("--scratch-prefix", default="acore_world_preflight")
+    ap.add_argument("--scratch-db", default=None,
+                    help=f"scratch schema name; must match {SCRATCH_NAME_RE.pattern}")
     ap.add_argument("--db-access", choices=["docker", "command"], default="docker")
     ap.add_argument("--db-service", default="ac-database")
     ap.add_argument("--db-container", default=None)
@@ -1408,6 +1713,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--compose-project", default=None)
     ap.add_argument("--compose-file", action="append", default=None)
     ap.add_argument("--no-dry-run", dest="dry_run", action="store_false", default=True)
+    ap.add_argument("--no-boot-path-check", dest="boot_path", action="store_false", default=True,
+                    help="skip the compose/mount verification (audit of a remote tree only; a "
+                         "skipped check means the gate never proved which files the boot reads)")
     ap.add_argument("--dry-run-anyway", action="store_true",
                     help="run the dry run even if earlier checks failed")
     ap.add_argument("--clone-mode", choices=["auto", "full", "minimal"], default="auto",
@@ -1445,7 +1753,7 @@ def main(argv=None) -> int:
         args.live_db = policy.get("liveDatabase", "acore_world")
     if args.scratch_db is None:
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        args.scratch_db = f"{args.scratch_prefix}_{os.getpid()}_{stamp}"
+        args.scratch_db = f"{SCRATCH_PREFIX}_{os.getpid()}_{stamp}"
 
     report = Report()
     report.data["started"] = datetime.datetime.now(datetime.timezone.utc).isoformat()

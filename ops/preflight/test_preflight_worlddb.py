@@ -150,10 +150,10 @@ class TestReservedBand(unittest.TestCase):
         self.assertIn("reserved-band", rules_for(
             "INSERT INTO `creature_template` (`entry`,`npcflag`) VALUES (12345, 3);"))
         self.assertIn("reserved-band", rules_for(
-            "INSERT INTO `creature` (`guid`,`id`,`map`,`x`,`y`,`z`,`o`) "
+            "INSERT INTO `creature` (`guid`,`id1`,`map`,`x`,`y`,`z`,`o`) "
             "VALUES (1234, 900001, 0, 0, 0, 0, 0);"))
         self.assertIn("reserved-band", rules_for(
-            "INSERT INTO `creature` (`guid`,`id`,`map`,`x`,`y`,`z`,`o`) "
+            "INSERT INTO `creature` (`guid`,`id1`,`map`,`x`,`y`,`z`,`o`) "
             "VALUES (9002020, 48101, 0, 0, 0, 0, 0);"))
 
     def test_second_row_out_of_band_is_rejected(self):
@@ -193,7 +193,16 @@ class TestAllowedShapes(unittest.TestCase):
             self.assertEqual(rules_for(sql), [], sql)
 
     def test_unknown_table_fails_closed(self):
+        # creature_equip_template became an approved table (PRO-179 review N3), so this
+        # has to name a table that really does not exist
         self.assertIn("table-not-allowed",
+                      rules_for("DELETE FROM `zz_no_such_content_table` WHERE `id` = 900200;"))
+
+    def test_newly_allowlisted_tables_are_bounded_on_their_real_key(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `creature_equip_template` WHERE `CreatureID` = 900200 AND `ID` = 1;"), [])
+        # partial key is no longer enough (N1)
+        self.assertIn("unbounded-write",
                       rules_for("DELETE FROM `creature_equip_template` WHERE `CreatureID` = 900200;"))
 
     def test_create_of_non_custom_table_is_rejected(self):
@@ -228,6 +237,102 @@ class TestPreamble(unittest.TestCase):
         self.assertEqual(rules_for("SELECT * FROM creature_template WHERE entry = 1;"), [])
         self.assertEqual(rules_for("SET @x = (SELECT COUNT(*) FROM quest_template);"), [])
 
+
+
+class TestProvenance(unittest.TestCase):
+    """PRO-179 review B1: the write policy may never be skipped on a company file."""
+
+    @staticmethod
+    def pf_with_author(author):
+        pf = make_preflight()
+        pf.git_author_origin = lambda path: author
+        return pf
+
+    @staticmethod
+    def file_in(db_path, origin):
+        return {"rel": f"{db_path}/x.sql", "path": Path("x.sql"),
+                "dir": {"db_path": db_path, "origin": origin}}
+
+    def test_company_directory_wins_over_foreign_author(self):
+        pf = self.pf_with_author(("upstream", "someone@else.example\tSomeone\tcontent"))
+        origin, _ = pf.classify_origin(
+            self.file_in("$/data/sql/updates/pending_db_world", "company"))
+        self.assertEqual(origin, "company")
+
+    def test_company_author_wins_over_upstream_directory(self):
+        pf = self.pf_with_author(("company", "dev@paperclip.local\tDev\tcontent"))
+        origin, _ = pf.classify_origin(self.file_in("$/data/sql/updates/db_world", "upstream"))
+        self.assertEqual(origin, "company")
+
+    def test_upstream_needs_both_tags(self):
+        pf = self.pf_with_author(("upstream", "ac@azerothcore.org\tAC\tfix"))
+        origin, _ = pf.classify_origin(self.file_in("$/data/sql/updates/db_world", "upstream"))
+        self.assertEqual(origin, "upstream")
+
+    def test_untracked_never_gets_the_exemption(self):
+        pf = self.pf_with_author(("unknown", "untracked"))
+        for origin_tag in ("company", "upstream"):
+            origin, _ = pf.classify_origin(self.file_in("$/data/sql/updates/db_world", origin_tag))
+            self.assertEqual(origin, "unknown")
+
+    def test_unknown_origin_is_not_policy_exempt(self):
+        pf = make_preflight()
+        f = self.file_in("$/data/sql/updates/pending_db_world", "company")
+        f["origin"] = "unknown"
+        f["provenance"] = "cannot attribute: untracked"
+        f["path"] = Path("ops/preflight/preflight_worlddb.py")  # any readable file
+        pf.check_policy([f])
+        self.assertFalse(any(x.rule == "policy-exempt-origin" for x in pf.r.findings))
+
+
+class TestKeyBounding(unittest.TestCase):
+    """PRO-179 review N1: a partial key must not bound a write."""
+
+    def test_partial_key_rejected_on_custom_table(self):
+        self.assertIn("unbounded-write", rules_for(
+            "DELETE FROM `module_string` WHERE `module` = 'mod-x';"))
+
+    def test_full_key_accepted_on_custom_table(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `module_string` WHERE `module` = 'mod-x' AND `id` = 900001;"), [])
+
+    def test_alternative_key_set_accepted(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `creature` WHERE `id1` = 900200 AND `map` = 539;"), [])
+
+    def test_alternative_key_set_still_band_checked(self):
+        self.assertIn("reserved-band", rules_for(
+            "DELETE FROM `creature` WHERE `id1` = 48101 AND `map` = 539;"))
+
+    def test_single_column_of_composite_key_rejected(self):
+        self.assertIn("unbounded-write", rules_for(
+            "UPDATE `npc_trainer` SET `MoneyCost` = 100 WHERE `ID` = 900200;"))
+        self.assertEqual(rules_for(
+            "UPDATE `npc_trainer` SET `MoneyCost` = 100 WHERE `ID` = 900200 "
+            "AND `SpellID` = 100;"), [])
+
+
+class TestScratchName(unittest.TestCase):
+    """PRO-179 review N5: the DROP DATABASE target cannot be operator-chosen."""
+
+    def test_rejects_foreign_schema_names(self):
+        for name in ("acore_world", "acore_characters", "mysql", "world",
+                     "acore_world_preflight", "prefix_acore_world_preflight_1",
+                     "acore_world_preflight/../x"):
+            pf = make_preflight()
+            pf.a.scratch_db = name
+            with self.assertRaises(Exception, msg=name):
+                pf.scratch_name()
+
+    def test_accepts_generated_name(self):
+        pf = make_preflight()
+        pf.a.scratch_db = "acore_world_preflight_42_20261103T080000Z"
+        self.assertEqual(pf.scratch_name(), "acore_world_preflight_42_20261103T080000Z")
+
+    def test_no_scratch_prefix_flag(self):
+        # the flag that let an operator choose the drop prefix must be gone
+        opts = {tuple(a.option_strings) for a in build_arg_parser()._actions}
+        self.assertNotIn(("--scratch-prefix",), opts)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
