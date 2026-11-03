@@ -1,3 +1,7 @@
+# Source of truth for the Project Maple dev-stack compose override
+# (PRO-178). The gitignored root docker-compose.override.yml is a copy of
+# this file - never hand-edit the root copy; regenerate it with:
+#   cp wrath-unbound/docker-compose.override.yml .
 services:
   ac-worldserver:
     build:
@@ -17,9 +21,22 @@ services:
       # 4 = DATABASE_WORLD only (src/server/database/Database/DatabaseLoader.h), so the
       # auth/character ledgers stay under their existing process of record.
       AC_UPDATES_ENABLE_DATABASES: "4"
+      # PRO-33: normal-operation default is 50 randombots. The load-test
+      # volume (1600-2000) is restored by docker-compose.loadtest.override.yml,
+      # see wrath-unbound/README.md ("Load testing") and docs/dev-environment.md.
       AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"
-      AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "1600"
-      AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "2000"
+      AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "50"
+      AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "50"
+      # e2e prerequisite (see e2e/README.md): the harness stores an empty
+      # account.os, so Warden rejects every login (AUTH_REJECT 14).
+      AC_WARDEN_ENABLED: "0"
+  ac-database:
+    volumes:
+      # PRO-30 (D5), mounted by PRO-178: dev durability tuning so per-commit
+      # fsyncs cannot wedge the worldserver main thread under shared-storage
+      # I/O pressure. Tracked at conf/mysql-dev.cnf. Trade-off: up to ~1s of
+      # InnoDB redo + binlog loss on power failure. Never carry into production.
+      - ./conf/mysql-dev.cnf:/etc/mysql/conf.d/maple-dev.cnf:ro
   ac-authserver:
     build:
       context: .
