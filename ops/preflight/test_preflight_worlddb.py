@@ -453,3 +453,27 @@ class TestBootPath(unittest.TestCase):
         pf = self._pf({"volumes": [f"{self.SOURCE}:{self.TARGET}:rw"],
                        "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
         self.assertIn("sql-mount-writable", self._fail_rules(pf))
+
+
+class TestRenderCoversEveryCheck(unittest.TestCase):
+    def test_boot_path_section_is_rendered(self):
+        """A check that cannot render cannot report a failure to a human."""
+        from preflight_worlddb import CHECK_TITLES, Report, render
+        self.assertIn("0b", CHECK_TITLES)
+        pf = make_preflight()
+        pf.r.fail("0b", "the /azerothcore/data/sql mount is not read-only",
+                  rule="sql-mount-writable")
+        text = render(pf.r, pf.a)
+        self.assertIn("[0b] boot path (mount/env)", text)
+        self.assertIn("sql-mount-writable", text)
+        self.assertIn("RESULT: FAIL", text)
+
+    def test_every_check_id_in_the_source_is_rendered(self):
+        """Every check id the checker can report must have a rendered section."""
+        import re
+        from preflight_worlddb import CHECK_TITLES
+        src = (HERE / "preflight_worlddb.py").read_text()
+        used = set(re.findall(r'self\.r\.(?:fail|warn|line)\(\s*"([^"]+)"', src))
+        self.assertTrue(used, "no findings found in the source - did the pattern rot?")
+        self.assertEqual(set(), used - set(CHECK_TITLES),
+                         f"unrendered check ids: {sorted(used - set(CHECK_TITLES))}")

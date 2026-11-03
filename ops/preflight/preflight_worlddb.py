@@ -1656,6 +1656,7 @@ class Preflight:
 
 CHECK_TITLES = {
     "0": "updater wiring",
+    "0b": "boot path (mount/env)",
     "1": "duplicate basenames",
     "2": "new files vs ledger",
     "3": "hash vs ledger",
