@@ -60,6 +60,8 @@ for pair in "${pairs[@]}"; do
     echo "compose-sync: DRIFT $installed does not match $canonical" >&2
     if [[ -f "$root/$installed" ]]; then
       diff -u "$root/$canonical" "$root/$installed" >&2 || true
+    elif [[ -d "$root/$installed" ]]; then
+      echo "compose-sync:       $installed is a directory, expected a regular file (remove it, then sudo -u pira scripts/compose-sync.sh)" >&2
     else
       echo "compose-sync:       $installed is missing (run: sudo -u pira scripts/compose-sync.sh)" >&2
     fi
