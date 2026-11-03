@@ -5,6 +5,7 @@
 .cache
 /conf/*
 !/conf/dist
+!/conf/mysql-dev.cnf
 /modules/*
 !/modules/*.md
 !/modules/*.sh
