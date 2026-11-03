@@ -103,7 +103,9 @@ and the `wrath-unbound/` snapshot are tracked in git.
 Services (from the stock `docker-compose.yml`, all started by one command):
 `ac-database` (mysql:8.4), `ac-db-import`, `ac-client-data-init`,
 `ac-worldserver`, `ac-authserver`. Compose project resolves from CWD —
-**always `cd` into the repo root before compose commands**.
+**always `cd` into the repo root before compose commands**. Except that
+`ac-worldserver` is not started by a bare `docker compose up` — its world-DB
+updater must clear the [PRO-179 pre-flight gate](#build--run) first.
 
 ## Single-writer lease (one worldserver, one writer at a time)
 
@@ -140,24 +142,63 @@ BatchMode SSH (agent sandboxes have no Docker). Take the
 [single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time)
 before any of them.
 
-One documented command from a provisioned tree (fresh image build; 2–4 h on
-a typical host, less on the Steam Deck baseline the guide targets):
+> **Gate every worldserver start (PRO-179).** The AzerothCore world-DB updater
+> runs the moment `ac-worldserver` starts. `ops/deploy/worldserver-up.sh` runs
+> the [PRO-179 pre-flight gate](../ops/preflight/README.md) and only then
+> `docker compose up -d ac-worldserver`; on a gate failure it prints
+> `REFUSING BOOT` and exits non-zero **without touching the stack**. Never run
+> `docker compose up/start/recreate ac-worldserver` around the gate. Two
+> sanctioned forms:
+>
+> - **Start / apply a freshly built image** (the common case):
+>   `bash ops/deploy/worldserver-up.sh` — gate, then `docker compose up -d
+>   ac-worldserver` (compose recreates when the image changed).
+> - **Anything the wrapper's fixed compose command cannot express** — an
+>   explicit `--force-recreate`, the load-test `COMPOSE_FILE` trio below, or a
+>   bare restart — run the gate alone first and boot only if it PASSes:
+>   `PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh` (exit 0 = PASS),
+>   then run your exact `docker compose` command. Never the other way round.
+>
+> The gate does **not** take the [single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time)
+> — your boot path still must, before any of the commands below. Its
+> `acore_world` access is read-only plus one throwaway scratch schema it drops
+> afterwards, so running it inside a lease you already hold is safe.
+
+Fresh provisioned tree (build every image; 2–4 h on a typical host, less on the
+Steam Deck baseline the guide targets). The updater runs when `ac-worldserver`
+starts and the gate reads the updater ledger from the live DB, so on a cold
+stack bring the database up first, gate, then start the worldserver (authserver
+and client-data are independent of the world updater):
 
 ```bash
-cd <repo root>
-docker compose up -d --build
+cd <repo root>                       # = /mnt/data/wow-server on the host
+docker compose build                 # builds all images; starts no container
+docker compose up -d ac-database     # one-shot ac-db-import loads the base schema
+# wait until ac-database is healthy and ac-db-import has finished
+bash ops/deploy/worldserver-up.sh    # gate, then up -d ac-worldserver
+docker compose up -d ac-authserver   # independent of the world updater
 ```
 
 After **any** core/module C++ change (the normal Scuff-Core loop —
-incremental, ~30–90 min):
+incremental, ~30–90 min), the rebuild stays a plain compose build and only the
+worldserver start is gated:
 
 ```bash
 docker compose build ac-worldserver
-docker compose up -d --force-recreate ac-worldserver
+bash ops/deploy/worldserver-up.sh    # gate, then up -d ac-worldserver (new image)
 ```
 
-Stop/start without rebuild: `docker compose stop ac-worldserver` /
-`docker compose start ac-worldserver`.
+If compose does not recreate on the new image and you must force it, use the
+second form above (`PREFLIGHT_CHECK_ONLY=1` gate, then your own
+`docker compose up -d --force-recreate ac-worldserver`).
+
+Stop is un-gated (no updater runs while stopped); bring it back through the
+gate, not `docker compose start`:
+
+```bash
+docker compose stop ac-worldserver               # fine — updater does not run
+bash ops/deploy/worldserver-up.sh                # gate, then up -d ac-worldserver
+```
 
 ### Load testing (randombot volume, PRO-33)
 
@@ -168,11 +209,13 @@ restored by `docker-compose.loadtest.override.yml`, which is **not** picked
 up by a plain `docker compose up`. From the repo root:
 
 ```bash
-# load-test boot (1600–2000 randombots)
+# load-test boot (1600–2000 randombots) — gate first, boot only on PASS
+PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh   # REFUSING BOOT on failure
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
   docker compose up -d --force-recreate ac-worldserver
 
-# back to the 50-bot default
+# back to the 50-bot default — gate first, boot only on PASS
+PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh
 docker compose up -d --force-recreate ac-worldserver
 ```
 
@@ -558,6 +601,14 @@ verify per the sections above.
   worldserver restart/recreate, `docker compose up`, DB migration, or e2e run
   without first holding `/mnt/data/wow-server/.stack/lease` — see
   [Single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time).
+- **World-DB pre-flight gate (PRO-179):** never start, recreate, or restart
+  `ac-worldserver` without the gate having passed — use
+  `bash ops/deploy/worldserver-up.sh`, or `PREFLIGHT_CHECK_ONLY=1 bash
+  ops/deploy/worldserver-up.sh` before an exact `docker compose` command the
+  wrapper cannot express (load-test `COMPOSE_FILE`, `--force-recreate`). Take
+  the lease first (the gate does not); keep `AC_UPDATES_ENABLE_DATABASES=4` and
+  leave the Playerbots updater (`acore_playerbots`) alone. See
+  [Build & run](#build--run) and [`ops/preflight/README.md`](../ops/preflight/README.md).
 - **Prohibited on the host:** a `cmake`/`make`/gcc build tree, binaries run
   outside a container, and any `docker`-alternative that shells out to a
   host-local toolchain. `docker compose up -d --build` is fine — it compiles
