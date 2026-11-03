@@ -336,3 +336,120 @@ class TestScratchName(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestBootPath(unittest.TestCase):
+    """Check 0b (review B2): the scanned tree must be the tree the boot applies."""
+
+    TARGET = "/azerothcore/data/sql"
+    SOURCE = "/nonexistent/data/sql"          # make_preflight --compose-root /nonexistent
+
+    def _pf(self, services, docker_raises=False):
+        import preflight_worlddb as P
+
+        cfg = {"services": {"ac-worldserver": services}}
+
+        class Proc:
+            returncode = 0
+            stdout = json.dumps(cfg).encode()
+            stderr = b""
+
+        def fake_run(argv, **kwargs):
+            if docker_raises:
+                raise FileNotFoundError("docker")
+            fake_run.argv = argv
+            return Proc()
+
+        pf = make_preflight()
+        pf._check_live_container = lambda *a, **k: None
+        self._orig = P.subprocess.run
+        P.subprocess.run = fake_run
+        self._run = fake_run
+        return pf
+
+    def tearDown(self):
+        import preflight_worlddb as P
+        P.subprocess.run = self._orig
+
+    def _fail_rules(self, pf):
+        pf.check_boot_path()
+        return [f.rule for f in pf.r.findings if f.severity == "FAIL"]
+
+    def _mount(self, ro=True, source=None, target=TARGET, typ="bind"):
+        return {"type": typ, "source": source if source is not None else self.SOURCE,
+                "target": target, "read_only": ro}
+
+    def test_clean_boot_path_passes(self):
+        pf = self._pf({"volumes": [self._mount()],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"},
+                       "restart": "unless-stopped"})
+        self.assertEqual([], self._fail_rules(pf))
+
+    def test_no_docker_fails_closed(self):
+        pf = self._pf({"volumes": [self._mount()],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}}, docker_raises=True)
+        self.assertIn("boot-path-unreadable", self._fail_rules(pf))
+
+    def test_none_compose_file_is_normalised(self):
+        pf = self._pf({"volumes": [self._mount()],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertEqual([], pf.a.compose_file)
+        self._fail_rules(pf)
+        self.assertNotIn("-f", self._run.argv)
+        self.assertNotIn(None, self._run.argv)
+
+    def test_writable_sql_mount_is_rejected(self):
+        pf = self._pf({"volumes": [self._mount(ro=False)],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertIn("sql-mount-writable", self._fail_rules(pf))
+
+    def test_foreign_mount_source_is_rejected(self):
+        pf = self._pf({"volumes": [self._mount(source="/srv/other/data/sql")],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertIn("sql-mount-source", self._fail_rules(pf))
+
+    def test_missing_mount_is_rejected(self):
+        pf = self._pf({"volumes": [], "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertIn("sql-mount-missing", self._fail_rules(pf))
+
+    def test_named_volume_is_rejected(self):
+        pf = self._pf({"volumes": [self._mount(typ="volume")],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertIn("sql-mount-type", self._fail_rules(pf))
+
+    def test_widened_updater_flag_is_rejected(self):
+        pf = self._pf({"volumes": [self._mount()],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "7"}})
+        self.assertIn("updater-env-widened", self._fail_rules(pf))
+
+    def test_world_updater_off_is_rejected(self):
+        pf = self._pf({"volumes": [self._mount()],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "0"}})
+        self.assertIn("updater-env-world-off", self._fail_rules(pf))
+
+    def test_missing_updater_flag_is_rejected(self):
+        pf = self._pf({"volumes": [self._mount()], "environment": {}})
+        self.assertIn("updater-env-unknown", self._fail_rules(pf))
+
+    def test_unknown_service_is_rejected(self):
+        import preflight_worlddb as P
+
+        class Proc:
+            returncode = 0
+            stdout = json.dumps({"services": {}}).encode()
+            stderr = b""
+
+        pf = make_preflight()
+        self._orig = P.subprocess.run
+        P.subprocess.run = lambda argv, **kw: Proc()
+        self.assertIn("boot-path-service", self._fail_rules(pf))
+
+    def test_short_syntax_ro_is_honoured(self):
+        pf = self._pf({"volumes": [f"{self.SOURCE}:{self.TARGET}:ro"],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertEqual([], self._fail_rules(pf))
+
+    def test_short_syntax_rw_is_rejected(self):
+        pf = self._pf({"volumes": [f"{self.SOURCE}:{self.TARGET}:rw"],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        self.assertIn("sql-mount-writable", self._fail_rules(pf))

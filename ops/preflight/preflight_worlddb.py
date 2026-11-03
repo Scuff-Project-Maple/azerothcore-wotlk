@@ -604,6 +604,9 @@ def parse_statement(text: str, masked: str, offset: int) -> Statement:
 class Preflight:
     def __init__(self, args, policy, report: Report):
         self.a = args
+        # `--compose-file` is `append`, so it is None unless someone passed one.
+        if self.a.compose_file is None:
+            self.a.compose_file = []
         self.p = policy
         self.r = report
         self.db = MySQL(args)
@@ -1744,6 +1747,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_arg_parser().parse_args(argv)
+    # `--compose-file` is `append`, so it is None unless someone passed one.
+    args.compose_file = args.compose_file or []
     policy_path = Path(args.policy)
     if not policy_path.is_file():
         print(f"preflight: policy file not found: {policy_path}", file=sys.stderr)
