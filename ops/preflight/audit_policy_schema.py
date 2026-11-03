@@ -55,27 +55,34 @@ def named_columns(entry):
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Audit preflight-policy.json table/column claims against the real DDL.")
-    ap.add_argument("--repo", default=".", type=Path)
+    ap.add_argument("--repo", default=None, type=Path,
+                    help="repo root containing data/sql/base/db_world "
+                         "(default: this file's repo, else the current directory)")
     ap.add_argument("--policy", default=None, type=Path)
     ap.add_argument("--include-modules", action="store_true",
                     help="also parse modules/*/data/sql/**/*.sql for custom tables")
     args = ap.parse_args()
 
-    policy_path = args.policy or (args.repo / "ops/preflight/preflight-policy.json")
+    here = Path(__file__).resolve()
+    repo = args.repo
+    if repo is None:
+        guess = here.parents[2]
+        repo = guess if (guess / "data/sql/base/db_world").is_dir() else Path.cwd()
+    policy_path = args.policy or (here.parent / "preflight-policy.json")
     try:
         policy = json.loads(policy_path.read_text())
     except (OSError, ValueError) as exc:
         print(f"audit: cannot read policy {policy_path}: {exc}", file=sys.stderr)
         return 2
 
-    base = args.repo / "data/sql/base/db_world"
+    base = repo / "data/sql/base/db_world"
     if not base.is_dir():
         print(f"audit: no DDL directory at {base}", file=sys.stderr)
         return 2
     ddl = parse_ddl(sorted(base.glob("*.sql")))
     module_ddl = {}
     if args.include_modules:
-        mods = sorted((args.repo / "modules").glob("*/data/sql/**/*.sql"))
+        mods = sorted((repo / "modules").glob("*/data/sql/**/*.sql"))
         module_ddl = parse_ddl(mods)
         print(f"parsed {len(ddl)} base table(s), {len(module_ddl)} module table(s)")
     else:
