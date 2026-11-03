@@ -5,12 +5,16 @@ Dev environment for the Unbound Wrath WotLK project. Provisioned per
 truth for repo pinning, build/run commands, `env/` config, and the expected
 healthy-boot log lines. QA and all engineers: start here.
 
-**Status:** provisioned, built, and booted on the [build host](#build-host).
-Clean boot verified 2026-10-19: `ready...` at 01:33:20 UTC, `[UNBOUND]
-Prereq map built.` at 01:32:55, `custom class registry ready: 1 template(s)
-active`, no errors since start, ~1500 random playerbots online. The
-in-game `.npc add 900001` check is delegated to QA as a child of
-[PRO-2](/PRO/issues/PRO-2) — see
+**Status:** provisioned, built, booted, and **fully accepted (2026-10-27)**.
+Current stack verified 2026-10-27 00:53 UTC on `AzerothCore rev.
+34d6f4b0e8c7+` (Playerbot branch, built 2026-10-25, includes the PRO-32
+async-DB hardening): `ready...`, `[UNBOUND] Prereq map built.`, `custom
+class registry ready: 1 template(s) active`, no errors/crash. The final
+in-game acceptance item — `.npc add 900001` from a GM3 session — **PASSED**
+in [PRO-43](/PRO/issues/PRO-43) (QA, 2026-10-27): login/enter-world, the
+persistent Mentor visible at -8830/614/93.5, a second Mentor spawned and
+persisted, no errors, ALE gossip menu answered. See
+[Verification](#verification-what-healthy-looks-like) and
 [Worldserver console vs in-game GM commands](#worldserver-console-vs-in-game-gm-commands).
 
 ---
@@ -51,12 +55,14 @@ commits on top of it. `mod-playerbots` fork `master` tracks `7bae1b5c…`;
 the `mod-ale` fork's `master` is at upstream HEAD — check out the pinned
 `1cb86c96…` when provisioning.
 
-**Push status (2026-10-19):** the fork `Playerbot` branch is current with
-the build host tree at `/mnt/data/wow-server` — it carries the
+**Push status (synced, verified 2026-10-27):** the fork `Playerbot` branch is
+the source of truth (head `a6c0eb14d`); it carries the
 T1/Wrath-Unbound base (`f5b197b8d`–`8c16d1194`), the PRO-9/PRO-10 module +
 SQL work (`b732dfd71`–`4805857c4`), and the PRO-3/PRO-16/PRO-20 docs
-(`e025c7dc9`–`f76e13468`). Pushes go through the company's managed GitHub
-identity (PRO-7); the fork is the source of truth for reprovisioning — see
+(`e025c7dc9`–`f76e13468`) — all four PRO-15 commits (`b732dfd71`,
+`deaf1109c`, `9c0db4ef6`, `ad3393eb7`) verified as ancestors of the fork
+head. Pushes go through the company's managed GitHub
+identity (PRO-7); cloning that branch is the reprovisioning path — see
 [Reprovisioning](#reprovisioning-from-a-clean-clone-e-g-on-the-new-docker-host).
 
 ## Provisioned tree layout
@@ -104,10 +110,40 @@ Services (from the stock `docker-compose.yml`, all started by one command):
 `ac-worldserver`, `ac-authserver`. Compose project resolves from CWD —
 **always `cd` into the repo root before compose commands**.
 
+## Single-writer lease (one worldserver, one writer at a time)
+
+There is exactly **one** `ac-worldserver` on the [build host](#build-host) and
+no mutual exclusion, so a restart under someone else's run silently destroys
+their verification — it cost [PRO-36](/PRO/issues/PRO-36) its T4.7 e2e gate on
+2026-10-28. Before you restart/recreate `ac-worldserver`, run
+`docker compose up`, apply a DB migration, **or run the e2e suite**, you MUST
+hold the lease. If `check` below reports `LEASE_HELD_LIVE`: **do not proceed** —
+wait, or coordinate in the holder's issue thread. Breaking a
+`LEASE_STALE_BREAKABLE` lease is allowed only with a comment on **your** issue
+naming the lease you broke (its `agentId`, `issueId`, `acquiredAt`,
+`expectedMinutes`). Release when the action finishes, including on failure.
+Lease file: `/mnt/data/wow-server/.stack/lease` (JSON, one line). The
+`.stack/` dir is `0775 scuff-dev:pira` so both host drivers can write it — the
+compose root itself is not agent-writable. No cron, no daemon: the read is the
+rule.
+
+```bash
+# ACQUIRE — atomic (O_EXCL); prints LEASE_HELD + the holder and exits non-zero if someone is in there
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && ( set -o noclobber; jq -cn --arg agent "<agent-id>" --arg issue "<PRO-xx>" --arg action "<worldserver-restart|e2e-suite|db-migration|compose-up>" --arg at "$(date -u +%FT%TZ)" --argjson mins 90 "{agentId:\$agent,issueId:\$issue,action:\$action,acquiredAt:\$at,expectedMinutes:\$mins}" > .stack/lease ) && echo LEASE_ACQUIRED || { echo LEASE_HELD; cat .stack/lease; exit 1; }'
+
+# CHECK — prints LEASE_FREE | LEASE_HELD_LIVE | LEASE_STALE_BREAKABLE (+ the lease JSON)
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && { [ -f .stack/lease ] && { jq -er "(.acquiredAt|fromdate)+(.expectedMinutes*60) > (now|floor)" .stack/lease >/dev/null && { echo LEASE_HELD_LIVE; cat .stack/lease; } || { echo LEASE_STALE_BREAKABLE; cat .stack/lease; }; } || echo LEASE_FREE; }'
+
+# RELEASE — always, including on failure
+ssh -o BatchMode=yes 192.168.1.71 'rm -f /mnt/data/wow-server/.stack/lease && echo LEASE_RELEASED'
+```
+
 ## Build & run
 
 All commands in this section run **on the [build host](#build-host)**, over
-BatchMode SSH (agent sandboxes have no Docker).
+BatchMode SSH (agent sandboxes have no Docker). Take the
+[single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time)
+before any of them.
 
 One documented command from a provisioned tree (fresh image build; 2–4 h on
 a typical host, less on the Steam Deck baseline the guide targets):
@@ -147,7 +183,7 @@ of the worldserver rebuild loop above. There is deliberately no allowlist: each
 pair must be byte-identical (`cmp`). Edit `wrath-unbound/*.override.yml`, never
 the root copies.
 
-### Load testing (randombot volume)
+### Load testing (randombot volume, PRO-33)
 
 The stack runs **50/50** randombots in normal operation
 (`AC_AI_PLAYERBOT_MIN/MAX_RANDOM_BOTS` in `docker-compose.override.yml`). The
@@ -168,6 +204,28 @@ docker compose up -d --force-recreate ac-worldserver
 Take the single-writer lease (`/mnt/data/wow-server/.stack/lease`) before any
 recreate, and health-check afterwards (`RestartCount=0`, empty `Errors.log`,
 the expected number of `Bot … logged in` lines).
+
+Verify the loaded count after boot: the `bot_count` row in
+`acore_playerbots.playerbots_random_bots` (owner=0, bot=0) should read 50
+(default) or 1600–2000 (load test):
+
+```bash
+docker exec ac-database mysql -u root -ppassword acore_playerbots \
+  -e "SELECT event, value FROM playerbots_random_bots WHERE owner = 0 AND bot = 0;"
+```
+
+and the online `rndbot%` characters in `acore_characters` should match
+within a few minutes:
+
+```bash
+docker exec ac-database mysql -u root -ppassword \
+  -e "SELECT COUNT(*) AS online_bots FROM acore_characters c JOIN acore_auth a ON c.account = a.id WHERE a.username LIKE 'rndbot%' AND c.online > 0;"
+```
+
+Background: the boot-time login storm was the primary stressor
+behind the auth-chain wedge
+([PRO-21](/PRO/issues/PRO-21)); DB-async SPOF hardening is tracked
+separately in [PRO-32](/PRO/issues/PRO-32).
 
 ## Build host
 
@@ -226,7 +284,7 @@ doc:
 | Git remotes | `origin` → `https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git` (the previous base-repo remote was replaced) |
 | Modules | plain source trees staged from the pinned/fork-snapshot sources: `mod-ale` @ `1cb86c960026`, `mod-playerbots` @ `7bae1b5c58c7`, `mod-unbound` + `mod-custom-classes` from the tracked `wrath-unbound/` snapshot, plus host-only `mod-arac` (kept) |
 | Conf | `env/dist/etc/modules/mod_ale.conf`, `mod_custom_classes.conf`, `lua_scripts/unbound_mentor.lua` in place; live `worldserver.conf` untouched |
-| Running binary | `AzerothCore rev. fd6df4549+ (Playerbot branch)`, built 2026-10-19 00:29 from this tree (the `+` marks untracked content in the tree at build time) |
+| Running binary | `AzerothCore rev. 34d6f4b0e8c7+ (Playerbot branch)`, built 2026-10-25 21:12 from this tree (the `+` marks untracked content in the tree at build time). Earlier verified run: `fd6df4549+` (2026-10-19) |
 
 Before the resync, safety artifacts were written to
 `/mnt/data/backups/pre-fork-resync-20261018/`: a gzip-verified dump of all
@@ -332,17 +390,30 @@ has none) and the stock ready marker:
 docker logs ac-worldserver | grep "ready..."
 ```
 
-**Verified on the live host (2026-10-19, 01:30–01:33 UTC boot):**
+**Verified on the live host (2026-10-27 00:53 UTC, running `rev.
+34d6f4b0e8c7+`, boot started 2026-10-26T23:52:43Z):**
 
 ```
+banner: AzerothCore rev. 34d6f4b0e8c7+ 2026-10-25 21:12:06 +0000 (Playerbot branch) ... ready...
+[UNBOUND] ranger_vex_gossip.lua loaded: entry 900200, quests 900101/900102
 [UNBOUND] Prereq map built.
-custom class registry ready: 1 template(s) active (0 removed after DBC validation)
 ```
 
-Boot reached `ready...` at 01:33:20 with no ERROR/ABRT/assert/segfault
-since start, `mod_custom_classes.conf` loaded with
-`CustomClasses.Enabled = true`, and ~1500 random playerbots online. The
-Mentor template (900001) loaded from the world DB without rejection.
+No `ERROR|FATAL|Assert|Segmentation|terminate called` in the boot window
+and no crash/restart, ~50 random playerbots online (PRO-33 default). The
+one config line that looks alarming but is **benign**: `Config: Missing
+property AiPlayerbot.ErrorDelay` — the live
+`env/dist/etc/modules/playerbots.conf` predates
+`modules/mod-playerbots/conf/playerbots.conf.dist:384`; it only disables a
+retry delay (module default applies) and is safe to ignore, or add
+`AiPlayerbot.ErrorDelay = 100` to the live conf on the next planned
+restart.
+
+Earlier verified boot (2026-10-19, `rev. fd6df4549+`, 01:30–01:33 UTC)
+also showed `custom class registry ready: 1 template(s) active (0 removed
+after DBC validation)`, `CustomClasses.Enabled = true`, and ~1500 random
+playerbots. The Mentor template (900001) loaded from the world DB without
+rejection in both boots.
 
 ### Worldserver console vs in-game GM commands
 
@@ -378,8 +449,13 @@ exists (measured read-only on the live `acore_world` 2026-11-03):
 All other `.npc` subcommands — including `.npc add` — are `Console::No`
 (in-game GM sessions only). `.npc add 900001` therefore **must be run from
 an in-game GM3 character**; it spawns "The Mentor" at the GM's position and
-persists the spawn row to the DB. That in-game check is the remaining PRO-2
-acceptance item, delegated to QA.
+persists the spawn row to the DB. That in-game check **PASSED** in
+[PRO-43](/PRO/issues/PRO-43) on 2026-10-27 (protocol-harness GM3 session):
+`.npc add 900001` produced live GUID
+`0xF1300DBBA1005C5D` and a new `acore_world.creature` row (`guid 9002023`),
+so the template+command path works from a real in-game session. The test
+spawn was deleted afterwards; the only remaining row is the persistent
+`9002020`.
 
 In-game test (GM3 account, in-game only — the console does not expose
 `.npc add`; see above):
@@ -478,12 +554,12 @@ verify per the sections above.
   toolchain. Build, boot, and log verification were then executed on the
   [build host](#build-host) (host provisioned via
   [PRO-6](/PRO/issues/PRO-6)). Clean boot + `[UNBOUND] Prereq map built.`
-  verified 2026-10-19. The only unverified acceptance item is the
-  in-game `.npc add 900001` spawn check, which requires an in-game GM
-  character (the console does not expose `.npc add` — see
+  verified 2026-10-19 and re-verified 2026-10-27. The in-game
+  `.npc add 900001` spawn check requires an in-game GM character (the
+  console does not expose `.npc add` — see
   [Worldserver console vs in-game GM commands](#worldserver-console-vs-in-game-gm-commands));
-  it is delegated to QA as a child of
-  [PRO-2](/PRO/issues/PRO-2).
+  it passed in [PRO-43](/PRO/issues/PRO-43) on 2026-10-27, closing the last
+  PRO-2 acceptance item.
 - **D2 — `ValidateSkillLearnedBySpells = 0` set in `worldserver.conf.dist`
   instead of the installer's runtime sed of `env/dist/etc/worldserver.conf`.**
   The runtime conf is generated into the bind-mounted `env/dist/etc` by the
@@ -616,6 +692,10 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
 - **Canonical agent access path:** `ssh 192.168.1.71 '<docker command>'` —
   build, apply SQL, and read logs from there. Do not ssh in and run a
   host-local compiler.
+- **Single-writer lease (board rule, [PRO-67](/PRO/issues/PRO-67)):** no
+  worldserver restart/recreate, `docker compose up`, DB migration, or e2e run
+  without first holding `/mnt/data/wow-server/.stack/lease` — see
+  [Single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time).
 - **Prohibited on the host:** a `cmake`/`make`/gcc build tree, binaries run
   outside a container, and any `docker`-alternative that shells out to a
   host-local toolchain. `docker compose up -d --build` is fine — it compiles
@@ -631,7 +711,7 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
 - [x] SQL migrations staged with documented apply order (custom-class DDL + PRO-10 seed auto-apply via the DB updater)
 - [x] `ValidateSkillLearnedBySpells = 0`
 - [x] Setup doc in the repo (this file)
-- [x] Build worldserver (on the build host; running rev `fd6df4549+`, 2026-10-19)
-- [x] Clean boot + `[UNBOUND] Prereq map built.` (verified 2026-10-19 01:30–01:33 UTC boot; no errors, ~1500 bots online)
+- [x] Build worldserver (on the build host; current running rev `34d6f4b0e8c7+`, 2026-10-25; first verified `fd6df4549+`, 2026-10-19)
+- [x] Clean boot + `[UNBOUND] Prereq map built.` (re-verified 2026-10-27 on `rev. 34d6f4b0e8c7+`; no errors/crash)
 - [x] NPC 900001 in the live world — template 900001 "The Mentor" (upstream addon `wrath-unbound/modules/mod-unbound/npc_setup.sql`, which ships no spawn row) + persistent spawn row (guid 9002020, `creature.id = 900001`, map 0 at -8830/614/93.5, `spawntimesecs` 300) in `acore_world`, owned by `data/sql/updates/pending_db_world/2026_11_03_00.sql`; `.npc load 9002020` is the console-side check — re-run owed on PRO-108, because the earlier `5300679` guid never existed
-- [ ] `.npc add 900001` from an in-game GM3 character — in-game only (console limitation, see above); delegated to QA
+- [x] `.npc add 900001` from an in-game GM3 character — **PASS** in [PRO-43](/PRO/issues/PRO-43) (2026-10-27): new live unit + persisted `creature` row, no errors; test spawn deleted, persistent `9002020` intact
