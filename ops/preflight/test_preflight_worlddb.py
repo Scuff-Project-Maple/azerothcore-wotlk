@@ -280,7 +280,7 @@ class TestProvenance(unittest.TestCase):
         f = self.file_in("$/data/sql/updates/pending_db_world", "company")
         f["origin"] = "unknown"
         f["provenance"] = "cannot attribute: untracked"
-        f["path"] = Path("ops/preflight/preflight_worlddb.py")  # any readable file
+        f["path"] = Path(__file__).with_name("preflight_worlddb.py")  # any readable file
         pf.check_policy([f])
         self.assertFalse(any(x.rule == "policy-exempt-origin" for x in pf.r.findings))
 
