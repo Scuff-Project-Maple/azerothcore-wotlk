@@ -311,13 +311,21 @@ exposes only a **subset** of GM commands. In this build
 
 `<spawn guid>` is the primary key of the `acore_world.creature` table, not
 the creature template id. For "The Mentor" (template 900001) the persistent
-spawn row is `guid 5300679` (Eastern Kingdoms, -8830/614/93.5):
+spawn row is `guid 9002020` (`creature.id = 900001`, Eastern Kingdoms,
+-8830/614/93.5). The row is owned by
+`data/sql/updates/pending_db_world/2026_11_03_00.sql` (committed 2026-11-03,
+PRO-114). The guid previously documented here, `5300679`, was never a spawn
+guid: it is only the `AUTO_INCREMENT` value in
+`data/sql/base/db_world/creature.sql`, and no `creature` row with that guid
+exists (measured read-only on the live `acore_world` 2026-11-03):
 
 ```
-.npc load 5300679
-# → "Creature spawn 5300679 is already loaded."  (verified on the running
-#   worldserver 2026-10-19 — the console-side proof the NPC is in the live
-#   world)
+.npc load 9002020
+# → "Creature spawn 9002020 is already loaded."
+#   The row is created by data/sql/updates/pending_db_world/
+#   2026_11_03_00.sql. The 2026-10-19 run of this check was recorded against
+#   guid 5300679, which does not exist in acore_world.creature, so the check
+#   is owed a re-run on PRO-108 (single-writer lease).
 ```
 
 All other `.npc` subcommands — including `.npc add` — are `Console::No`
@@ -554,5 +562,5 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
 - [x] Setup doc in the repo (this file)
 - [x] Build worldserver (on the build host; running rev `fd6df4549+`, 2026-10-19)
 - [x] Clean boot + `[UNBOUND] Prereq map built.` (verified 2026-10-19 01:30–01:33 UTC boot; no errors, ~1500 bots online)
-- [x] NPC 900001 in the live world — template 900001 "The Mentor" + persistent spawn row (guid 5300679) in `acore_world`; `.npc load 5300679` → "already loaded" on the running worldserver (console-side equivalent)
+- [x] NPC 900001 in the live world — template 900001 "The Mentor" (upstream addon `wrath-unbound/modules/mod-unbound/npc_setup.sql`, which ships no spawn row) + persistent spawn row (guid 9002020, `creature.id = 900001`, map 0 at -8830/614/93.5, `spawntimesecs` 300) in `acore_world`, owned by `data/sql/updates/pending_db_world/2026_11_03_00.sql`; `.npc load 9002020` is the console-side check — re-run owed on PRO-108, because the earlier `5300679` guid never existed
 - [ ] `.npc add 900001` from an in-game GM3 character — in-game only (console limitation, see above); delegated to QA

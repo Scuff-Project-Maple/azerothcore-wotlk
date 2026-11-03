@@ -57,7 +57,14 @@
 --   item 1468 (Murloc Fin, quality 1 ilvl 16; drops 35 %/kill from
 --   1024-1029 via existing creature_loot_template rows)
 --   item 2046 (Bluegill Kukri, quality 2 ilvl 24)
---   creature 900001 + spawn guid 5300679 (row-shape precedents)
+--   creature 900001 "The Mentor" + its spawn row (row-shape precedent).
+--   Comment-only correction 2026-11-03 (PRO-114 / PRO-171): this line
+--   originally cited "spawn guid 5300679". 5300679 is not a spawn guid - it
+--   is only the AUTO_INCREMENT value in data/sql/base/db_world/creature.sql,
+--   and no creature row with that guid exists (measured read-only on the live
+--   acore_world 2026-11-03). The Mentor's spawn row is guid 9002020 and is
+--   owned by data/sql/updates/pending_db_world/2026_11_03_00.sql. No DML in
+--   this file was changed.
 --   quest 279 (row-shape precedent only)
 --
 -- ROLLBACK:
