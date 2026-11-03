@@ -453,6 +453,22 @@ class TestBootPath(unittest.TestCase):
         pf = self._pf({"volumes": [f"{self.SOURCE}:{self.TARGET}:rw"],
                        "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
         self.assertIn("sql-mount-writable", self._fail_rules(pf))
+        # the summary line must not describe a writable mount as read-only
+        # (host probe PRO-179: the rw override printed "(read-only bind)")
+        from preflight_worlddb import render
+        pf.check_boot_path()
+        text = render(pf.r, pf.a)
+        self.assertIn("WRITABLE bind", text)
+        self.assertNotIn("(read-only bind)", text)
+
+    def test_summary_line_reports_read_only_only_when_it_is(self):
+        pf = self._pf({"volumes": [f"{self.SOURCE}:{self.TARGET}:ro"],
+                       "environment": {"AC_UPDATES_ENABLE_DATABASES": "4"}})
+        from preflight_worlddb import render
+        pf.check_boot_path()
+        text = render(pf.r, pf.a)
+        self.assertIn("(read-only bind)", text)
+        self.assertNotIn("WRITABLE bind", text)
 
 
 class TestRenderCoversEveryCheck(unittest.TestCase):

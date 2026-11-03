@@ -945,7 +945,15 @@ class Preflight:
         if restart in ("unless-stopped", "always"):
             self.r.line("0b", f"restart={restart}: a bad update file crash-loops the stack, which "
                               f"is why this gate runs before every boot")
-        self.r.line("0b", f"sql mount {scanned} -> {target} (read-only bind) for {svc_name}; "
+        if not matched:
+            ro_label = "not mounted"
+        elif all(v["ro"] is True for v in matched):
+            ro_label = "read-only bind"
+        elif any(v["ro"] is False for v in matched):
+            ro_label = "WRITABLE bind"
+        else:
+            ro_label = "bind, read-only not asserted"
+        self.r.line("0b", f"sql mount {scanned} -> {target} ({ro_label}) for {svc_name}; "
                           f"{flag}={env.get(flag)}")
         self._check_live_container(svc_name, target, scanned, bp)
 

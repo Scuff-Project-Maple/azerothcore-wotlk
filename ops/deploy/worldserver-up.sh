@@ -20,14 +20,16 @@
 # Environment:
 #   COMPOSE_ROOT          stack root, default the repo root of this script
 #   COMPOSE_FILE          honoured, same meaning as for `docker compose`
-#   PREFLIGHT_CHECK_ONLY=1  run the gate (and the lease check) and exit without
-#                          starting anything — CI and merge-gate rehearsal
+#   PREFLIGHT_CHECK_ONLY=1  run the gate only: no lease requirement, no stack
+#                          touch — CI and merge-gate rehearsal
+#   LEASE_FILE            lease path override, default $COMPOSE_ROOT/.stack/lease
 #   PYTHON                python interpreter for the gate
 #
-# Single-writer lease: this script REQUIRES a held lease at
-# $COMPOSE_ROOT/.stack/lease before it will start anything. It verifies the
-# lease, it does not take it — taking it is the boot path's job, see
-# docs/dev-environment.md#single-writer-lease.
+# Order of operations is deliberate: the single-writer lease is verified BEFORE
+# the gate, because the gate opens a scratch schema on the database and a
+# boot-path writer must be the only one touching that server. The script
+# verifies the lease, it does not take it — taking it is the boot path's job,
+# see docs/dev-environment.md#single-writer-lease.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,7 +40,7 @@ PYTHON="${PYTHON:-python3}"
 LEASE_FILE="${LEASE_FILE:-$COMPOSE_ROOT/.stack/lease}"
 
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -128,25 +130,14 @@ if [[ ${#COMPOSE_FILES[@]} -eq 0 && -n "${COMPOSE_FILE:-}" ]]; then
   done
 fi
 
-echo "worldserver-up: pre-flight gate (compose root $COMPOSE_ROOT)"
-rc=0
-"$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} || rc=$?
-if (( rc != 0 )); then
-  echo "worldserver-up: REFUSING BOOT — pre-flight failed (exit $rc)." >&2
-  echo "worldserver-up: ac-worldserver was not started. Fix the named file(s) or" >&2
-  echo "                  escalate to Scuff (SQL); do not bypass this gate." >&2
-  exit "$rc"
-fi
-
+# --- single-writer lease --------------------------------------------------- #
+# Refuse to boot without a lease someone is actually holding. `PREFLIGHT_CHECK_ONLY=1`
+# is the CI/rehearsal escape hatch and skips it, because a check-only run neither
+# needs the stack nor starts it. The inner block is not indented: the `PY` heredoc
+# terminator has to sit at column 0.
 if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
-  echo "worldserver-up: gate passed; PREFLIGHT_CHECK_ONLY=1 so the stack was not touched."
-  exit 0
-fi
-
-# --- single-writer lease -------------------------------------------------- #
-# Refuse to boot without a lease someone is actually holding. The gate does not
-# take the lease on purpose: it is read-only and CI-safe, and a gate that could
-# grab the lease would let a CI run starve the host boot path.
+  echo "worldserver-up: PREFLIGHT_CHECK_ONLY=1 — read-only check, lease not required."
+else
 if [[ ! -f "$LEASE_FILE" ]]; then
   die "REFUSING BOOT — no single-writer lease at $LEASE_FILE. Take it first (docs/dev-environment.md#single-writer-lease); this script verifies the lease, it does not take it."
 fi
@@ -200,6 +191,22 @@ print(f"worldserver-up: lease held ({holder}), {minutes - age_min:.0f} min of th
 PY
 then
   exit 2
+fi
+fi
+
+echo "worldserver-up: pre-flight gate (compose root $COMPOSE_ROOT)"
+rc=0
+"$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} || rc=$?
+if (( rc != 0 )); then
+  echo "worldserver-up: REFUSING BOOT — pre-flight failed (exit $rc)." >&2
+  echo "worldserver-up: ac-worldserver was not started. Fix the named file(s) or" >&2
+  echo "                  escalate to Scuff (SQL); do not bypass this gate." >&2
+  exit "$rc"
+fi
+
+if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
+  echo "worldserver-up: gate passed; PREFLIGHT_CHECK_ONLY=1 so the stack was not touched."
+  exit 0
 fi
 
 cd "$COMPOSE_ROOT"
