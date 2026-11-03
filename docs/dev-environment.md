@@ -117,27 +117,30 @@ no mutual exclusion, so a restart under someone else's run silently destroys
 their verification — it cost [PRO-36](/PRO/issues/PRO-36) its T4.7 e2e gate on
 2026-10-28. Before you restart/recreate `ac-worldserver`, run
 `docker compose up`, apply a DB migration, **or run the e2e suite**, you MUST
-hold the lease. If `check` below reports `LEASE_HELD_LIVE`: **do not proceed** —
-wait, or coordinate in the holder's issue thread. Breaking a
-`LEASE_STALE_BREAKABLE` lease is allowed only with a comment on **your** issue
-naming the lease you broke (its `agentId`, `issueId`, `acquiredAt`,
-`expectedMinutes`). Release when the action finishes, including on failure.
-Lease file: `/mnt/data/wow-server/.stack/lease` (JSON, one line). The
-`.stack/` dir is `0775 scuff-dev:pira` so both host drivers can write it (the
-compose root became agent-writable too with
+hold the lease; `action` is one of `worldserver-restart`, `e2e-suite`,
+`db-migration`, `compose-up`. If `check` below reports `LEASE_HELD_LIVE`: **do
+not proceed** — wait, or coordinate in the holder's issue thread. A lease that
+will not parse counts as stale-breakable, and breaking a stale or unparseable
+lease is the **only** time you `rm -f` a lease that is not yours — it needs a
+comment on **your** issue naming it (`agentId`, `issueId`, `acquiredAt`,
+`expectedMinutes`). Release when the action finishes, including on failure;
+`release` refuses unless the lease names you. Lease file:
+`/mnt/data/wow-server/.stack/lease` (JSON, one line); the `.stack/` dir is
+`2775 scuff-dev:pira` so both host drivers can write it (the compose root
+became agent-writable too with
 [PRO-198](/PRO/issues/PRO-198) — see
 [Git access on the compose root](#git-access-on-the-compose-root)). No cron,
 no daemon: the read is the rule.
 
 ```bash
 # ACQUIRE — atomic (O_EXCL); prints LEASE_HELD + the holder and exits non-zero if someone is in there
-ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && ( set -o noclobber; jq -cn --arg agent "<agent-id>" --arg issue "<PRO-xx>" --arg action "<worldserver-restart|e2e-suite|db-migration|compose-up>" --arg at "$(date -u +%FT%TZ)" --argjson mins 90 "{agentId:\$agent,issueId:\$issue,action:\$action,acquiredAt:\$at,expectedMinutes:\$mins}" > .stack/lease ) && echo LEASE_ACQUIRED || { echo LEASE_HELD; cat .stack/lease; exit 1; }'
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && mkdir -p .stack && ( set -o noclobber; jq -cn --arg agent "<agent-id>" --arg issue "<PRO-xx>" --arg action "<action>" --arg at "$(date -u +%FT%TZ)" --argjson mins 90 "{agentId:\$agent,issueId:\$issue,action:\$action,acquiredAt:\$at,expectedMinutes:\$mins}" > .stack/lease ) && echo LEASE_ACQUIRED || { echo LEASE_HELD; cat .stack/lease; exit 1; }'
 
 # CHECK — prints LEASE_FREE | LEASE_HELD_LIVE | LEASE_STALE_BREAKABLE (+ the lease JSON)
 ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && { [ -f .stack/lease ] && { jq -er "(.acquiredAt|fromdate)+(.expectedMinutes*60) > (now|floor)" .stack/lease >/dev/null && { echo LEASE_HELD_LIVE; cat .stack/lease; } || { echo LEASE_STALE_BREAKABLE; cat .stack/lease; }; } || echo LEASE_FREE; }'
 
-# RELEASE — always, including on failure
-ssh -o BatchMode=yes 192.168.1.71 'rm -f /mnt/data/wow-server/.stack/lease && echo LEASE_RELEASED'
+# RELEASE — always, including on failure; refuses unless the lease names you
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && if jq -e --arg a "<agent-id>" --arg i "<PRO-xx>" ".agentId==\$a and .issueId==\$i" .stack/lease >/dev/null 2>&1; then rm -f .stack/lease && echo LEASE_RELEASED; else echo LEASE_NOT_YOURS; cat .stack/lease 2>/dev/null; fi'
 ```
 
 ## Build & run
@@ -145,7 +148,8 @@ ssh -o BatchMode=yes 192.168.1.71 'rm -f /mnt/data/wow-server/.stack/lease && ec
 All commands in this section run **on the [build host](#build-host)**, over
 BatchMode SSH (agent sandboxes have no Docker). Take the
 [single-writer lease](#single-writer-lease-one-worldserver-one-writer-at-a-time)
-before any of them.
+before any command below that builds, starts, restarts or recreates a container,
+or applies SQL — read-only inspection commands do not need it.
 
 One documented command from a provisioned tree (fresh image build; 2–4 h on
 a typical host, less on the Steam Deck baseline the guide targets):
