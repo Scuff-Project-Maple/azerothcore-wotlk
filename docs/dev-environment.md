@@ -759,7 +759,17 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   `docker compose` command the wrapper cannot express (`up -d --build`,
   `restart`). Take the lease first — the wrapper verifies it, the gate does not
   take it; keep `AC_UPDATES_ENABLE_DATABASES=4` and leave the Playerbots updater
-  (`acore_playerbots`) alone. See
+  (`acore_playerbots`) alone. The wrapper **refuses** the flags that would let a
+  boot step around what the gate read: `-f/--file`, `--env-file` and
+  `-p/--project-name` after a bare `--` (pass them before `--`), `--compose-root`
+  and `--gate` (set `COMPOSE_ROOT`/`PYTHON` instead, so the gate and the `cd`
+  cannot disagree), and `--no-boot-path-check` unless `PREFLIGHT_CHECK_ONLY=1`.
+  A restart that changes **no** SQL can skip the slow half of the gate — the
+  scratch clone plus up to `--data-copy-max-rows` rows copied per referenced
+  table — with `bash ops/deploy/worldserver-up.sh --no-dry-run`; it prints a
+  warning on purpose, because it is exactly the fast path that must not be used
+  after a SQL change. `--keep-scratch` keeps the scratch schema instead of
+  dropping it, for post-mortem queries. See
   [Build & run](#build--run) and [`ops/preflight/README.md`](../ops/preflight/README.md).
 - **Prohibited on the host:** a `cmake`/`make`/gcc build tree, binaries run
   outside a container, and any `docker`-alternative that shells out to a

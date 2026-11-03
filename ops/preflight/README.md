@@ -6,6 +6,7 @@ It refuses the boot unless the four `db_world` directories that
 
     ops/deploy/worldserver-up.sh              # lease check + gate, then compose up
     python3 ops/preflight/preflight_worlddb.py  # gate only (exit 0 pass, 1 fail, 2 operational error)
+    PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py  # policy-engine tests, no DB needed
 
 `PREFLIGHT_CHECK_ONLY=1 ops/deploy/worldserver-up.sh` runs the gate without touching the
 stack — that is the CI / merge-gate rehearsal form. The wrapper **verifies** the single-writer
@@ -38,7 +39,8 @@ mounts. It requires: bind mount `Destination == <Updates.SourceDirectory>/data/s
 `Source` resolving to `<compose_root>/data/sql`, read-only, no shadowing second mount, and
 `AC_UPDATES_ENABLE_DATABASES` set with bit `4` (`DATABASE_WORLD`,
 `src/server/database/Database/DatabaseLoader.h:48-51`) and no other bit. `--no-boot-path-check`
-skips it for offline use.
+skips it for offline use; the wrapper refuses that flag unless `PREFLIGHT_CHECK_ONLY=1`, because
+a boot that skips check 0b is a boot the gate did not read.
 
 Why the mount is what makes the gate meaningful: the `.sql` files the updater applies come from
 the bind mount, not from the image, so a stale image cannot make the scanned set differ from the
@@ -56,9 +58,17 @@ The directory tag is a policy statement, so content dropped into a company direc
 policy-checked — even when it is committed with `--author` crediting an upstream author, which
 this repo's `AGENTS.md` requires. `upstream` (and therefore exempt by default) requires **both**
 an upstream-tagged directory and a non-company author. Files git cannot attribute — untracked or
-unreadable history — are never exempt. `--strict-all` enforces the policy on everything, which is
-the CI/merge-gate setting; a boot-time gate that enforced it against upstream
-`updates/db_world` would eventually block a legitimate `git pull`.
+unreadable history — are never exempt, and neither is an upstream file with **uncommitted
+changes**: provenance is read from HEAD, so a hand edit in the work tree re claims the file for
+the policy (`dirty-worktree`) instead of letting the edit ride the exemption.
+
+So **check 4 covers company content only**, by design. `--strict-all` (policy on everything,
+warnings too) is not a usable boot-time setting: against this tree it fails ~754 of 861 upstream
+files — 77094 reserved-band, 52967 table-not-allowed, 1666 band-not-literal, 1452 unbounded-write,
+25 `DROP`, 4 on `updates`, 2 `EXECUTE` — every one of them upstream content the updater has
+always applied. `--policy-all` reports the same set without failing; **CI runs `--policy-all`
+report-only** and the boot gate runs the default company-only mode. Anything that must hold
+against upstream too is a review question, not a boot gate.
 
 ## Write policy (check 4)
 
@@ -70,11 +80,24 @@ For a file under policy, every statement must satisfy:
 - writes target only tables in `baseTables` of `preflight-policy.json`, or a table
   explicitly whitelisted in `customTables`; `CREATE TABLE` is allowed for whitelisted
   custom tables only;
+- every `UPDATE`/`DELETE` writes **one** table. A second table anywhere in the write region —
+  `UPDATE creature c JOIN updates u SET ...`, `UPDATE a, b SET ...`, `DELETE a, b FROM a JOIN b` —
+  is a `multi-table-write` failure, and every table named in that region is still checked against
+  the ledger and the allow-list, so a JOIN cannot smuggle `updates` past check 4;
 - every `UPDATE`/`DELETE` is `WHERE`-bounded on a **complete** natural key: every column of one
-  of the table's `keySets` groups compared to literals with `=`/`<=>`/`IN`, no top-level `OR`.
+  of the table's `keySets` groups compared to literals with `=`/`<=>`/`IN`, no `OR` that decides
+  which rows are reached. Grouping parentheses do not hide a disjunction
+  (`WHERE (source_type=0 OR entryorguid=9002020)` fails), a key bounded only on one side of an
+  `OR` does not bound the statement, a column bounded only inside `IN (SELECT ...)` does not
+  count at all, and `NOT (entry=...)` bounds nothing. `key = 1 AND (x='a' OR x='b')` stays legal.
+  Predicates after the key are read up to the first top-level `ORDER BY`/`LIMIT`, so trailing
+  clauses cannot make a literal look like a non-literal.
   With no `keySets`, the whole `keyColumns` list is one required group. Bounding on part of a
   composite key is not enough (`DELETE FROM module_string WHERE module='x'` deletes the whole
   module);
+- keywords inside string literals are inert: `'Please select your destination, hero;'` in
+  `page_text` is data, not a statement separator or an `OR` (the masker blanks literal bodies
+  while preserving offsets);
 - every row that identifies a company creature/quest sits in the reserved band
   (`creature_template.entry` / `quest_template.ID` >= 900000, `creature.guid` >= 9000000,
   plus the reference columns in `refs`), as a literal in a named column;
@@ -89,7 +112,12 @@ the full schema) and the written tables are pre-populated server-side so `WHERE`
 match real rows; `FOREIGN_KEY_CHECKS` stays on unless a referenced table was too big to
 copy (`--data-copy-max-rows`, which then warns under `dry-run-coverage`). The live schema is
 only ever read. `--clone-mode full` (mysqldump) and `minimal` (structure only, FK off)
-remain for debugging. `--no-dry-run` skips it; the gate still runs checks 0-4.
+remain for debugging. `--no-dry-run` skips it and says so — check 5 renders a `dry-run-skipped`
+warning rather than an `ok`, so a report can never read as though the updater had been replayed.
+
+`--keep-scratch` leaves `acore_world_preflight_<pid>_<stamp>` in place after the run instead of
+dropping it, so a failed dry run can be queried afterwards; nothing else reads that schema, and
+the next run drops it before creating its own.
 
 The scratch name is validated against a hard-coded prefix (`acore_world_preflight_`) plus the
 live database name and the reserved MySQL schemas **before** the `DROP DATABASE` that opens the
@@ -119,9 +147,12 @@ dry run. There is no operator-settable scratch prefix.
 2. Add `bands` for columns that carry a company content id and `refs` for columns that reference
    one.
 3. `python3 ops/preflight/audit_policy_schema.py` checks every policy table/column against the
-   DDL in `data/sql/base/db_world` and reports drift. Module-created tables are skipped, since
-   their DDL is not in that directory — verify those against the module SQL by hand.
-4. `python3 -m unittest discover -s ops/preflight` before committing.
+   DDL in `data/sql/base/db_world` **and** the module SQL that creates the `customTables`
+   (`modules/`, `wrath-unbound/modules/`, `nodeps/modules/`, discovered with `git ls-files` so a
+   clean clone sees them too). `--no-modules` skips the module half and says so per unchecked
+   table; it never skips silently.
+4. `PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py` before committing
+   (plain `python3 -m unittest discover -s ops/preflight` fails: the directory is not a package).
 
 ## Out of scope
 

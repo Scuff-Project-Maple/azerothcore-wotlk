@@ -334,9 +334,6 @@ class TestScratchName(unittest.TestCase):
         opts = {tuple(a.option_strings) for a in build_arg_parser()._actions}
         self.assertNotIn(("--scratch-prefix",), opts)
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class TestBootPath(unittest.TestCase):
     """Check 0b (review B2): the scanned tree must be the tree the boot applies."""
@@ -493,3 +490,207 @@ class TestRenderCoversEveryCheck(unittest.TestCase):
         self.assertTrue(used, "no findings found in the source - did the pattern rot?")
         self.assertEqual(set(), used - set(CHECK_TITLES),
                          f"unrendered check ids: {sorted(used - set(CHECK_TITLES))}")
+
+
+class TestMultiTableWrite(unittest.TestCase):
+    """PRO-179 rev-2 B-1: every table a write touches must be policy-checked."""
+
+    def test_join_into_ledger_table_fails_both_rules(self):
+        rules = rules_for("UPDATE `creature` c JOIN `updates` u SET u.hash = 'x' "
+                          "WHERE c.guid = 9002020;")
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules)
+
+    def test_join_into_unallowlisted_table_is_named(self):
+        rules = rules_for("UPDATE `creature` c JOIN `game_event` g SET g.eventType = 1 "
+                          "WHERE c.guid = 9002020;")
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("table-not-allowed", rules)
+
+    def test_comma_separated_update_targets_are_rejected(self):
+        self.assertIn("multi-table-write", rules_for(
+            "UPDATE `creature_template` c, `creature` d SET c.npcflag = 3, d.script_name = 'x' "
+            "WHERE c.entry = 900200 AND d.guid = 9002020;"))
+
+    def test_multi_table_delete_is_rejected(self):
+        self.assertIn("multi-table-write", rules_for(
+            "DELETE c, s FROM `creature` c JOIN `smart_scripts` s "
+            "WHERE c.guid = 9002020;"))
+
+    def test_unparenthesised_subquery_target_is_rejected(self):
+        self.assertIn("multi-table-write", rules_for(
+            "UPDATE (SELECT 1) SET `npcflag` = 3 WHERE `entry` = 900200;"))
+
+    def test_bare_alias_still_passes(self):
+        self.assertEqual(rules_for(
+            "UPDATE `creature_template` c SET c.npcflag = 3 WHERE c.entry = 900200;"), [])
+
+    def test_as_alias_still_passes(self):
+        self.assertEqual(rules_for(
+            "UPDATE `creature_template` AS c SET c.npcflag = 3 WHERE c.entry = 900200;"), [])
+
+    def test_foreign_qualified_predicate_leaves_the_key_unbounded(self):
+        self.assertIn("unbounded-write", rules_for(
+            "UPDATE `creature_template` SET `npcflag` = 3 WHERE u.entry = 900200;"))
+
+    def test_foreign_qualified_assignment_is_rejected(self):
+        self.assertIn("unparsable", rules_for(
+            "UPDATE `creature_template` SET u.hash = 'x' WHERE `entry` = 900200;"))
+
+    def test_partition_clause_is_not_a_second_table(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `creature` PARTITION (p1) WHERE `guid` = 9002020;"), [])
+
+    def test_delete_order_limit_still_bounds_on_the_key(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `creature` WHERE `guid` = 9002020 ORDER BY `guid` LIMIT 1;"), [])
+
+    def test_verb_abutting_the_backticked_table_is_still_a_single_table_write(self):
+        # `UPDATE`t SET ...` is legal MySQL: the backtick ends the verb token, and
+        # the AC corpus contains it (data/sql/archive/db_world/2024_07_14_00.sql).
+        self.assertEqual(rules_for(
+            "UPDATE`smart_scripts` SET `action_param2` = 2 WHERE `source_type` = 0 "
+            "AND `id` = 0 AND `entryorguid` IN (9002020, 9002021);"), [])
+        self.assertEqual(rules_for(
+            "DELETE FROM`smart_scripts` WHERE `source_type` = 0 AND `entryorguid` = 9002020;"), [])
+        # and the grammar still refuses when the region is not one table
+        self.assertIn("multi-table-write", rules_for(
+            "UPDATE`creature` c JOIN `game_event` ge ON c.guid = ge.guid SET c.unit_flags = 0;"))
+
+
+class TestPredicateScanning(unittest.TestCase):
+    """PRO-179 rev-2 B-2: parenthesised predicates and subqueries."""
+
+    def test_parenthesised_conjunction_is_accepted(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `smart_scripts` WHERE (`source_type` = 0 "
+            "AND `entryorguid` = 9002020);"), [])
+
+    def test_nested_parentheses_are_accepted(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `smart_scripts` WHERE ((`source_type` = 0) "
+            "AND (`entryorguid` = 9002020));"), [])
+
+    def test_key_bounded_only_inside_subquery_is_rejected(self):
+        self.assertIn("unbounded-write", rules_for(
+            "DELETE FROM `smart_scripts` WHERE `entryorguid` = 9002020 AND `id` IN "
+            "(SELECT `id` FROM `smart_scripts` WHERE `source_type` = 9);"))
+
+    def test_whole_where_inside_subquery_is_rejected(self):
+        self.assertIn("unbounded-write", rules_for(
+            "DELETE FROM `creature` WHERE `guid` IN "
+            "(SELECT `guid` FROM `creature` WHERE `id1` = 900200);"))
+
+    def test_trailing_comment_cannot_supply_a_predicate(self):
+        self.assertIn("unbounded-write", rules_for(
+            "DELETE FROM `smart_scripts` WHERE `entryorguid` = 9002020 "
+            "-- AND `source_type` = 0\n;"))
+
+    def test_or_inside_parentheses_is_still_caught(self):
+        self.assertIn("or-in-where", rules_for(
+            "DELETE FROM `smart_scripts` WHERE (`source_type` = 0 "
+            "OR `entryorguid` = 9002020);"))
+
+    def test_in_list_with_key_values_is_accepted(self):
+        self.assertEqual(rules_for(
+            "DELETE FROM `smart_scripts` WHERE `source_type` = 0 AND `entryorguid` "
+            "IN (9002020, 9002021);"), [])
+
+
+class TestMaskedLiterals(unittest.TestCase):
+    """PRO-179 rev-2 N-1: keywords inside string literals are not SQL keywords."""
+
+    def test_semicolon_and_keywords_in_literal_do_not_trigger_rules(self):
+        self.assertEqual(rules_for(
+            "INSERT INTO `page_text` (`ID`, `Text`) VALUES "
+            "(900001, 'Please select your destination, hero; the portal awaits.');"), [])
+
+    def test_or_inside_literal_is_not_or_in_where(self):
+        self.assertEqual(rules_for(
+            "UPDATE `quest_template` SET `OfferText` = 'Hot or cold' WHERE `ID` = 900001;"), [])
+
+    def test_statement_text_in_literal_is_not_a_forbidden_statement(self):
+        self.assertEqual(rules_for(
+            "INSERT INTO `custom_class_template` (`template_key`, `label`) "
+            "VALUES ('DELETE FROM creature', 'x');"), [])
+
+    def test_escaped_quote_in_literal_keeps_the_mask_aligned(self):
+        self.assertEqual(rules_for(
+            "UPDATE `quest_template` SET `OfferText` = 'He said \\'DROP TABLE x\\' loudly' "
+            "WHERE `ID` = 900001;"), [])
+        # a following real statement must still be parsed
+        self.assertIn("unbounded-write", rules_for(
+            "UPDATE `quest_template` SET `OfferText` = 'it\\'s fine' WHERE `ID` = 900001;\n"
+            "UPDATE `quest_template` SET `OfferText` = 'x';\n"))
+
+    def test_doubled_quote_in_literal_keeps_row_and_where_parsing_aligned(self):
+        # `''` is how the AC corpus escapes an apostrophe. The mask has to blank
+        # both characters, otherwise every offset-based splitter after the
+        # literal is one quote out of phase (PRO-179 rev-3).
+        self.assertEqual(rules_for(
+            "UPDATE `quest_offer_reward` SET `RewardText` = 'You''ve been a tremendous "
+            "help today; we now have a solid chance. Thank you, $N!' WHERE `ID` = 900001;"), [])
+        self.assertEqual(rules_for(
+            "INSERT INTO `page_text` (`ID`, `Text`) VALUES "
+            "(900001, 'You''ve been a tremendous help; SELECT 1 -- nope');"), [])
+
+    def test_doubled_quote_row_still_reports_a_real_band_violation(self):
+        self.assertEqual(rules_for(
+            "INSERT INTO `page_text` (`ID`, `Text`) VALUES "
+            "(900001, 'You''ve been a tremendous help; SELECT 1');"), [])
+        self.assertIn("reserved-band", rules_for(
+            "INSERT INTO `page_text` (`ID`, `Text`) VALUES "
+            "(12345, 'You''ve been a tremendous help; SELECT 1');"))
+
+    def test_odd_number_of_doubled_quotes_does_not_swallow_later_statements(self):
+        # An odd number of `''` escapes left the rev-2 mask with unbalanced
+        # quotes, so the statement containing one swallowed every statement
+        # after it and none of them were ever checked — 4720 statements hidden
+        # in data/sql/updates/db_world/2026_05_30_08.sql alone (PRO-179 rev-3).
+        sql = ("UPDATE `creature` SET `AIName` = 'Brian''s Script' WHERE `guid` = 9002020;\n"
+               "DELETE FROM `game_event` WHERE `guid` = 9002020;\n")
+        self.assertEqual(rules_for(sql), ["table-not-allowed"])
+        self.assertEqual(lines_for(sql), [2])
+
+
+class TestDirtyWorktree(unittest.TestCase):
+    """PRO-179 rev-2 N-3: provenance is a HEAD claim, the work tree is the truth."""
+
+    def _file(self, pf, sql):
+        # git_root is the temp dir so is_dirty() sees a real repo-relative path
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        p = d / "upstream.sql"
+        p.write_text(sql, encoding="utf-8")
+        pf.git_root = d
+        return {"rel": "data/sql/updates/db_world/upstream.sql", "path": p,
+                "origin": "upstream", "provenance": "upstream directory and author"}
+
+    def test_dirty_upstream_file_is_checked_against_the_policy(self):
+        pf = make_preflight()
+        f = self._file(pf, "DELETE FROM `creature` WHERE `script_name` = 'x';")
+        pf.dirty_paths = lambda: {"upstream.sql"}
+        pf.check_policy([f])
+        rules = [x.rule for x in pf.r.findings if x.severity == "FAIL"]
+        self.assertIn("dirty-worktree", rules)
+        self.assertIn("unbounded-write", rules)
+
+    def test_clean_upstream_file_keeps_the_exemption(self):
+        pf = make_preflight()
+        f = self._file(pf, "DELETE FROM `creature` WHERE `script_name` = 'x';")
+        pf.dirty_paths = lambda: set()
+        pf.check_policy([f])
+        rules = [x.rule for x in pf.r.findings]
+        self.assertIn("policy-exempt-origin", rules)
+        self.assertNotIn("dirty-worktree", rules)
+        self.assertNotIn("unbounded-write", rules)
+
+    def test_unknown_git_state_is_treated_as_dirty(self):
+        pf = make_preflight()
+        f = self._file(pf, "DELETE FROM `creature` WHERE `script_name` = 'x';")
+        pf._dirty_cache = None          # git could not answer
+        self.assertTrue(pf.is_dirty(f["path"]))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

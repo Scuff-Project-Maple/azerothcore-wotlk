@@ -17,6 +17,20 @@
 #   --no-aliases, --no-anon, --remove-orphans, --no-color, --quiet,
 #   --ignore-buildable, --profile NAME, --scale SVC=N, -d   compose-only
 #
+# Refused outright (PRO-179 review N-2), because each one would let the boot
+# path read something the gate did not audit:
+#   -f, --file, --env-file, -p and their --x=y forms AFTER a bare `--`
+#                          (everything after `--` is raw-forwarded to compose,
+#                          so these would pick a compose file or project the
+#                          gate never saw)
+#   --compose-root / --gate-path
+#                          (the gate would run against one root while the boot
+#                          `cd`s into another; set COMPOSE_ROOT instead)
+#   --no-boot-path-check   (disables check 0b; only allowed with
+#                          PREFLIGHT_CHECK_ONLY=1, where nothing boots)
+# --no-dry-run and --no-copy-data are allowed — check 5 is the restart fast path
+# docs/dev-environment.md points at — but they print a loud warning.
+#
 # Environment:
 #   COMPOSE_ROOT          stack root, default the repo root of this script
 #   COMPOSE_FILE          honoured, same meaning as for `docker compose`
@@ -37,10 +51,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_ROOT="${COMPOSE_ROOT:-$REPO_ROOT}"
 GATE="$SCRIPT_DIR/../preflight/preflight_worlddb.py"
 PYTHON="${PYTHON:-python3}"
-LEASE_FILE="${LEASE_FILE:-$COMPOSE_ROOT/.stack/lease}"
+# Resolved after argument parsing, so that a --compose-root given on the
+# command line cannot leave the lease check pointing at the default root.
+LEASE_FILE="${LEASE_FILE:-}"
 
 usage() {
-  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Print the header block up to `set -euo pipefail` rather than a fixed line
+  # range: a hard-coded range silently leaks shell into --help whenever the
+  # header grows (PRO-179 review N-2).
+  sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" \
+    | sed -e '/^set -euo pipefail$/d' -e 's/^# \{0,1\}//'
 }
 
 die() {
@@ -89,9 +109,13 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --scale)
-      [[ $# -ge 3 ]] || die "--scale needs SERVICE=NUM"
-      COMPOSE_ARGS+=("$arg" "$2" "$3")
-      shift 3
+      [[ $# -ge 2 ]] || die "--scale needs SERVICE=NUM"
+      COMPOSE_ARGS+=("$arg" "$2")
+      shift 2
+      ;;
+    --scale=*)
+      COMPOSE_ARGS+=("$arg")
+      shift
       ;;
     --force-recreate|--no-recreate|--no-build|--wait|--no-start|--no-aliases|\
 --no-anon|--remove-orphans|--no-color|--quiet|--ignore-buildable|-d)
@@ -107,9 +131,45 @@ while [[ $# -gt 0 ]]; do
       COMPOSE_ARGS+=("$arg")
       shift
       ;;
+    --compose-root|--compose-root=*|--gate|--gate=*)
+      # The gate is invoked with `--compose-root "$COMPOSE_ROOT"` below and the
+      # boot happens after `cd "$COMPOSE_ROOT"`. argparse lets the LAST
+      # --compose-root win, so a second one here would audit one tree and boot
+      # another (PRO-179 review N-2). One source of truth: the variable.
+      die "--compose-root/--gate cannot be passed here; set COMPOSE_ROOT (and PYTHON) in the environment so the gate and the boot use the same root"
+      ;;
+    --no-boot-path-check|--no-boot*|--disable-boot*)
+      # Prefix-matched on purpose: argparse accepts unambiguous abbreviations,
+      # so `--no-boot` would otherwise slip through this case and still disable
+      # check 0b in the gate.
+      if [[ "${PREFLIGHT_CHECK_ONLY:-0}" != "1" ]]; then
+        die "refusing to boot with the boot-path check disabled: check 0b is what proves the running container reads the audited SQL tree read-only. Run with PREFLIGHT_CHECK_ONLY=1 to check without booting."
+      fi
+      GATE_ARGS+=("$arg")
+      shift
+      ;;
+    --no-dry-run|--no-dry*|--no-copy-data|--no-copy*)
+      echo "worldserver-up: WARNING — $arg skips check 5 (the updater dry run on a scratch clone)." >&2
+      echo "                  That is the documented restart fast path; do not use it after a SQL change." >&2
+      GATE_ARGS+=("$arg")
+      shift
+      ;;
     --)
       shift
-      while [[ $# -gt 0 ]]; do COMPOSE_ARGS+=("$1"); shift; done
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -f|--file|--file=*|--env-file|--env-file=*|-p|--project-name|--project-name=*|\
+--compose-file|--compose-file=*|--compose-project|--compose-project=*)
+            # Everything after `--` goes to `docker compose` verbatim, so a
+            # compose file or project named here would boot without the gate
+            # having read it (PRO-179 review N-2). Pass them before `--`, where
+            # they are also forwarded to the gate.
+            die "refusing to forward $1 to docker compose: it selects what boots, and the gate must read exactly that. Pass it before -- instead."
+            ;;
+        esac
+        COMPOSE_ARGS+=("$1")
+        shift
+      done
       ;;
     *)
       GATE_ARGS+=("$arg")
@@ -117,6 +177,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Resolved here rather than at the top of the script so an explicit COMPOSE_ROOT
+# from the environment and a defaulted one behave identically: the lease always
+# lives under the root the gate is about to audit.
+if [[ -z "$LEASE_FILE" ]]; then
+  LEASE_FILE="$COMPOSE_ROOT/.stack/lease"
+fi
 
 # `COMPOSE_FILE` is how the host root of this stack pins its override file
 # (scripts/compose-sync.sh writes it). If it is set and no -f was passed, hand

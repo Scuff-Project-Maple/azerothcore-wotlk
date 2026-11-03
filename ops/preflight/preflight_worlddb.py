@@ -42,6 +42,7 @@ SCRATCH_PREFIX = "acore_world_preflight"
 SCRATCH_NAME_RE = re.compile(r"^acore_world_preflight_[A-Za-z0-9_]{1,48}$")
 
 IDENT_RE = re.compile(r"^[A-Za-z0-9_$]+$")
+_UNSET = object()  # "not computed yet" for cached lookups that may cache None
 NAME_TOKEN = r"`?[A-Za-z0-9_$]+`?"
 
 
@@ -230,7 +231,15 @@ class MySQL:
 
 
 def mask_sql(text: str) -> str:
-    """Blank out comments, keep every offset. /*! ... */ stays live (mysql executes it)."""
+    """Blank comments and string bodies, keeping every offset.
+
+    /*! ... */ stays live (mysql executes it). String bodies are blanked too
+    (PRO-179 review N-1): keyword rules such as `insert-select` and
+    `or-in-where` scan the masked text, so a page_text value like
+    'Please select your destination;' used to read as SQL. Backticked
+    identifiers are NOT blanked — table and column names are read out of the
+    masked text by the parsers below.
+    """
     out = list(text)
     i, n = 0, len(text)
     state = None  # 'sq' | 'dq' | 'bt' | 'line' | 'block'
@@ -277,21 +286,32 @@ def mask_sql(text: str) -> str:
                 continue
             if c == "'":
                 if nxt == "'":
-                    out[i + 1] = " "
+                    # escaped quote inside the literal: blank BOTH characters so
+                    # the mask keeps exactly one quote per string boundary and
+                    # every offset-based splitter stays balanced (PRO-179 rev-3)
+                    out[i] = out[i + 1] = " "
                     i += 2
                     continue
                 state = None
+            elif c != "\n":
+                out[i] = " "
             i += 1
             continue
         if state == "dq":
             if c == "\\":
+                out[i] = " "
+                if i + 1 < n and text[i + 1] != "\n":
+                    out[i + 1] = " "
                 i += 2
                 continue
             if c == '"':
                 if nxt == '"':
+                    out[i] = out[i + 1] = " "
                     i += 2
                     continue
                 state = None
+            elif c != "\n":
+                out[i] = " "
             i += 1
             continue
         if state == "bt":
@@ -403,10 +423,38 @@ def split_qualified(token: str) -> tuple[str | None, str]:
     return None, unquote_ident(token)
 
 
+def paren_depths(masked: str) -> list[int]:
+    """Bracket depth at every offset (len + 1 entries).
+
+    For a `(` the depth recorded is the one outside it; for a `)` the depth
+    recorded is the one after it closes. Clamped at 0 so unbalanced text cannot
+    go negative.
+    """
+    depths = [0] * (len(masked) + 1)
+    d = 0
+    for i, c in enumerate(masked):
+        if c == ")":
+            d = d - 1 if d > 0 else 0
+        depths[i] = d
+        if c == "(":
+            d += 1
+    depths[len(masked)] = d
+    return depths
+
+
 def top_level_positions(masked: str, word: str) -> list[int]:
-    """Offsets of a bare keyword that is not inside quotes and not part of a longer word."""
+    """Offsets of a bare keyword at bracket depth 0, outside quotes.
+
+    Depth matters for locating clause boundaries: in
+    `UPDATE t SET a = (SELECT x FROM s WHERE k = 1) WHERE entry = 9002020`
+    the first WHERE is inside the SET clause, and treating it as the statement
+    WHERE would slice the predicate region out of the wrong place (PRO-179
+    review B-2 family). The masked text has comments and string bodies blanked,
+    so a keyword inside a literal is never seen here.
+    """
     pat = re.compile(r"(?<![A-Za-z0-9_$])" + word + r"(?![A-Za-z0-9_$])", re.IGNORECASE)
-    return [m.start() for m in pat.finditer(masked)]
+    depths = paren_depths(masked)
+    return [m.start() for m in pat.finditer(masked) if depths[m.start()] == 0]
 
 
 def split_top_level(text: str, masked: str, sep: str) -> list[str]:
@@ -459,23 +507,107 @@ def literal_value(token: str):
     return "unknown", None
 
 
-def scan_predicates(where_text: str) -> dict[str, list[tuple[str, str, object]]]:
-    """col -> [(operator, kind, value)] for `col op literal` and `col IN (lit, ...)` shapes."""
-    masked = mask_sql(where_text)
+SUBQUERY_HEAD_RE = re.compile(r"^\s*SELECT\b", re.IGNORECASE)
+BOOL_KW_RE = re.compile(r"(?<![A-Za-z0-9_$])(AND|OR|XOR)(?![A-Za-z0-9_$])", re.IGNORECASE)
+BOOL_KW_OR_RE = re.compile(r"(?<![A-Za-z0-9_$])(OR|XOR)(?![A-Za-z0-9_$])", re.IGNORECASE)
+PRED_NAME = r"`?[A-Za-z0-9_$]+`?"
+PRED_OPS = r"(?P<op><=>|!=|<>|>=|<=|=|<|>|\bIN\b|\bLIKE\b|\bBETWEEN\b|\bIS\b|\bREGEXP\b)"
+
+
+def blank_subqueries(masked: str) -> str:
+    """Blank parenthesised `(SELECT ...)` groups, offsets preserved.
+
+    A predicate whose only bound lives inside a subquery does not bound the
+    outer write (PRO-179 review B-2): `DELETE FROM creature WHERE id IN (SELECT
+    id FROM t WHERE guid = 9002020)` must not read as `guid` being literal
+    bound. Trimming operands without doing this first would turn that shape into
+    a false pass, which is exactly the pairing the review asked to fix together.
+    """
+    out = list(masked)
+    i, n = 0, len(masked)
+    while i < n:
+        if out[i] != "(":
+            i += 1
+            continue
+        depth, j = 0, i
+        while j < n:
+            if out[j] == "(":
+                depth += 1
+            elif out[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if SUBQUERY_HEAD_RE.match(masked[i + 1:j + 1]):
+            for k in range(i, min(j + 1, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+        i = j + 1 if j < n else n
+    return "".join(out)
+
+
+def _read_operand(masked: str, start: int, stops: set[int]) -> str:
+    """Masked text of one comparison operand, starting at `start`.
+
+    Stops at a top-level AND/OR/XOR, or at a `)` that closes a group opened
+    *before* the operand. The second rule is what makes
+    `WHERE (entryorguid = 9002020 AND source_type = 0)` — the dominant shape in
+    AzerothCore update files — read as two literal bounds instead of one
+    operand ending in a stray `)`, which the old scanner classified as non-literal
+    and refused the boot over (PRO-179 review B-2).
+
+    The operand is read out of the MASKED text on purpose: slicing the raw text
+    instead let a trailing `-- WHERE ...` comment leak into the operand and turn
+    a clean `WHERE entry = 900200 -- note` into `band-not-literal`.
+    """
+    depth, i, n = 0, start, len(masked)
+    while i < n:
+        c = masked[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and i in stops:
+            break
+        i += 1
+    return masked[start:i]
+
+
+def scan_predicates(where_text: str, qualifiers: set[str] | None = None
+                    ) -> dict[str, list[tuple[str, str, object]]]:
+    """col -> [(operator, kind, value)] for `col op literal` and `col IN (lit, ...)` shapes.
+
+    `col` may be qualified by the table name or its alias; `qualifiers` is the
+    set of qualifier spellings that belong to the statement's own table. A
+    qualifier outside that set is not recorded at all, so the column simply does
+    not count as bounded and the statement fails closed — an aliased write to a
+    table the gate has not approved can never borrow the driving table's key.
+    """
+    masked = blank_subqueries(mask_sql(where_text))
+    stops = {m.start() for m in BOOL_KW_RE.finditer(masked)}
+    allowed = {q.lower().strip("`") for q in (qualifiers or set())}
     out: dict[str, list[tuple[str, str, object]]] = {}
     pat = re.compile(
-        r"(?<![A-Za-z0-9_$.])" + r"(`?[A-Za-z0-9_$]+`?)" +
-        r"\s*(<=>|!=|<>|>=|<=|=|<|>|\bIN\b|\bLIKE\b|\bBETWEEN\b|\bIS\b|\bREGEXP\b)",
+        r"(?<![A-Za-z0-9_$.])" + r"(?:(?P<q>" + PRED_NAME + r")\s*\.\s*)?" +
+        r"(?P<col>" + PRED_NAME + r")" + r"\s*" + PRED_OPS,
         re.IGNORECASE,
     )
     for m in pat.finditer(masked):
-        col = unquote_ident(m.group(1)).lower()
-        op = m.group(2).upper()
+        qual = m.group("q")
+        if qual is not None:
+            qual = unquote_ident(qual).lower()
+            if qual not in allowed:
+                continue
+        col = unquote_ident(m.group("col")).lower()
+        op = m.group("op").upper()
         rest_start = m.end()
         if op == "IN":
             while rest_start < len(masked) and masked[rest_start] in " \n\t":
                 rest_start += 1
             if rest_start >= len(masked) or masked[rest_start] != "(":
+                # includes `IN (SELECT ...)` — the group was blanked above
                 out.setdefault(col, []).append((op, "unknown", None))
                 continue
             depth, j = 0, rest_start
@@ -487,35 +619,176 @@ def scan_predicates(where_text: str) -> dict[str, list[tuple[str, str, object]]]
                     if depth == 0:
                         break
                 j += 1
-            inner = where_text[rest_start + 1:j]
-            for piece in split_top_level(inner, mask_sql(inner), ","):
+            inner = masked[rest_start + 1:j]
+            for piece in split_top_level(inner, inner, ","):
                 kind, value = literal_value(piece)
                 out.setdefault(col, []).append((op, kind, value))
             continue
-        # single operand: read up to the next top-level boolean keyword
-        stop = len(where_text)
-        for kw in ("AND", "OR", "XOR"):
-            for p in top_level_positions(masked[rest_start:], kw):
-                stop = min(stop, rest_start + p)
-        operand = where_text[rest_start:stop]
+        operand = _read_operand(masked, rest_start, stops)
         kind, value = literal_value(operand)
         out.setdefault(col, []).append((op, kind, value))
     return out
 
 
-def has_top_level_or(where_text: str) -> bool:
-    """True when an OR sits at bracket depth 0 — the shape that widens a write beyond its key."""
-    masked = mask_sql(where_text)
-    depth = 0
-    for m in re.finditer(r"[()]|(?<![A-Za-z0-9_$])OR(?![A-Za-z0-9_$])", masked, re.IGNORECASE):
-        tok = m.group(0)
-        if tok == "(":
-            depth += 1
-        elif tok == ")":
-            depth -= 1
-        elif depth == 0:
+def _bool_split(masked: str, lo: int, hi: int, depths: list[int],
+                keywords: tuple[str, ...]) -> list[tuple[int, int]]:
+    """Slice bounds of the operands of `keywords` at the range's own paren depth."""
+    base = depths[lo]
+    cuts: list[tuple[int, int]] = []
+    for m in BOOL_KW_RE.finditer(masked, lo, hi):
+        if depths[m.start()] == base and m.group(1).upper() in keywords:
+            cuts.append((m.start(), m.end()))
+    if not cuts:
+        return [(lo, hi)]
+    spans: list[tuple[int, int]] = []
+    start = lo
+    for c, e in cuts:
+        spans.append((start, c))
+        start = e
+    spans.append((start, hi))
+    return spans
+
+
+def _unwrap_parens(masked: str, lo: int, hi: int) -> tuple[int, int]:
+    """Peel parenthesised grouping that wraps the whole range, e.g. `((a AND b))`."""
+    while lo < hi and masked[lo] == "(":
+        depth, j, close = 0, lo, -1
+        while j < hi:
+            if masked[j] == "(":
+                depth += 1
+            elif masked[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    close = j
+                    break
+            j += 1
+        if close != hi - 1:
+            break
+        lo, hi = lo + 1, hi - 1
+        while lo < hi and masked[lo].isspace():
+            lo += 1
+        while hi > lo and masked[hi - 1].isspace():
+            hi -= 1
+    return lo, hi
+
+
+NOT_RE = re.compile(r"(?<![A-Za-z0-9_$])NOT(?![A-Za-z0-9_$])", re.IGNORECASE)
+NOT_OPERATOR_RE = re.compile(r"^(?:IN|BETWEEN|LIKE|REGEXP)\b", re.IGNORECASE)
+
+
+def has_expression_negation(masked: str, lo: int, hi: int) -> bool:
+    """True when a NOT negates an expression rather than one operator.
+
+    `IS NOT NULL` and `NOT IN (...)` are single operators: the row set is still
+    what the predicates say. `NOT (entry = 900200)` is not — it admits every row
+    except the keyed one, which no key bounding can describe — so the caller
+    treats the range as bounding nothing at all.
+    """
+    for m in NOT_RE.finditer(masked, lo, hi):
+        before = masked[:m.start()].rstrip().upper()
+        after = masked[m.end():hi].lstrip()
+        if before.endswith("IS") or NOT_OPERATOR_RE.match(after):
+            continue
+        return True
+    return False
+
+
+def bound_columns(masked: str, text: str, lo: int, hi: int,
+                  qualifiers: set[str] | None = None,
+                  depths: list[int] | None = None) -> set[str]:
+    """Columns that EVERY row the WHERE admits is equality/IN-bound to literals on.
+
+    Conjunction unions its operands, disjunction intersects them, which is the
+    difference between "the key bounds the write" and "one of the branches happens
+    to mention the key": `key = 1 AND (a = 'x' OR a = 'y')` still bounds `key`,
+    while `(source_type = 0 OR entryorguid = 9002020)` bounds neither — each branch
+    lets rows through that the other does not. Subqueries are invisible here
+    (scan_predicates blanks them), so a column bounded only inside a derived table
+    never counts, and a `NOT` flips the whole range to unbounded rather than
+    guessing (PRO-179 rev-2 B-2).
+    """
+    depths = paren_depths(masked) if depths is None else depths
+    while lo < hi and masked[lo].isspace():
+        lo += 1
+    while hi > lo and masked[hi - 1].isspace():
+        hi -= 1
+    if lo >= hi:
+        return set()
+    # Grouping first: `((a = 1 OR b = 2))` has to split as a disjunction, and it
+    # cannot be seen as one while the wrapping parentheses still hold the depth up.
+    lo, hi = _unwrap_parens(masked, lo, hi)
+    if lo >= hi:
+        return set()
+    if has_expression_negation(masked, lo, hi):
+        return set()
+    disj = _bool_split(masked, lo, hi, depths, ("OR", "XOR"))
+    if len(disj) > 1:
+        common: set[str] | None = None
+        for a, b in disj:
+            part = bound_columns(masked, text, a, b, qualifiers, depths)
+            common = part if common is None else common & part
+        return common or set()
+    conj = _bool_split(masked, lo, hi, depths, ("AND",))
+    if len(conj) > 1:
+        out: set[str] = set()
+        for a, b in conj:
+            out |= bound_columns(masked, text, a, b, qualifiers, depths)
+        return out
+    out = set()
+    for col, hits in scan_predicates(text[lo:hi], qualifiers).items():
+        if any(op in ("=", "IN", "<=>") for op, _, _ in hits) and \
+                not any(kind == "unknown" for _, kind, _ in hits):
+            out.add(col)
+    return out
+
+
+def top_level_disjunction(where_text: str) -> bool:
+    """True when the WHERE *as a whole* is a disjunction, `(...)` grouping included.
+
+    `(a = 1 OR b = 2)` is the shape that used to slip past the depth-0 scan: the
+    parentheses are pure grouping, so the statement still reaches rows that
+    neither key column selects. An OR nested under an AND is a different thing
+    (`key = 1 AND (x = 'a' OR x = 'b')` is still key-bounded) and stays legal —
+    bound_columns() decides those. (PRO-179 rev-2 B-2.)
+    """
+    masked = blank_subqueries(mask_sql(where_text))
+    depths = paren_depths(masked)
+    lo, hi = 0, len(masked)
+    while lo < hi and masked[lo].isspace():
+        lo += 1
+    while hi > lo and masked[hi - 1].isspace():
+        hi -= 1
+    lo, hi = _unwrap_parens(masked, lo, hi)
+    base = depths[lo]
+    for m in BOOL_KW_OR_RE.finditer(masked, lo, hi):
+        if depths[m.start()] == base:
             return True
     return False
+
+
+WHERE_TAIL_KW_RE = re.compile(
+    r"(?<!`)(?<![A-Za-z0-9_$])(ORDER|GROUP|HAVING|LIMIT|OFFSET|INTO|PROCEDURE|LOCK|FOR)"
+    r"(?![A-Za-z0-9_$])(?!`)",
+    re.IGNORECASE)
+
+
+def where_clause(masked: str, text: str, wpos: int) -> str:
+    """The WHERE expression alone, cut before any trailing top-level clause.
+
+    `... WHERE `guid` = 9002020 ORDER BY `guid` LIMIT 1` must scan as the guid
+    predicate only; leaving `ORDER BY guid LIMIT 1` in the text makes the operand
+    of the last predicate read as `9002020 ORDER BY` — not a literal, so a
+    perfectly bounded write fails closed. Keywords inside a subquery survive:
+    the ORDER BY of a derived table is part of that predicate.
+    """
+    body_masked = masked[wpos + len("WHERE"):]
+    depths = paren_depths(body_masked)
+    end = len(body_masked)
+    for m in WHERE_TAIL_KW_RE.finditer(body_masked):
+        if depths[m.start()] == 0:
+            end = m.start()
+            break
+    return text[wpos + len("WHERE"):wpos + len("WHERE") + end]
 
 
 # --------------------------------------------------------------------------- #
@@ -597,6 +870,105 @@ def parse_statement(text: str, masked: str, offset: int) -> Statement:
 
 
 # --------------------------------------------------------------------------- #
+# write-target grammar for UPDATE / DELETE (PRO-179 review B-1)
+# --------------------------------------------------------------------------- #
+
+WRITE_JOIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_$])(JOIN|STRAIGHT_JOIN|INNER|OUTER|CROSS|NATURAL|USING)(?![A-Za-z0-9_$])",
+    re.IGNORECASE)
+PARTITION_CLAUSE_RE = re.compile(r"(?<![A-Za-z0-9_$])PARTITION\s*\([^()]*\)", re.IGNORECASE)
+WRITE_REGION_RE = re.compile(
+    r"^\s*(?P<tbl>" + TBL + r")(?:\s+(?:(?P<as>AS)\s+)?(?P<alias>" + NAME_TOKEN + r"))?\s*$",
+    re.IGNORECASE)
+UPDATE_HEAD_RE = re.compile(r"^\s*UPDATE\s*(?:(?:LOW_PRIORITY|IGNORE|HIGH_PRIORITY|QUICK)\s+)*",
+                            re.IGNORECASE)
+DELETE_HEAD_RE = re.compile(r"^\s*DELETE\s*(?:(?:LOW_PRIORITY|QUICK|IGNORE|UNIQUE)\s+)*",
+                            re.IGNORECASE)
+BACKTICKED_NAME_RE = re.compile(r"`([^`]+)`")
+# `UPDATE`smart_scripts` is legal MySQL: the backtick terminates the verb token.
+# The head patterns therefore allow the table to abut the verb; a verb that is not
+# UPDATE/DELETE never reaches here (parse_statement already decided), and anything
+# the region grammar does not understand fails closed.
+
+
+def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str],
+                                          str | None, str]:
+    """Parse the region between the verb and the first top-level SET/WHERE.
+
+    Returns `([(schema, table), ...], aliases, error, region)`. A well-formed
+    single-table write yields one target plus any alias, which the caller needs
+    so `WHERE c.guid = 9002020` counts as bounding `creature.guid`. Anything
+    else yields an error string and, best effort, every backticked name the
+    region still mentions.
+
+    Only one write target is accepted. MySQL's multi-table forms (`UPDATE a JOIN
+    b`, `UPDATE a, b`, `DELETE a, b FROM ...`, derived tables, index hints) are
+    rejected rather than parsed, because a partial reading of them is exactly how
+    the rev-1 gate let `UPDATE creature c JOIN updates u SET u.hash = ...`
+    through: only the first table was ever examined.
+    """
+    masked = st.masked
+    if st.verb == "UPDATE":
+        head = UPDATE_HEAD_RE.match(masked)
+        if not head:
+            return [], set(), "could not locate the UPDATE keyword", ""
+        stops = top_level_positions(masked, "SET")
+        lo, hi = head.end(), (stops[0] if stops else len(masked))
+        pre = ""
+    elif st.verb == "DELETE":
+        head = DELETE_HEAD_RE.match(masked)
+        if not head:
+            return [], set(), "could not locate the DELETE keyword", ""
+        froms = top_level_positions(masked, "FROM")
+        if not froms:
+            return [], set(), "DELETE has no FROM clause", ""
+        pre = masked[head.end():froms[0]]
+        lo = froms[0] + len("FROM")
+        ends = [p for p in (top_level_positions(masked, "WHERE")
+                            + top_level_positions(masked, "ORDER")
+                            + top_level_positions(masked, "LIMIT")) if p > lo]
+        hi = min(ends) if ends else len(masked)
+    else:
+        return [], set(), None, ""
+
+    if pre.strip():
+        region = masked[head.end():hi]
+        return _region_tables(masked, head.end(), hi), set(), \
+            f"table list {pre.strip()[:60]!r} before FROM is multi-table DELETE syntax", region
+    region_masked = PARTITION_CLAUSE_RE.sub(" ", masked[lo:hi])
+    region = masked[lo:hi].strip()
+    err = None
+    if WRITE_JOIN_RE.search(region_masked):
+        err = "the write region contains a JOIN"
+    elif "," in region_masked:
+        err = "the write region is a comma-separated table list"
+    elif "(" in region_masked:
+        err = ("the write region contains a parenthesised expression (derived table or index "
+               "hint), which the gate does not attempt to parse")
+    m = WRITE_REGION_RE.match(region_masked)
+    if err is None and not m:
+        err = "the write region is not a single table with an optional alias"
+    if err is not None:
+        return _region_tables(masked, lo, hi), set(), err, region
+    schema, table = split_qualified(m.group("tbl"))
+    aliases = {unquote_ident(m.group("alias")).lower()} if m.group("alias") else set()
+    return [(schema, table)], aliases, None, region
+
+
+def _region_tables(masked: str, lo: int, hi: int) -> list[tuple[str | None, str]]:
+    """Every backticked name in the write region, in order of first appearance.
+
+    Used only on the rejection path, so the report can name the table a rejected
+    statement was reaching for (the ledger among them).
+    """
+    seen: dict[str, tuple[str | None, str]] = {}
+    for name in BACKTICKED_NAME_RE.findall(masked[lo:hi]):
+        schema, table = split_qualified(name)
+        seen.setdefault(table.lower(), (schema, table))
+    return list(seen.values())
+
+
+# --------------------------------------------------------------------------- #
 # the checker
 # --------------------------------------------------------------------------- #
 
@@ -672,15 +1044,49 @@ class Preflight:
             return "upstream", f"upstream directory and author: {detail}"
         return "unknown", f"unrecognised directory origin {dir_origin!r} for {f['dir']['db_path']}"
 
-    def git_tracked(self, path: Path) -> bool:
-        rel = os.path.relpath(path, self.git_root)
+    def dirty_paths(self) -> set | None:
+        """Work-tree-modified paths, lower-cased and posix-normalised; None if unknown.
+
+        Provenance is read from HEAD (`git_author_origin`), so a file that
+        upstream-provenances cleanly but was hand-edited in the work tree keeps
+        its exemption from checks 2-5 while the bytes the updater will run are
+        nobody's upstream content (PRO-179 review N-3). One `git status` for the
+        whole run, cached. Callers must treat None as dirty: a question git
+        cannot answer is not a clean bill of health.
+        """
+        cached = getattr(self, "_dirty_cache", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        paths: set | None = set()
         try:
-            proc = subprocess.run(["git", "ls-files", "--error-unmatch", "--", rel],
-                                  cwd=str(self.git_root), stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL, timeout=30)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+            proc = subprocess.run(
+                ["git", "status", "--porcelain", "--ignore-submodules=none"],
+                cwd=str(self.git_root), stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            paths = None
+        else:
+            if proc.returncode != 0:
+                paths = None
+            else:
+                for entry in proc.stdout.decode("utf-8", "replace").splitlines():
+                    if len(entry) < 4 or entry[:2] == "!!":
+                        continue
+                    # R/C entries carry "old -> new"; both sides count as touched.
+                    for part in entry[3:].split(" -> "):
+                        part = part.strip().strip('"')
+                        if part:
+                            paths.add(Path(part).as_posix().lower())
+        self._dirty_cache = paths
+        return paths
+
+    def is_dirty(self, path: Path) -> bool:
+        """True when `path` differs from HEAD, or when git cannot tell us."""
+        dirty = self.dirty_paths()
+        if dirty is None:
             return True
-        return proc.returncode == 0
+        rel = Path(os.path.relpath(path, self.git_root)).as_posix().lower()
+        return rel in dirty
 
     # -- discovery ----------------------------------------------------------- #
 
@@ -694,8 +1100,18 @@ class Preflight:
         if seen != expected:
             extra = {k: v for k, v in seen.items() if expected.get(k) != v}
             missing = {k: v for k, v in expected.items() if seen.get(k) != v}
+            # This is the check most likely to refuse a boot after someone pokes the
+            # database, so the recovery is in the failure text rather than in a README
+            # nobody has open at 1am (PRO-179 review N-8).
+            repair = ", ".join(f"('{d['path']}', '{d['state']}')"
+                               for d in self.p["includedDirs"])
             self.r.fail("0", "updates_include does not match the approved four-directory set. "
-                             f"unexpected/changed={sorted(extra)} missing={sorted(missing)}",
+                             f"unexpected/changed={sorted(extra)} missing={sorted(missing)}. "
+                             f"Recovery with the worldserver stopped and the single-writer lease "
+                             f"held: DELETE FROM `updates_include`; INSERT INTO `updates_include` "
+                             f"(`path`, `state`) VALUES {repair}; then re-run this gate. If the "
+                             f"row came from a module, fix that module's AddDatabaseUpdates call "
+                             f"instead of editing the table (PRO-177).",
                         rule="updater-wiring")
             self.r.info("0", "Module SQL paths must never be registered into the core updater "
                              "(PRO-177). An unexpected row here means someone added AddDatabaseUpdates "
@@ -965,7 +1381,13 @@ class Preflight:
         if self.a.compose_project:
             base += ["-p", self.a.compose_project]
         try:
-            ids = subprocess.run(base + ["ps", "-q", svc_name], cwd=str(Path(self.a.compose_root)),
+            # `-a` matters: a stopped-but-not-removed ac-worldserver still owns its
+            # mounts, and `docker compose up -d` would recreate it from the compose
+            # file only if the container were gone (PRO-179 review N-4). Plain `ps -q`
+            # lists running containers, so the exited container was invisible and the
+            # gate asserted against the compose config alone.
+            ids = subprocess.run(base + ["ps", "-a", "-q", svc_name],
+                                 cwd=str(Path(self.a.compose_root)),
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return
@@ -1146,11 +1568,22 @@ class Preflight:
         statements = 0
         for f in new_files:
             if f.get("origin") in exempt and not self.a.policy_all:
-                self.r.warn("4", f"{f['rel']} is upstream-provenanced ({f.get('provenance','')}); "
-                                 f"write policy is not enforced on upstream files by default. "
-                                 f"Use --strict-all to enforce it anyway.",
-                            file=f["rel"], rule="policy-exempt-origin")
-                continue
+                # The exemption is a HEAD-level claim. If the work tree disagrees
+                # with HEAD, the bytes the updater is about to run are company
+                # content regardless of who authored the committed version.
+                if self.is_dirty(f["path"]):
+                    self.r.fail("4", f"{f['rel']} is upstream-provenanced at HEAD "
+                                     f"({f.get('provenance','')}) but has uncommitted "
+                                     f"changes, so it is checked against the write policy "
+                                     f"as company content. Commit it under a company "
+                                     f"author, or restore it.",
+                                file=f["rel"], rule="dirty-worktree")
+                else:
+                    self.r.warn("4", f"{f['rel']} is upstream-provenanced ({f.get('provenance','')}); "
+                                     f"write policy is not enforced on upstream files by default. "
+                                     f"Use --strict-all to enforce it anyway.",
+                                file=f["rel"], rule="policy-exempt-origin")
+                    continue
             checked_files += 1
             text = f["path"].read_text(encoding="utf-8", errors="replace")
             for stmt_text, off in split_statements(text):
@@ -1218,41 +1651,95 @@ class Preflight:
                                          f"({', '.join(sorted(custom))})")
             return
 
+        if st.verb in ("UPDATE", "DELETE"):
+            self._policy_multi_table(f, st, line, bad, base, custom)
+            return
+
+        # INSERT / REPLACE: a single target table, parsed by parse_statement()
         if st.table is None:
             bad("unparsable", "could not identify the target table — fail closed")
             return
-        if st.schema and st.schema.lower() not in (self.live_db.lower(), "current_date"):
-            bad("cross-schema-write", f"statement qualifies schema {st.schema!r}; update files must "
+        if not self._check_write_target(bad, st, st.table, st.schema, base, custom):
+            return
+        entry = self._policy_entry(st.table, base, custom)
+        self._policy_insert(f, st, line, digest, bad,
+                            [c.lower() for c in entry.get("keyColumns", [])],
+                            entry.get("bands", []), entry.get("refs", []),
+                            st.table.lower() in {k.lower() for k in custom})
+
+    _LEDGER_TABLES = ("updates", "updates_include", "version", "dbversion")
+
+    def _policy_entry(self, table, base, custom):
+        for key in (table, table.lower()):
+            if key in base:
+                return base[key]
+            if key in custom:
+                return custom[key]
+        return None
+
+    def _check_write_target(self, bad, st, table, schema, base, custom) -> bool:
+        """Schema/ledger/allow-list checks for one write target. False if a finding was raised."""
+        if schema and schema.lower() not in (self.live_db.lower(), "current_date"):
+            bad("cross-schema-write", f"statement qualifies schema {schema!r}; update files must "
                                       f"not write outside the world database")
-            return
-
-        if st.table.lower() in ("updates", "updates_include", "version", "dbversion"):
-            bad("ledger-table", f"write target {st.table!r} is updater bookkeeping; only "
+            return False
+        if table.lower() in self._LEDGER_TABLES:
+            bad("ledger-table", f"write target {table!r} is updater bookkeeping; only "
                                 f"UpdateFetcher may touch it")
-            return
-
-        entry = base.get(st.table) or custom.get(st.table)
-        if entry is None:
+            return False
+        if self._policy_entry(table, base, custom) is None:
             bad("table-not-allowed",
-                f"write target {st.table!r} is neither a company-approved base table nor a "
+                f"write target {table!r} is neither a company-approved base table nor a "
                 f"whitelisted custom table; add it to ops/preflight/preflight-policy.json and "
                 f"get it reviewed")
+            return False
+        return True
+
+    def _policy_multi_table(self, f, st, line, bad, base, custom):
+        """UPDATE/DELETE policy entry point: prove there is exactly one write target.
+
+        The rev-1 scanner only looked at the first table after the verb, so
+        `UPDATE creature c JOIN updates u SET u.hash = ...` was checked against
+        `creature` alone — it rewrote the ledger hash while the `ledger-table`
+        rule reported clean (PRO-179 review B-1). Multi-table writes are now
+        rejected outright, which costs nothing in `pending_db_world`, and every
+        table the region still names is run through the ledger/allow-list checks
+        so a green result never depends on the grammar having anticipated a
+        syntax.
+        """
+        targets, qualifiers, err, region = write_targets(st)
+        if err:
+            extra = ", ".join(sorted({t for _, t in targets})) or "none identifiable"
+            bad("multi-table-write",
+                f"{st.verb} is not a single-table write: {err} (write region {region!r}; "
+                f"tables named: {extra}). Split it into one statement per table, each "
+                f"WHERE-bounded on that table's natural key.")
+            # Still name every table the region mentions, so the report says
+            # *what* the statement was reaching for even though it is rejected.
+            for _schema, table in targets:
+                self._check_write_target(bad, st, table, _schema, base, custom)
             return
-        is_custom = st.table in custom
+        if len(targets) != 1:
+            bad("unparsable", f"could not identify exactly one write target for {st.verb} "
+                              f"(found {len(targets)}) — fail closed")
+            return
+        schema, table = targets[0]
+        if not self._check_write_target(bad, st, table, schema, base, custom):
+            return
+        entry = self._policy_entry(table, base, custom)
         key_cols = [c.lower() for c in entry.get("keyColumns", [])]
         # A partial key is only accepted where policy says so explicitly (keySets);
         # by default the WHOLE natural key has to be bounded (PRO-179 review N1).
         key_sets = [[c.lower() for c in grp] for grp in entry.get("keySets", []) if grp] \
             or ([key_cols] if key_cols else [])
-        bands = entry.get("bands", [])
-        refs = entry.get("refs", [])
+        quals = {table.lower()} | {q.lower() for q in qualifiers} | {self.live_db.lower()}
+        if st.verb == "UPDATE":
+            self._policy_update(f, st, line, bad, key_cols, entry.get("bands", []),
+                                entry.get("refs", []), entry, key_sets, quals)
+        else:
+            self._policy_delete(st, bad, key_cols, entry.get("bands", []),
+                               entry.get("refs", []), key_sets, quals)
 
-        if st.verb in ("INSERT", "REPLACE"):
-            self._policy_insert(f, st, line, digest, bad, key_cols, bands, refs, is_custom)
-        elif st.verb == "UPDATE":
-            self._policy_update(f, st, line, bad, key_cols, bands, refs, entry, key_sets)
-        elif st.verb == "DELETE":
-            self._policy_delete(st, bad, key_cols, bands, refs, key_sets)
 
     def _policy_insert(self, f, st, line, digest, bad, key_cols, bands, refs, is_custom):
         masked = st.masked
@@ -1323,62 +1810,88 @@ class Preflight:
                                          f"the company reserved band {limit}+ "
                                          f"(docs/content-playbook.md 2.4)")
 
-    def _policy_update(self, f, st, line, bad, key_cols, bands, refs, entry, key_sets):
+    def _policy_update(self, f, st, line, bad, key_cols, bands, refs, entry, key_sets,
+                       qualifiers):
         masked = st.masked
         where_positions = top_level_positions(masked, "WHERE")
         if not where_positions:
             bad("unbounded-write", f"UPDATE {st.table} without WHERE is rejected")
             return
         wpos = where_positions[0]
-        set_start = re.search(r"(?<![A-Za-z0-9_$])SET(?![A-Za-z0-9_$])", masked, re.IGNORECASE)
-        if not set_start or set_start.end() > wpos:
+        set_start = [p for p in top_level_positions(masked, "SET") if p < wpos]
+        if not set_start:
             bad("unparsable", "could not locate the SET clause of the UPDATE — fail closed")
             return
-        set_text = st.text[set_start.end():wpos]
-        where_text = st.text[wpos + len("WHERE"):]
-        if has_top_level_or(where_text):
-            bad("or-in-where", f"UPDATE {st.table}: top-level OR in WHERE is rejected; use an "
-                               f"explicit IN list of reserved-band ids")
-        preds = scan_predicates(where_text)
-        self._bounded_on(bad, st, preds, key_sets, "UPDATE")
+        set_text = st.text[set_start[-1] + len("SET"):wpos]
+        where_text = where_clause(masked, st.text, wpos)
+        preds = scan_predicates(where_text, qualifiers)
+        self._bounded_on(bad, st, preds, key_sets, "UPDATE",
+                         bound=bound_columns(masked, st.text, wpos + len("WHERE"),
+                                             wpos + len("WHERE") + len(where_text),
+                                             qualifiers),
+                         where_text=where_text)
         forbidden_assign = set(key_cols)
         for b in bands:
             forbidden_assign.add(b["column"].lower())
         for piece in split_top_level(set_text, mask_sql(set_text), ","):
-            target = piece.split("=")[0].strip().lower()
-            target = unquote_ident(target.split(".")[-1])
+            lhs = piece.split("=")[0].strip()
+            parts = lhs.split(".")
+            if len(parts) > 1:
+                qual = unquote_ident(parts[0]).lower()
+                if qual not in qualifiers:
+                    bad("unparsable",
+                        f"UPDATE {st.table} assigns {piece.strip()[:40]!r}, which belongs to "
+                        f"{qual!r} — only the written table may be assigned; fail closed")
+                    continue
+            target = unquote_ident(parts[-1]).lower()
             if target in forbidden_assign:
                 bad("key-column-assigned",
                     f"UPDATE {st.table} assigns the natural-key/reserved column {target!r}")
         self._check_literals(bad, st, preds, bands, refs, "UPDATE")
 
-    def _policy_delete(self, st, bad, key_cols, bands, refs, key_sets):
+    def _policy_delete(self, st, bad, key_cols, bands, refs, key_sets, qualifiers):
         masked = st.masked
         where_positions = top_level_positions(masked, "WHERE")
         if not where_positions:
             bad("unbounded-write", f"DELETE FROM {st.table} without WHERE is rejected")
             return
-        where_text = st.text[where_positions[0] + len("WHERE"):]
-        if has_top_level_or(where_text):
-            bad("or-in-where", f"DELETE FROM {st.table}: top-level OR in WHERE is rejected; use an "
-                               f"explicit IN list of reserved-band ids")
-        preds = scan_predicates(where_text)
-        self._bounded_on(bad, st, preds, key_sets, "DELETE")
+        where_text = where_clause(masked, st.text, where_positions[0])
+        preds = scan_predicates(where_text, qualifiers)
+        self._bounded_on(bad, st, preds, key_sets, "DELETE",
+                         bound=bound_columns(masked, st.text,
+                                             where_positions[0] + len("WHERE"),
+                                             where_positions[0] + len("WHERE") + len(where_text),
+                                             qualifiers),
+                         where_text=where_text)
         self._check_literals(bad, st, preds, bands, refs, "DELETE")
 
-    def _bounded_on(self, bad, st, preds, key_sets, verb):
+    def _bounded_on(self, bad, st, preds, key_sets, verb, bound=None, where_text=""):
         """Bound means: EVERY column of at least one key set is equality/IN bound to literals.
 
         The old rule accepted any single key column, so
         `DELETE FROM module_string WHERE module='mod-x'` passed while deleting rows
         unrelated to the file that shipped them (PRO-179 review N1). keyColumns is the
         whole key and must be bounded as a unit; policy `keySets` lists alternative keys
-        only where a partial key really is selective.
+        only where a partial key really is selective. `bound` is the disjunction-aware
+        set from bound_columns(), not the flat predicate list: a key column that is
+        only bounded on one side of an OR does not bound the statement.
         """
         if not key_sets:
             bad("no-natural-key-configured",
                 f"{verb} on {st.table}: no natural key configured in the policy — fail closed")
             return
+        if bound is None:
+            bound = {c for c, hits in preds.items()
+                     if any(op in ("=", "IN", "<=>") for op, _, _ in hits)
+                     and not any(kind == "unknown" for _, kind, _ in hits)}
+        if where_text and top_level_disjunction(where_text):
+            bad("or-in-where",
+                f"{verb} on {st.table}: the WHERE is a disjunction, so no key bounds every "
+                f"row the statement can reach; use an explicit IN list of reserved-band "
+                f"ids instead")
+        for group in key_sets:
+            if all(kc.lower() in bound for kc in group):
+                return  # every column of this key set bounds the statement
         best: list[str] | None = None
         for group in key_sets:
             problems: list[str] = []
@@ -1394,14 +1907,17 @@ class Preflight:
                 if any(kind == "unknown" for _, kind, _ in hits):
                     problems.append(f"{kc!r} compared against a non-literal operand")
                     continue
+                if kc.lower() not in bound:
+                    problems.append(f"{kc!r} bounded on only one side of a disjunction")
+                    continue
             if not problems:
-                return  # every column of this key set bounds the statement
+                break
             if best is None or len(problems) < len(best):
                 best = problems
         bad("unbounded-write",
             f"{verb} on {st.table} is not WHERE-bounded on a complete natural key "
             f"(keys tried: {key_sets}; closest: {'; '.join(best or [])}; "
-            f"bounded columns found: {sorted(preds) or 'none'})")
+            f"columns bounded on every branch: {sorted(bound) or 'none'})")
 
     def _check_literals(self, bad, st, preds, bands, refs, verb):
         rules: dict[str, tuple[int, str]] = {}
@@ -1655,6 +2171,12 @@ class Preflight:
                 self.r.line("5", "skipped — earlier checks already failed")
             else:
                 self.run_dry_run(new_files)
+        else:
+            # Render must not be able to print "[5] ... ok" for a check that never ran.
+            self.r.warn("5", "dry run skipped by --no-dry-run: the restart fast path. Fine for a "
+                             "restart that changes no SQL, never for a SQL change — the updater "
+                             "was not replayed against a scratch clone of the live schema.",
+                        rule="dry-run-skipped")
         return EXIT_FAIL if self.r.failed else EXIT_OK
 
 
