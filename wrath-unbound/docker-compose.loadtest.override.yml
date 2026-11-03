@@ -1,0 +1,24 @@
+# PRO-33 load-test override: restores the large randombot volume
+# (1600-2000) that the default override lowered to 50.
+#
+# SOURCE OF TRUTH (PRO-180): the repo-root `docker-compose.loadtest.override.yml`
+# is a gitignored, generated copy of this file. Edit this file and run
+# `scripts/compose-sync.sh`; never hand-edit the root copy (hand-editing the
+# root copies is what produced the PRO-33/PRO-65/PRO-178 drift).
+#
+# This file is NOT loaded by a plain `docker compose up` (only
+# docker-compose.yml + docker-compose.override.yml are auto-merged).
+# To run a load test, from the repo root:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
+#     docker compose up -d --force-recreate ac-worldserver
+#
+# To return to the 50-bot default afterwards:
+#   docker compose up -d --force-recreate ac-worldserver
+#
+# See docs/dev-environment.md ("Load testing (randombot volume)").
+services:
+  ac-worldserver:
+    environment:
+      AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "1600"
+      AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "2000"
