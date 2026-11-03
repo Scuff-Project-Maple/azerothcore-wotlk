@@ -5,8 +5,18 @@ services:
       target: worldserver
     volumes:
       - ./modules:/azerothcore/modules
+      # PRO-65: the core SQL updater resolves acore_world.updates_include paths
+      # ("$/data/sql/...") against the source tree (/azerothcore), so without this
+      # mount the include directories do not exist in the container and
+      # pending_db_world is never applied. Read-only: the updater only reads.
+      - ./data/sql:/azerothcore/data/sql:ro
     environment:
       AC_PLAYERBOTS_UPDATES_ENABLE_DATABASES: "1"
+      # PRO-65: apps/docker/Dockerfile bakes ENV AC_UPDATES_ENABLE_DATABASES=0, which
+      # short-circuits the core updater ("Automatic database updates are disabled").
+      # 4 = DATABASE_WORLD only (src/server/database/Database/DatabaseLoader.h), so the
+      # auth/character ledgers stay under their existing process of record.
+      AC_UPDATES_ENABLE_DATABASES: "4"
       AC_AI_PLAYERBOT_RANDOM_BOT_AUTOLOGIN: "1"
       AC_AI_PLAYERBOT_MIN_RANDOM_BOTS: "1600"
       AC_AI_PLAYERBOT_MAX_RANDOM_BOTS: "2000"
