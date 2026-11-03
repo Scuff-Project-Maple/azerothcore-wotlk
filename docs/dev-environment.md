@@ -87,7 +87,7 @@ and the `wrath-unbound/` snapshot are tracked in git.
  │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
  │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
-├── docker-compose.override.yml           # Playerbots env (random bots 1600–2000, DB auto-updates), ./modules mount
+ ├── docker-compose.override.yml           # generated copy of wrath-unbound/docker-compose.override.yml (PRO-178): 50 randombots, world-DB auto-updates, Warden off, ./modules + ./data/sql + mysql-dev.cnf mounts
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
 └── wrath-unbound/                        # tracked snapshot of the provisioned payload (reprovisioning source)
@@ -388,6 +388,8 @@ cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
 cp wrath-unbound/docker-compose.override.yml .
+# the root override is a generated copy (PRO-178): never hand-edit it;
+# edit wrath-unbound/docker-compose.override.yml and re-run this cp
 
 # the core hook patches are committed IN-TREE on Playerbot
 # (f5b197b8d mod-unbound, 6 files; b732dfd71 mod-custom-classes, 6 files)
@@ -454,9 +456,12 @@ verify per the sections above.
   patch mod-playerbots; if they start to, fetch history first.
 
 - **D5 — Dev DB durability relaxed (PRO-30).** `conf/mysql-dev.cnf`
-  (tracked) is bind-mounted into `ac-database` at
-  `/etc/mysql/conf.d/maple-dev.cnf` via the root `docker-compose.override.yml`
-  (installer-managed, untracked): `innodb_flush_log_at_trx_commit = 2`,
+  (tracked via the `!/conf/mysql-dev.cnf` gitignore exception added in
+  PRO-178 — before that it was gitignored and unmounted) is bind-mounted
+  into `ac-database` at `/etc/mysql/conf.d/maple-dev.cnf` by the **tracked**
+  `wrath-unbound/docker-compose.override.yml`; the root
+  `docker-compose.override.yml` is a generated copy of it (PRO-178).
+  Values: `innodb_flush_log_at_trx_commit = 2`,
   `sync_binlog = 10000`, `binlog_expire_logs_seconds = 172800`,
   `max_binlog_size = 104857600`. The dev box is a KVM VM on shared storage;
   per-commit fsyncs (InnoDB log + binlog) wedged the worldserver main thread
@@ -464,6 +469,11 @@ verify per the sections above.
   [PRO-30](/PRO/issues/PRO-30) and the section below). Trade-off: on power
   failure the dev DB may lose up to ~1 s of transactions. Do not carry these
   values into a production stack.
+  Verify the mount and values are live:
+  `docker inspect ac-database --format '{{json .Mounts}}'` lists the cnf
+  bind mount, and `docker exec ac-database mysql -u root -ppassword -N -e
+  "SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog;"` returns `2
+  10000`.
 ## PRO-30: auth hang defect, dev DB durability, and host I/O notes
 
 **Defect (found by QA on 2026-10-19, tracked in
@@ -492,7 +502,12 @@ until the stall.
 **Fix applied (dev stack):**
 
 - `conf/mysql-dev.cnf` (D5): no per-commit fsyncs; commits complete in
-  microseconds even under I/O pressure.
+  microseconds even under I/O pressure. Historical note (PRO-178): at the
+  October verification this file was gitignored and no compose mount
+  referenced it, so the running server kept MySQL defaults
+  (`@@innodb_flush_log_at_trx_commit = 1`, `@@sync_binlog = 1`); the tuning
+  was never actually in effect until the tracked override mounted it on
+  2026-11-03.
 - Disk hygiene on the build host: `docker builder prune` (41 GB build cache
   -> ~31 GB) and `PURGE BINARY LOGS BEFORE` (16.5 GB binlogs -> 5 files).
   Root disk went 98% -> ~82%. Keep an eye on it: the MySQL data volume and

@@ -33,6 +33,12 @@ Companion guide: `guides/unbound-wrath/Wrath-Unbound-Addon-HOWTO.md` (blob
 
 Notes:
 
+- `docker-compose.override.yml` here is the **source of truth** (PRO-178):
+  the root `docker-compose.override.yml` is a gitignored, generated copy.
+  Edit this file and re-run the staging `cp`; never hand-edit the root copy
+  (hand-editing it is what caused the PRO-178 drift). It also mounts the
+  PRO-30 dev DB tuning `conf/mysql-dev.cnf`, which is tracked in the fork
+  itself (gitignore exception `!/conf/mysql-dev.cnf`) and needs no staging.
 - `modules/mod-unbound` needs **no CMakeLists.txt**: with the docker build's
   `MODULES=static`, AzerothCore's `modules/CMakeLists.txt`
   (`GetModuleSourceList` → `CollectSourceFiles`) auto-collects
