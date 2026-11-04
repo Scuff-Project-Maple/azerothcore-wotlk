@@ -15,7 +15,15 @@ unknown), and per included directory. `--rule RULE` lists the offending
 file:line for one rule. Nothing here touches MySQL: provenance comes from git and
 the policy from preflight-policy.json, exactly as the gate reads them.
 
-Exit status: 0 always (this is a measurement tool), 2 on a usage/operational error.
+The invariant the README names is the `company` column: those are the findings that
+turn into `REFUSING BOOT`. It is therefore also the exit status — a non-zero company
+total exits 1, so this can be wired into CI instead of read by eye. `--diff` prints
+the per-rule company delta alongside the total, because a finding that migrates
+`upstream -> company` leaves the totals untouched while creating a new boot refusal
+(PRO-179 review NB-C). Use `--measure-only` for a baseline capture, where a non-zero
+company total is expected and must not fail the run.
+
+Exit status: 0 clean, 1 findings in the company column, 2 on a usage/operational error.
 """
 
 from __future__ import annotations
@@ -37,12 +45,16 @@ import preflight_worlddb as pf  # noqa: E402
 class Args:
     """Only the attributes Preflight/MySQL read at construction time."""
 
-    def __init__(self, root: Path, policy: Path, strict_all: bool, policy_all: bool):
+    def __init__(self, root: Path, policy: Path, strict_all: bool, policy_all: bool,
+                 live_db: str):
         self.compose_root = str(root)
         self.sql_root = None
         self.git_root = None
         self.policy = str(policy)
-        self.live_db = "acore_world"
+        # The gate reads the live schema from the policy file; hard-coding it here meant
+        # `cross-schema-write` could be measured against a schema the gate never uses
+        # (PRO-179 review NB-C).
+        self.live_db = live_db
         self.scratch_db = None
         self.db_access = "command"
         self.db_service = "ac-database"
@@ -124,23 +136,60 @@ def print_report(result: dict, top: int, rule_filter: str | None,
                 print(f"{v['file']}:{v.get('line')}: {v.get('detail', '')[:200]}")
 
 
-def print_diff(current: dict, baseline_path: Path) -> None:
+def company_by_rule(result: dict) -> dict[str, int]:
+    """Per-rule count of findings authored by the company.
+
+    This is the column that matters: these are the findings the boot gate turns into
+    `REFUSING BOOT`, so a non-zero total is a falsifiable invariant rather than
+    decoration (PRO-179 review NB-C).
+    """
+    out: dict[str, int] = {}
+    for rule, origins in (result.get("byRuleOrigin") or {}).items():
+        n = int(origins.get("company", 0))
+        if n:
+            out[rule] = n
+    return out
+
+
+def company_total(result: dict) -> int:
+    return sum(company_by_rule(result).values())
+
+
+def print_diff(current: dict, baseline_path: Path) -> list[str]:
+    """Print per-rule deltas and return the rules whose company column grew.
+
+    Diffing totals alone was the defect: a finding that migrates `upstream -> company`
+    leaves every total untouched while creating a brand-new boot refusal, and the tool
+    printed "(no rule changed)" (PRO-179 review NB-C). The company column is therefore
+    diffed in its own right, and a rule that gains company findings is reported even
+    when its total is unchanged.
+    """
     base = json.loads(baseline_path.read_text())
-    rules = sorted(set(current["byRule"]) | set(base.get("byRule", {})))
+    rules = sorted(set(current.get("byRule", {})) | set(base.get("byRule", {})))
+    base_company = company_by_rule(base)
+    cur_company = company_by_rule(current)
     print(f"diff vs {baseline_path} (baseline head {base.get('head', '?')})")
-    print("rule                               before    after     delta")
+    print("rule                               before    after     delta   company  c-delta")
     moved = 0
+    grown: list[str] = []
     for rule in rules:
         before = base.get("byRule", {}).get(rule, 0)
-        after = current["byRule"].get(rule, 0)
-        if before == after:
+        after = current.get("byRule", {}).get(rule, 0)
+        cb, ca = base_company.get(rule, 0), cur_company.get(rule, 0)
+        if before == after and cb == ca:
             continue
         moved += 1
-        print(f"{rule:<32} {before:>8} {after:>7} {after - before:>+8}")
+        flag = ""
+        if ca > cb:
+            grown.append(rule)
+            flag = "   <-- new company finding (boot refusal)"
+        print(f"{rule:<32} {before:>8} {after:>7} {after - before:>+8} {ca:>8} {ca - cb:>+7}{flag}")
     if not moved:
         print("(no rule changed)")
     for key in ("files", "filesUnderPolicy", "statements", "findings"):
-        print(f"{key:<12} {base.get(key, 0)} -> {current[key]}")
+        print(f"{key:<12} {base.get(key, 0)} -> {current.get(key, 0)}")
+    print(f"{'company':<12} {sum(base_company.values())} -> {sum(cur_company.values())}")
+    return grown
 
 
 def main(argv=None) -> int:
@@ -155,10 +204,13 @@ def main(argv=None) -> int:
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--rule", default=None, help="list file:line for one rule")
     ap.add_argument("--strict-all", action="store_true",
-                   help="no provenance exemption, exactly like the gate's --strict-all")
+                    help="no provenance exemption, exactly like the gate's --strict-all")
     ap.add_argument("--policy-all", action="store_true")
     ap.add_argument("--out", default=None, help="write the tally as JSON")
     ap.add_argument("--diff", default=None, help="compare against a saved JSON tally")
+    ap.add_argument("--measure-only", action="store_true",
+                    help="exit 0 even when the company column is non-zero or the diff shows "
+                         "an upstream->company migration; for baseline capture")
     ap.add_argument("--json", dest="json_out", default=None, help="also dump JSON to stdout")
     args = ap.parse_args(argv)
 
@@ -172,24 +224,39 @@ def main(argv=None) -> int:
         print(f"{root} has no data/sql — pass --compose-root", file=sys.stderr)
         return 2
 
-    engine = pf.Preflight(Args(root, policy_path, args.strict_all, args.policy_all),
-                          policy, pf.Report())
+    engine = pf.Preflight(
+        Args(root, policy_path, args.strict_all, args.policy_all,
+             str(policy.get("liveDatabase", "acore_world"))),
+        policy, pf.Report())
     files = build_files(engine, policy, args.workers)
     result = tally(engine, files)
     result.update({"head": git_head(root), "composeRoot": str(root),
                    "policy": str(policy_path),
-                   "strictAll": bool(args.strict_all)})
+                   "liveDatabase": engine.live_db,
+                   "strictAll": bool(args.strict_all),
+                   "companyFindings": company_total(result)})
 
     print_report(result, args.top, args.rule, engine)
+    exit_code = 0
     if args.diff:
         print()
-        print_diff(result, Path(args.diff))
+        grown = print_diff(result, Path(args.diff))
+        if grown:
+            print(f"\nCOMPANY findings appeared in: {', '.join(grown)} — a parser change "
+                  f"must not move findings into the set the gate refuses boot for")
+            if not args.measure_only:
+                exit_code = 1
+    if result["companyFindings"]:
+        print(f"\nCOMPANY findings: {result['companyFindings']} — every one of these is a "
+              f"boot refusal today; list them with --rule RULE")
+        if not args.measure_only:
+            exit_code = 1
     if args.out:
         Path(args.out).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         print(f"\nwrote {args.out}")
     if args.json_out:
         print(json.dumps(result, sort_keys=True))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

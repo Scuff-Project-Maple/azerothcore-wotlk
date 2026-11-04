@@ -131,15 +131,20 @@ boot gate only policy-checks files the updater has not applied yet, so a regress
 refusing upstream syntax is invisible to it until someone tries to boot.
 
 ```
-python3 ops/preflight/corpus_sweep.py --out /tmp/before.json   # add --strict-all for the full corpus
+python3 ops/preflight/corpus_sweep.py --out /tmp/before.json --measure-only   # baseline capture
 # ...change the engine...
-python3 ops/preflight/corpus_sweep.py --diff /tmp/before.json   # per-rule deltas, nothing else
+python3 ops/preflight/corpus_sweep.py --diff /tmp/before.json   # per-rule + per-rule company deltas
 python3 ops/preflight/corpus_sweep.py --rule table-not-allowed  # offending file:line
 ```
 
 The number that matters is the `company` column: it must stay 0, because a finding in
-company-authored SQL is a boot refusal. The `upstream` columns are the corpus the gate exempts by
-default, and are measured with `--strict-all` to see how much syntax the engine understands.
+company-authored SQL is a boot refusal. It is therefore also the exit status — a non-zero company
+total, or a `--diff` that shows findings migrating `upstream → company` at constant totals, exits
+1 so this can be wired into CI rather than read by eye (PRO-179 review NB-C). `--measure-only`
+returns 0 regardless, which is what a baseline capture needs. The `upstream` columns are the corpus
+the gate exempts by default, and are measured with `--strict-all` to see how much syntax the engine
+understands. `liveDatabase` is read from the policy file, so `cross-schema-write` is measured
+against the schema the gate actually uses.
 
 ## Dry run (check 5)
 
