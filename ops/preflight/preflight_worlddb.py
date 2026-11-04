@@ -888,9 +888,28 @@ BACKTICKED_NAME_RE = re.compile(r"`([^`]+)`")
 BACKTICK_SPAN_RE = re.compile(r"`[^`]*`")
 # The syntax a single-table write region must be free of. Splitting on these is how
 # the rejection path decides which names in the region sit in a table position.
+# FROM is in the list because a multi-table DELETE has two different name grammars on
+# either side of it: the delete-target list before it, the table references after it
+# (PRO-179 review NB-B).
 REGION_SPLIT_RE = re.compile(
-    r"(?<![A-Za-z0-9_$])(?:JOIN|STRAIGHT_JOIN|INNER|OUTER|CROSS|NATURAL|USING)(?![A-Za-z0-9_$])|,",
+    r"(?<![A-Za-z0-9_$])(?:JOIN|STRAIGHT_JOIN|INNER|OUTER|CROSS|NATURAL|USING|FROM)"
+    r"(?![A-Za-z0-9_$])|,",
     re.IGNORECASE)
+# One identifier, optionally the first half of a qualified one. Reading ``a`.`b`` as a
+# *unit* is the point: matching one backtick run at a time promoted the schema to table
+# position and demoted the real table to a name (PRO-179 review NB-A). Bare names are
+# included so an unquoted region is not read as naming nothing (PRO-179 review NB-B).
+_REGION_IDENT = r"(?:`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)"
+REGION_NAME_RE = re.compile(_REGION_IDENT + r"(?:\s*\.\s*" + _REGION_IDENT + r")?")
+# Words that are syntax or index-hint noise where a bare name is expected. Applied to
+# unquoted names only — a backticked name is unambiguously an identifier, and a table
+# may legitimately be spelled like a keyword.
+REGION_NAME_STOPWORDS = frozenset({
+    "as", "by", "cross", "duplicate", "for", "force", "from", "group", "having", "ignore",
+    "index", "inner", "join", "key", "limit", "low_priority", "natural", "on", "order",
+    "outer", "partition", "primary", "quick", "select", "set", "straight_join", "unique",
+    "use", "using", "where",
+})
 # `UPDATE`smart_scripts` is legal MySQL: the backtick terminates the verb token.
 # The head patterns therefore allow the table to abut the verb; a verb that is not
 # UPDATE/DELETE never reaches here (parse_statement already decided), and anything
@@ -931,6 +950,7 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
     through: only the first table was ever examined.
     """
     masked = st.masked
+    from_end: int | None = None
     if st.verb == "UPDATE":
         head = UPDATE_HEAD_RE.match(masked)
         if not head:
@@ -946,7 +966,8 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
         if not froms:
             return [], set(), "DELETE has no FROM clause", ""
         pre = masked[head.end():froms[0]]
-        lo = froms[0] + len("FROM")
+        from_end = froms[0] + len("FROM")
+        lo = from_end
         ends = [p for p in (top_level_positions(masked, "WHERE")
                             + top_level_positions(masked, "ORDER")
                             + top_level_positions(masked, "LIMIT")) if p > lo]
@@ -956,7 +977,7 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
 
     if pre.strip():
         region = masked[head.end():hi]
-        tables, others = _region_tables(masked, head.end(), hi)
+        tables, others = _region_tables(masked, head.end(), hi, from_end)
         return tables, others, \
             f"table list {pre.strip()[:60]!r} before FROM is multi-table DELETE syntax", region
     region_names = PARTITION_CLAUSE_RE.sub(" ", masked[lo:hi])
@@ -979,14 +1000,20 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
     if err is None and not m:
         err = "the write region is not a single table with an optional alias"
     if err is not None:
-        tables, others = _region_tables(masked, lo, hi)
+        tables, others = _region_tables(masked, lo, hi, from_end)
         return tables, others, err, region
     schema, table = split_qualified(m.group("tbl"))
     aliases = {unquote_ident(m.group("alias")).lower()} if m.group("alias") else set()
     return [(schema, table)], aliases, None, region
 
 
-def _region_tables(masked: str, lo: int, hi: int) -> tuple[list[tuple[str | None, str]], set[str]]:
+def _region_names(fragment: str) -> list[str]:
+    """Identifiers in a region fragment, a qualified name counted as one name."""
+    return [m.group(0) for m in REGION_NAME_RE.finditer(fragment)]
+
+
+def _region_tables(masked: str, lo: int, hi: int,
+                   from_end: int | None = None) -> tuple[list[tuple[str | None, str]], set[str]]:
     """(tables, other names) for a rejected write region, in order of first appearance.
 
     Used only on the rejection path, so the report can name the table a rejected
@@ -997,21 +1024,62 @@ def _region_tables(masked: str, lo: int, hi: int) -> tuple[list[tuple[str | None
     `updates`, and `c`/`u` are names, not tables — running them through the
     allow-list check reported a phantom `table-not-allowed` for each (PRO-179
     review NB-2).
+
+    Three refinements, all report fidelity on an already-rejected statement:
+
+    * a qualified name is read as one unit, so ``UPDATE `acore_world`.`updates` `u``
+      names `updates` in a table position instead of promoting the schema to table
+      and losing the ledger (PRO-179 review NB-A);
+    * unquoted names are visible too, so ``DELETE updates, creature FROM updates u``
+      names `updates` rather than reporting "none identifiable" (PRO-179 review NB-B);
+    * a multi-table DELETE has two name grammars, so `from_end` says where the FROM
+      keyword ends. Before it every name is a delete target; after it the first name
+      of each fragment is a table and the rest are aliases. A delete target that an
+      alias in the FROM list defines is that alias, not a second table, which is what
+      keeps ``DELETE `u`, `c` FROM `updates` `u` JOIN `creature` `c``` naming
+      `updates` and `creature` instead of `u` and `c` (PRO-179 review NB-B).
+
+    What a bare-name scan cannot tell is an index hint: `USE INDEX (idx)` contributes
+    `idx` as a name. That is noise in a message about a statement that is already
+    refused, never a silently-passing write — a name this function misses can only
+    cost report fidelity, because `multi-table-write` is raised independently of it.
     """
     raw = masked[lo:hi]
     scan = blank_backticked(PARTITION_CLAUSE_RE.sub(" ", raw))
     bounds = [0] + [m.end() for m in REGION_SPLIT_RE.finditer(scan)] + [len(scan)]
+    from_off = None if from_end is None else from_end - lo
     tables: dict[str, tuple[str | None, str]] = {}
-    others: set[str] = set()
+    aliases: set[str] = set()
+    targets: dict[str, tuple[str | None, str]] = {}
+    seen: set[str] = set()
+
+    def record(token: str) -> tuple[str, tuple[str | None, str]] | None:
+        schema, table = split_qualified(token)
+        if not table:
+            return None
+        if not token.startswith("`") and table.lower() in REGION_NAME_STOPWORDS:
+            return None
+        return table.lower(), (schema, table)
+
     for a, b in zip(bounds, bounds[1:]):
-        names = BACKTICKED_NAME_RE.findall(raw[a:b])
-        for idx, name in enumerate(names):
-            schema, table = split_qualified(name)
-            if idx == 0 and table:
-                tables.setdefault(table.lower(), (schema, table))
+        in_from = from_off is None or a >= from_off
+        for idx, token in enumerate(_region_names(raw[a:b])):
+            hit = record(token)
+            if hit is None:
+                continue
+            key, ident = hit
+            seen.add(key)
+            if in_from:
+                if idx == 0:
+                    tables.setdefault(key, ident)
+                else:
+                    aliases.add(key)
             else:
-                others.add(table.lower() if table else name.lower())
-    return list(tables.values()), others
+                targets.setdefault(key, ident)
+    for key, ident in targets.items():
+        if key not in aliases:
+            tables.setdefault(key, ident)
+    return list(tables.values()), {k for k in seen if k not in tables}
 
 
 # --------------------------------------------------------------------------- #

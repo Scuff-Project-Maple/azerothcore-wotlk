@@ -9,6 +9,8 @@ masker and the write-policy engine only.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import unittest
 from argparse import Namespace
@@ -788,6 +790,159 @@ class TestRev3NonBlocking(unittest.TestCase):
             proc = self._run_wrapper(tail)
             self.assertNotIn("refusing to forward", proc.stdout, f"{tail}")
             self.assertIn("lease", proc.stdout, f"{tail}")
+
+
+class TestRev4ReportFidelity(unittest.TestCase):
+    """PRO-179 rev-4 NB-A/NB-B: the rejection path must name the tables it blames.
+
+    None of these can turn a passing file into a failing one — `multi-table-write` is
+    raised before any of this is consulted — but a report that blames the wrong name
+    sends a reviewer chasing the wrong table, and a report that says "none
+    identifiable" reads as "touches nothing" when it genuinely reaches the ledger.
+    """
+
+    def test_qualified_name_keeps_the_ledger_as_the_table(self):
+        # NB-A: `acore_world`.`updates` used to promote the schema to table position.
+        found = findings_for("UPDATE `acore_world`.`updates` `u` JOIN `creature` `c` "
+                             "SET u.hash='x' WHERE c.guid=9002020;")
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules)
+        self.assertEqual([], [m for r, m in found if r == "table-not-allowed"],
+                          "the schema was blamed as a write target")
+        msg = next(m for r, m in found if r == "multi-table-write")
+        self.assertIn("updates", msg)
+        self.assertNotIn("none identifiable", msg)
+
+    def test_qualified_name_still_names_an_unallowlisted_table(self):
+        found = findings_for("UPDATE `acore_world`.`creature` `c` JOIN `game_event` `g` "
+                             "SET g.eventType=1 WHERE c.guid=9002020;")
+        rules = [r for r, _ in found]
+        self.assertIn("table-not-allowed", rules)
+        self.assertIn("game_event", next(m for r, m in found if r == "table-not-allowed"))
+
+    def test_multi_table_delete_target_list_names_the_real_tables(self):
+        # NB-B: the second fragment's first name is the second delete target, not the
+        # table after FROM, so `updates` used to be demoted to a mere name.
+        found = findings_for("DELETE `u`, `c` FROM `updates` `u` JOIN `creature` `c`;")
+        rules = [r for r, _ in found]
+        self.assertIn("ledger-table", rules)
+        self.assertEqual([], [m for r, m in found if r == "table-not-allowed"],
+                          "delete-target aliases were blamed as write targets")
+        msg = next(m for r, m in found if r == "multi-table-write")
+        self.assertIn("creature", msg)
+        self.assertIn("updates", msg)
+
+    def test_unquoted_multi_table_delete_is_not_invisible(self):
+        # NB-B: the name scan was backtick-only, so this reported "none identifiable".
+        found = findings_for("DELETE updates, creature FROM updates u JOIN creature c;")
+        rules = [r for r, _ in found]
+        self.assertIn("ledger-table", rules)
+        msg = next(m for r, m in found if r == "multi-table-write")
+        self.assertNotIn("none identifiable", msg)
+        self.assertIn("updates", msg)
+
+    def test_unquoted_join_names_the_ledger(self):
+        self.assertIn("ledger-table", rules_for(
+            "UPDATE updates u JOIN creature c SET u.hash='x' WHERE c.guid=9002020;"))
+
+    def test_index_hint_words_are_not_reported_as_tables(self):
+        found = findings_for("UPDATE `creature_template` USE INDEX (PRIMARY) "
+                             "SET `npcflag`=3 WHERE `entry`=900200;")
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertEqual([], [m for r, m in found if r == "table-not-allowed"],
+                          "index-hint keywords were blamed as write targets")
+
+    def test_the_passing_path_is_unaffected_by_the_name_scan(self):
+        self.assertEqual([], rules_for(
+            "UPDATE `acore_world`.`creature` SET `script_name` = 'x' WHERE `guid` = 9002020;"))
+        self.assertEqual([], rules_for(
+            "DELETE FROM `acore_world`.`creature_template` WHERE `entry` = 900200;"))
+
+
+class TestCorpusSweepCompanyColumn(unittest.TestCase):
+    """PRO-179 rev-4 NB-C: the tool must measure the invariant its README names."""
+
+    RESULT_CLEAN = {
+        "files": 3, "filesUnderPolicy": 3, "statements": 3, "findings": 2,
+        "byRule": {"unbounded-write": 2},
+        "byRuleOrigin": {"unbounded-write": {"upstream": 2}},
+        "byDir": {}, "perFile": {},
+    }
+    # Identical totals, one finding migrated upstream -> company.
+    RESULT_DIRTY = {
+        "files": 3, "filesUnderPolicy": 3, "statements": 3, "findings": 2,
+        "byRule": {"unbounded-write": 2},
+        "byRuleOrigin": {"unbounded-write": {"upstream": 1, "company": 1}},
+        "byDir": {}, "perFile": {},
+    }
+
+    def _sweep(self, result, argv):
+        import contextlib
+        import io
+        import tempfile
+        import corpus_sweep as cs
+        saved = cs.build_files, cs.tally
+        cs.build_files = lambda engine, policy, workers: []
+        cs.tally = lambda engine, files: dict(result)
+        out = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp) / "baseline.json"
+                base.write_text(json.dumps(self.RESULT_CLEAN))
+                with contextlib.redirect_stdout(out):
+                    code = cs.main(["--diff", str(base), *argv])
+        finally:
+            cs.build_files, cs.tally = saved
+        return code, out.getvalue()
+
+    def test_company_findings_drive_the_exit_status(self):
+        clean, _ = self._sweep(self.RESULT_CLEAN, [])
+        self.assertEqual(0, clean)
+        dirty, text = self._sweep(self.RESULT_DIRTY, [])
+        self.assertEqual(1, dirty)
+        self.assertIn("COMPANY findings", text)
+
+    def test_measure_only_keeps_the_exit_status_at_zero(self):
+        code, text = self._sweep(self.RESULT_DIRTY, ["--measure-only"])
+        self.assertEqual(0, code)
+        self.assertIn("COMPANY findings", text)
+
+    def test_diff_measures_the_company_column_not_just_the_totals(self):
+        _, text = self._sweep(self.RESULT_DIRTY, [])
+        self.assertIn("company", text)
+        self.assertIn("new company finding", text)
+        self.assertNotIn("(no rule changed)", text,
+                         "a company finding appeared while the diff said nothing changed")
+
+    def test_args_take_the_live_schema_from_the_policy(self):
+        import corpus_sweep as cs
+        args = cs.Args(Path("."), Path("policy.json"), False, False, "acore_world_alt")
+        self.assertEqual("acore_world_alt", args.live_db)
+
+    def test_main_threads_the_policy_live_schema_into_the_engine(self):
+        import corpus_sweep as cs
+        saved = cs.build_files, cs.tally, cs.pf.Preflight
+        seen = {}
+        real = cs.pf.Preflight
+
+        class Spy(real):
+            def __init__(self, a, policy, report):
+                seen["live_db"] = a.live_db
+                super().__init__(a, policy, report)
+
+        cs.build_files = lambda engine, policy, workers: []
+        cs.tally = lambda engine, files: dict(self.RESULT_CLEAN)
+        cs.pf.Preflight = Spy
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = cs.main([])
+        finally:
+            cs.build_files, cs.tally, cs.pf.Preflight = saved
+        self.assertEqual(0, code)
+        self.assertEqual(POLICY["liveDatabase"], seen.get("live_db"),
+                         "cross-schema-write was measured against a hard-coded schema")
 
 
 if __name__ == "__main__":
