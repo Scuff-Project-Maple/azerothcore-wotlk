@@ -278,12 +278,17 @@ docker exec ac-database mysql -u root -ppassword acore_playerbots \
   -e "SELECT event, value FROM playerbots_random_bots WHERE owner = 0 AND bot = 0;"
 ```
 
-and the online `rndbot%` characters in `acore_characters` should match
-within a few minutes:
+and the online `rndbot%` characters should match within a few minutes. The
+connection has no default database, so both tables must be fully qualified
+(`acore_characters.characters`, `acore_auth.account`) — bare table names fail
+with `ERROR 1046 (No database selected)`:
 
 ```bash
 docker exec ac-database mysql -u root -ppassword \
-  -e "SELECT COUNT(*) AS online_bots FROM acore_characters c JOIN acore_auth a ON c.account = a.id WHERE a.username LIKE 'rndbot%' AND c.online > 0;"
+  -e "SELECT COUNT(*) AS online_bots
+      FROM acore_characters.characters c
+      JOIN acore_auth.account a ON a.id = c.account
+      WHERE a.username LIKE 'rndbot%' AND c.online = 1;"
 ```
 
 Background: the boot-time login storm was the primary stressor
