@@ -85,24 +85,48 @@ lookups only (`git ls-tree`), never a fetch:
 
 | ref answers | classification | finding |
 | --- | --- | --- |
-| file is in the ref | `upstream` | none — the ordinary `git pull` path |
-| ref resolved, file absent | `company` | `FAIL` `unverified-upstream-origin` naming `pending_db_world` |
+| name is in the ref, bytes match | `upstream` | none — the ordinary `git pull` path |
+| name is in the ref modulo case, bytes match | `upstream` | `WARN` `upstream-ref-case-divergence` naming the ref path |
+| name is in the ref, bytes do not match | `company` | `FAIL` `unverified-upstream-content` naming `pending_db_world` |
+| ref resolved, name absent | `company` | `FAIL` `unverified-upstream-origin` naming `pending_db_world` |
 | git could not answer | `company` | `FAIL` `unverified-upstream-origin`, failing closed, naming `refreshCommand` |
+| ref does not resolve under `refs/remotes/` | `company` | `FAIL` `upstream-ref-not-remote` naming `refreshCommand` |
 | ref unset / not present locally | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
 
-A missing ref is deliberately a `WARN` and not a `FAIL`: refusing every clone that has not fetched
-is worse than the pre-PRO-248 status quo, and the report says which command restores the check.
-`verifiedRef` must name a **remote-tracking** ref — `git rev-parse --symbolic-full-name` is checked,
-and a local branch produces `WARN upstream-ref-not-remote`, because the person whose forged
-`--author` this rule exists to catch can rewrite a local branch.
+A ref that is simply missing is deliberately a `WARN` and not a `FAIL`: refusing every clone that
+has not fetched is worse than the pre-PRO-248 status quo, and the report names the command that
+restores the check. Every other answer the ref can give is a `FAIL`.
+
+`verifiedRef` is stored fully qualified, as `refs/remotes/origin/Playerbot`. A short
+`origin/Playerbot` is ambiguous: git expands `refs/heads/` before `refs/remotes/`, so a single
+`git branch origin/Playerbot HEAD` makes rev-parse, `ls-tree` and every object lookup answer for
+the shadow branch instead of the remote — and `git rev-parse --symbolic-full-name origin/Playerbot`
+then prints **nothing on stdout** (warning on stderr, error on stderr) while still exiting 0. The
+remote-tracking test is therefore "exit 0 **and** a name starting with `refs/remotes/`"; anything
+else is answered as *not remote-tracking* and refuses the boot, because the person whose forged
+`--author` this rule exists to catch can create exactly that shadow branch. `audit_policy_schema.py`
+exits 1 when `verifiedRef` is deleted, empty, or does not start with `refs/remotes/`, so the
+qualifier cannot be dropped silently.
+
+Content **is** consulted. The ref is listed with `git ls-tree -z -r` — NUL-delimited, so a genuine
+upstream filename like `2026_11_04_00_érfar.sql` is compared byte-for-byte instead of against git's
+quoted `"...\303\251rfar.sql"` — and each company-authored file under an `origin: "upstream"` tag is
+re-hashed with `git hash-object` against the blob id from that listing. A verified name whose bytes
+were replaced is company content (`unverified-upstream-content`), whether the rewrite was committed
+under a forged `--author` or left sitting dirty in the work tree. A case-only twin stays exempt but
+is named in a `WARN`, since it is usually the first sign of a rename that the updater will not
+recognise.
 
 Honest limit: an operator with write access to the object database can still
-`git update-ref refs/remotes/origin/Playerbot HEAD` and fake the third tag. That is a deliberate,
-loud, non-default act (a plain `git fetch --prune` undoes it, and it is exactly the kind of thing
-`git reflog refs/remotes/origin/Playerbot` shows a reviewer), where the author forge was a routine
-commit command. Content is not consulted for provenance: an upstream file that trips the reserved
-bands is still exempt, and the corpus `upstream` column records those 444 726 findings as review
-material, not boot failures.
+`git update-ref refs/remotes/origin/Playerbot HEAD` and fake the third tag, blob ids included. That
+is a deliberate, loud, non-default act — `git reflog refs/remotes/origin/Playerbot` shows it to a
+reviewer and the next real fetch moves the ref back — where the author forge was a routine commit
+command. It is also no wider a privilege than the ones already in the same file: whoever can
+`update-ref` can edit `preflight-policy.json` outright (`companyEmailDomains`,
+`includedDirs[].origin`, `reservedIdBands`), which is why the policy is pinned by
+`audit_policy_schema.py` and CI rather than by this check. An upstream file that trips the reserved
+bands stays exempt from check 4, and the corpus `upstream` column records those 444 726 findings as
+review material, not boot failures.
 
 So **check 4 covers company content only**, by design. `--strict-all` (policy on everything,
 warnings too) is not a usable boot-time setting: against this tree it fails ~754 of 861 upstream
@@ -183,21 +207,49 @@ understands. `liveDatabase` is read from the policy file, so `cross-schema-write
 against the schema the gate actually uses.
 
 A rule that reports 0 everywhere proves nothing until it has been seen to fire, so the provenance
-rule is falsified the same way — commit an out-of-band write into `updates/db_world` with a forged
-upstream `--author`, in a scratch work tree with a clean work tree, and sweep **without**
-`--strict-all`:
+rules are falsified the same way — forge the provenance in a scratch work tree, keep the work tree
+clean, and sweep **without** `--strict-all`:
 
 ```
-git worktree add --detach /tmp/poc HEAD            # copy the ops/preflight files under review in
+git worktree add --detach /tmp/poc HEAD
+cp ops/preflight/{preflight_worlddb.py,preflight-policy.json,corpus_sweep.py} \
+   /tmp/poc/ops/preflight/                                     # the engine under review
+cd /tmp/poc
 echo "INSERT INTO \`creature_template\` (\`entry\`,\`name\`) VALUES (1234,'x');" \
   > data/sql/updates/db_world/2026_11_05_99.sql
-git commit -qam add --author="Someone <x@azerothcore.org>"
-python3 ops/preflight/corpus_sweep.py --measure-only          # company column must become 1
+git add -- data/sql/updates/db_world/2026_11_05_99.sql          # `commit -a` never stages a new file
+git commit -q --author="Someone <x@azerothcore.org>" -m "add upstream creature_template row"
+python3 ops/preflight/corpus_sweep.py --measure-only            # company column must become non-zero
 ```
 
-At PRO-248 this went `findings=0 / under-write-policy=7` on the pre-PRO-248 engine to
-`reserved-band company=1 / under-write-policy=8` on the new one, and back to 0 once the file was
-put in the tracked ref — the two directions the rule has to get right.
+The `git add` is not decoration, and an earlier revision of this recipe omitted it: with the file
+left **untracked**, what moves the company column is the untracked/unknown-author path, not
+`unverified-upstream-origin`, so the number measures a different rule than the one under test.
+Staged and committed as written above, the same tree measures:
+
+| engine (crafted file present) | under-write-policy | company findings |
+| --- | --- | --- |
+| pre-PRO-248 (`2c4c8dbf9`) | 7 | none — the forged `--author` bought the exemption |
+| PRO-248 | 8 | `unverified-upstream-origin` 1, `reserved-band` 1 |
+| PRO-248, file returned to the ref | 7 | none |
+
+The 1234 is deliberately out of band, so a second rule fires too; with an in-band id the
+provenance rule is the *only* thing that fires, which is the case the rule exists for. The content
+half is falsified from the other direction — a file that genuinely is in the ref, with its bytes
+replaced (`git hash-object` against the ref's blob id):
+
+```
+T=$(git ls-files data/sql/updates/db_world | grep '\.sql$' | head -1)   # not head -1: .gitkeep
+printf '\nINSERT INTO `creature_template` (`entry`,`name`) VALUES (900200,"x");\n' >> "$T"
+git add -- "$T"; git commit -q --author="Someone <x@azerothcore.org>" -m "tighten defaults"
+python3 ops/preflight/corpus_sweep.py --measure-only   # unverified-upstream-content company=1
+```
+
+That rewrite registers the same single company finding whether it is committed under a forged
+author or left dirty in the work tree, and both return to 0 once the file is restored. Two traps in
+a detached work tree: `git reset --hard HEAD` does **not** undo the crafted commit (reset to the
+base commit), and that reset also reverts `ops/preflight/` — re-copy the engine files after it or
+you will sweep the engine you just replaced.
 
 ## Dry run (check 5)
 
