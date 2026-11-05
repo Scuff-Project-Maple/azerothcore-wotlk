@@ -25,6 +25,30 @@
 
   "writePolicyExemptOrigins": ["upstream"],
 
+  "upstreamProvenance": {
+    "verifiedRef": "origin/Playerbot",
+    "refreshCommand": "git fetch --prune origin Playerbot",
+    "_comment": [
+      "PRO-248 (PRO-179 review NB-E). The write-policy exemption for an origin:upstream",
+      "directory is a claim about history, and `git commit --author=\"Someone",
+      "<x@azerothcore.org>\" data/sql/updates/db_world/x.sql` is enough to make that",
+      "claim locally. So a new file in an upstream-tagged directory is only exempt when",
+      "it also exists in verifiedRef — the ref the tree is tracking. A forged --author",
+      "does not put the file in the ref; a `git pull` does.",
+      "verifiedRef must name a remote-tracking ref (refs/remotes/...): a local branch is",
+      "writable by the very person the rule constrains, and pointing it at HEAD would",
+      "make every file look upstream. It is read with local object database lookups only",
+      "— nothing here fetches, so an ordinary offline boot still resolves it.",
+      "States: verified -> exempt as before. unverified -> FAIL naming the pending",
+      "directory, because company content belongs in pending_db_world. indeterminate",
+      "(git could not answer) -> FAIL, failing closed, naming refreshCommand.",
+      "unchecked (ref not configured or not present locally) -> WARN naming",
+      "refreshCommand and the pre-PRO-248 dir+author exemption is kept: refusing every",
+      "clone that has never fetched is worse than the status quo, and the report says so.",
+      "Deleting this block is a governance change to a reviewed file, not a way to pass."
+    ]
+  },
+
   "forbiddenStatements": [
     "ALTER", "DROP", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
     "LOAD", "CALL", "LOCK", "UNLOCK", "HANDLER", "PREPARE", "DEALLOCATE",
