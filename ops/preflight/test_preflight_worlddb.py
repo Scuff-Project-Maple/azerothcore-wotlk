@@ -17,8 +17,8 @@ from argparse import Namespace
 from pathlib import Path
 
 from preflight_worlddb import (
-    MySQL, Preflight, Report, mask_sql, parse_statement, split_statements,
-    build_arg_parser,
+    MySQL, Preflight, REGION_NAME_STOPWORDS, Report, mask_sql, parse_statement,
+    split_statements, build_arg_parser, write_targets,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -943,6 +943,160 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual(POLICY["liveDatabase"], seen.get("live_db"),
                          "cross-schema-write was measured against a hard-coded schema")
+
+
+def targets_for(sql: str, known_names: set[str] | None = None) -> list[tuple[str | None, str]]:
+    """The write targets a rejected region names, for assertions on the name scan."""
+    text, offset = split_statements(sql)[0]
+    masked = mask_sql(text)
+    return write_targets(parse_statement(text, masked, offset), known_names)[0]
+
+
+class TestRev5RegionCoordinates(unittest.TestCase):
+    """PRO-179 rev-5 NB-1..NB-5: the name scan and the text it slices must agree.
+
+    NB-1 (a PARTITION clause blanked to a shorter string) and NB-2 (clause keywords
+    located in text that still contains backticked content) are one defect seen twice:
+    the fragment bounds `_region_tables()` works in have to be offsets into the same
+    text it slices. So the headline POC below is a single statement carrying both, and
+    it only passes if neither defect comes back. None of this can turn a passing file
+    into a failing one — `multi-table-write` is raised first — but a report that
+    invents a schema or blames a partition name sends a reviewer to the wrong table.
+    """
+
+    COMBINED_POC = ("DELETE `from`, `c` FROM `updates` PARTITION (p1,p2,p3) `from` "
+                    "JOIN `creature` `c` WHERE `from`.`hash` = 'x';")
+
+    def test_partition_blank_and_backticked_keyword_together(self):
+        # NB-1 + NB-2 in one statement: the PARTITION blank must not move the text
+        # under the offsets, and `from` must not be read as the FROM keyword.
+        self.assertEqual([(None, "updates"), (None, "creature")], targets_for(self.COMBINED_POC))
+        found = findings_for(self.COMBINED_POC)
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules, "`updates` was not named as a write target")
+        self.assertEqual([], [m for r, m in found if r == "table-not-allowed"],
+                          "partition names were blamed as write targets")
+        msg = next(m for r, m in found if r == "multi-table-write")
+        self.assertIn("before FROM", msg, "the delete-target list was not recognised as such")
+        # Every name in the table list is quoted, so the bare-scan label does not
+        # belong on it even though the partition names are in the noise list.
+        self.assertIn("tables named: creature, updates", msg)
+        self.assertNotIn("heuristic", msg)
+
+    def test_partition_clause_alone_keeps_the_ledger_in_the_table_position(self):
+        sql = ("DELETE `u`, `c` FROM `updates` PARTITION (p1,p2,p3) `u` JOIN `creature` `c` "
+               "WHERE `u`.`hash` = 'x';")
+        self.assertEqual([(None, "updates"), (None, "creature")], targets_for(sql))
+        self.assertIn("ledger-table", rules_for(sql))
+
+    def test_a_backticked_keyword_is_never_read_as_a_clause_keyword(self):
+        # NB-2 alone: with the bug the FROM landed on the delete target, so the
+        # statement was refused as a malformed single-table write instead.
+        found = findings_for("DELETE `from` FROM `updates` `from`;")
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules)
+        self.assertIn("before FROM", next(m for r, m in found if r == "multi-table-write"))
+        self.assertEqual([(None, "updates")], targets_for("DELETE `from` FROM `updates` `from`;"))
+
+    def test_a_bare_qualified_name_does_not_invent_a_schema(self):
+        # NB-3: `a.b.c` is three bare tokens to the scan. Believing the first half was
+        # a schema accused a file that never names a schema of writing outside it.
+        sql = "UPDATE a.b.c JOIN creature c SET c.guid = 1 WHERE c.guid = 2;"
+        rules = rules_for(sql)
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("table-not-allowed", rules, "the table the region names was not checked")
+        self.assertNotIn("cross-schema-write", rules)
+        msg = next(m for r, m in findings_for(sql) if r == "multi-table-write")
+        self.assertIn("tables named (heuristic — unquoted region)", msg)
+
+    def test_a_quoted_qualified_name_is_still_believed(self):
+        self.assertIn("cross-schema-write", rules_for(
+            "UPDATE `other`.`updates` u JOIN `creature` c SET u.hash = 'x' "
+            "WHERE c.guid = 9002020;"))
+
+    def test_a_policy_table_named_like_a_keyword_is_still_named(self):
+        # NB-4: the stopword list removes syntax noise where a bare name is expected,
+        # so a real table called `duplicate` used to disappear from the report. The
+        # caller hands the scan the policy and ledger names, which are never noise.
+        sql = "UPDATE duplicate JOIN creature c SET c.guid = 1 WHERE c.guid = 2;"
+        self.assertEqual([(None, "creature")], targets_for(sql))
+        self.assertEqual([(None, "duplicate"), (None, "creature")],
+                         targets_for(sql, {"duplicate"}))
+
+    def test_no_current_policy_table_collides_with_a_stopword(self):
+        # The escape hatch above should stay unused: a name collision is tolerable
+        # because it is handled, but it should not be invisible either.
+        names = {k.lower() for k in POLICY["baseTables"]} | {
+            k.lower() for k in POLICY["customTables"] if not k.startswith("_")}
+        self.assertEqual(set(), names & set(REGION_NAME_STOPWORDS),
+                         "a policy table spells a keyword; the region scan now depends on "
+                         "known_names to keep it visible")
+
+    def test_targets_come_back_in_order_of_first_appearance(self):
+        # NB-5: the docstring promises first-appearance order, and pre-FROM delete
+        # targets used to be appended after every FROM-list table.
+        self.assertEqual([(None, "creature"), (None, "updates")],
+                         targets_for("DELETE creature FROM updates u JOIN creature c;"))
+
+
+class TestRev5RegionScanImpliesRefusal(unittest.TestCase):
+    """PRO-179 rev-5 NB-6: the name scan exists only because multi-table writes are refused.
+
+    `_region_tables()` is the report text for a statement `_policy_multi_table()` has
+    already rejected — it is not a second way to pass, and it is never consulted for a
+    write the gate accepts. If a future change lets a multi-table write through while
+    still consulting the heuristic, that is a policy change and this test names it as
+    one instead of letting the path quietly acquire a second meaning.
+    """
+
+    REJECTED = [
+        "UPDATE `creature` c JOIN `updates` u SET u.hash = 'x' WHERE c.guid = 9002020;",
+        "UPDATE `creature` c, `creature_template` d SET c.npcflag = 3 WHERE c.guid = 9002020;",
+        "UPDATE (SELECT 1) SET `npcflag` = 3 WHERE `entry` = 900200;",
+        "UPDATE `creature_template` USE INDEX (PRIMARY) SET `npcflag` = 3 WHERE `entry` = 900200;",
+        "DELETE c, s FROM `creature` c JOIN `smart_scripts` s WHERE c.guid = 9002020;",
+        "DELETE updates, creature FROM updates u JOIN creature c;",
+        "DELETE `u`, `c` FROM `updates` `u` JOIN `creature` `c`;",
+        "DELETE `from`, `c` FROM `updates` PARTITION (p1,p2,p3) `from` JOIN `creature` `c` "
+        "WHERE `from`.`hash` = 'x';",
+        "UPDATE a.b.c JOIN creature c SET c.guid = 1 WHERE c.guid = 2;",
+        "UPDATE `acore_world`.`updates` `u` JOIN `creature` `c` SET u.hash = 'x' "
+        "WHERE c.guid = 9002020;",
+    ]
+    ACCEPTED = [
+        "UPDATE `creature_template` c SET c.npcflag = 3 WHERE c.entry = 900200;",
+        "UPDATE`smart_scripts` SET `action_param2` = 2 WHERE `source_type` = 0 AND `id` = 0 "
+        "AND `entryorguid` IN (9002020, 9002021);",
+        "DELETE FROM `creature` PARTITION (p1) WHERE `guid` = 9002020;",
+        "DELETE FROM `acore_world`.`creature_template` WHERE `entry` = 900200;",
+        "DELETE FROM `creature` WHERE `guid` = 9002020 ORDER BY `guid` LIMIT 1;",
+    ]
+
+    def test_the_heuristic_is_only_ever_reached_on_a_refusal(self):
+        import preflight_worlddb as pw
+        seen: list[str] = []
+        real = pw._region_tables
+
+        def spy(masked, lo, hi, from_end=None, known_names=None):
+            seen.append(masked[lo:hi])
+            return real(masked, lo, hi, from_end, known_names)
+
+        pw._region_tables = spy
+        try:
+            for sql in self.REJECTED:
+                seen.clear()
+                rules = rules_for(sql)
+                self.assertTrue(seen, f"{sql!r} was expected to consult the region scan")
+                self.assertIn("multi-table-write", rules,
+                              f"{sql!r} consulted the region scan but was never refused")
+            for sql in self.ACCEPTED:
+                seen.clear()
+                self.assertEqual([], rules_for(sql), f"{sql!r} should pass")
+                self.assertEqual([], seen, f"{sql!r} passed but consulted the region scan")
+        finally:
+            pw._region_tables = real
 
 
 if __name__ == "__main__":
