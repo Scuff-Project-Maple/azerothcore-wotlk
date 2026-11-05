@@ -68,6 +68,42 @@ unreadable history — are never exempt, and neither is an upstream file with **
 changes**: provenance is read from HEAD, so a hand edit in the work tree re claims the file for
 the policy (`dirty-worktree`) instead of letting the edit ride the exemption.
 
+### The third tag: the tracked upstream ref (PRO-248)
+
+Directory tag plus author tag is a claim about **history**, and history metadata is cheap to
+fabricate:
+
+```
+git commit --author="Someone <x@azerothcore.org>" data/sql/updates/db_world/2026_11_04_00.sql
+```
+
+That keeps the work tree clean and buys the exemption, which is how a company engineer can hand
+themselves a `warn` (`policy-exempt-origin`) instead of a check-4 review. So a **new** file (no row
+in `acore_world.updates`) sitting in an `origin: "upstream"` directory is exempt only when it also
+exists in the ref the tree is tracking — `upstreamProvenance.verifiedRef`, read with local object
+lookups only (`git ls-tree`), never a fetch:
+
+| ref answers | classification | finding |
+| --- | --- | --- |
+| file is in the ref | `upstream` | none — the ordinary `git pull` path |
+| ref resolved, file absent | `company` | `FAIL` `unverified-upstream-origin` naming `pending_db_world` |
+| git could not answer | `company` | `FAIL` `unverified-upstream-origin`, failing closed, naming `refreshCommand` |
+| ref unset / not present locally | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
+
+A missing ref is deliberately a `WARN` and not a `FAIL`: refusing every clone that has not fetched
+is worse than the pre-PRO-248 status quo, and the report says which command restores the check.
+`verifiedRef` must name a **remote-tracking** ref — `git rev-parse --symbolic-full-name` is checked,
+and a local branch produces `WARN upstream-ref-not-remote`, because the person whose forged
+`--author` this rule exists to catch can rewrite a local branch.
+
+Honest limit: an operator with write access to the object database can still
+`git update-ref refs/remotes/origin/Playerbot HEAD` and fake the third tag. That is a deliberate,
+loud, non-default act (a plain `git fetch --prune` undoes it, and it is exactly the kind of thing
+`git reflog refs/remotes/origin/Playerbot` shows a reviewer), where the author forge was a routine
+commit command. Content is not consulted for provenance: an upstream file that trips the reserved
+bands is still exempt, and the corpus `upstream` column records those 444 726 findings as review
+material, not boot failures.
+
 So **check 4 covers company content only**, by design. `--strict-all` (policy on everything,
 warnings too) is not a usable boot-time setting: against this tree it fails ~754 of 861 upstream
 files — 77094 reserved-band, 52967 table-not-allowed, 1666 band-not-literal, 1452 unbounded-write,
@@ -145,6 +181,23 @@ returns 0 regardless, which is what a baseline capture needs. The `upstream` col
 the gate exempts by default, and are measured with `--strict-all` to see how much syntax the engine
 understands. `liveDatabase` is read from the policy file, so `cross-schema-write` is measured
 against the schema the gate actually uses.
+
+A rule that reports 0 everywhere proves nothing until it has been seen to fire, so the provenance
+rule is falsified the same way — commit an out-of-band write into `updates/db_world` with a forged
+upstream `--author`, in a scratch work tree with a clean work tree, and sweep **without**
+`--strict-all`:
+
+```
+git worktree add --detach /tmp/poc HEAD            # copy the ops/preflight files under review in
+echo "INSERT INTO \`creature_template\` (\`entry\`,\`name\`) VALUES (1234,'x');" \
+  > data/sql/updates/db_world/2026_11_05_99.sql
+git commit -qam add --author="Someone <x@azerothcore.org>"
+python3 ops/preflight/corpus_sweep.py --measure-only          # company column must become 1
+```
+
+At PRO-248 this went `findings=0 / under-write-policy=7` on the pre-PRO-248 engine to
+`reserved-band company=1 / under-write-policy=8` on the new one, and back to 0 once the file was
+put in the tracked ref — the two directions the rule has to get right.
 
 ## Dry run (check 5)
 
