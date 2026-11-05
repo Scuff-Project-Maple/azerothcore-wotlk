@@ -71,11 +71,16 @@ This repo's `.gitignore` intentionally keeps provisioned content out of the
 git index: `/modules/*`, `/env/dist/*`, and `/*.override.yml` are all
 gitignored. Provisioned files therefore live in the **working tree** of this
 checkout; only the core-source changes (`worldserver.conf.dist`), this doc,
-the `scripts/compose-sync.sh` installer, and the `wrath-unbound/` snapshot are
+the `scripts/compose-sync.sh` and `scripts/lua-sync.sh` installers, and the
+`wrath-unbound/` snapshot are
 tracked in git. The two root compose overrides are **generated** copies of
 their `wrath-unbound/` snapshots and must not be hand-edited — see
 [Keep the compose overrides in sync](#keep-the-compose-overrides-in-sync-pre-boot-assertion)
-(PRO-180).
+(PRO-180). The ALE scripts under `env/dist/etc/modules/lua_scripts/` are
+likewise **generated** copies of their snapshots here and must not be
+hand-placed — see
+[Keep the ALE Lua scripts in sync](#keep-the-ale-lua-scripts-in-sync-pre-boot-assertion)
+(PRO-269).
 
 ```
 <repo root>  (= this checkout of azerothcore-wotlk @ 7f12e89e…)
@@ -96,10 +101,13 @@ their `wrath-unbound/` snapshots and must not be hand-edited — see
 ├── env/dist/etc/modules/
  │   ├── mod_ale.conf                      # ALE.Enabled = 1, ALE.ScriptPath = /azerothcore/env/dist/etc/modules/lua_scripts
  │   ├── mod_custom_classes.conf           # CustomClasses.Enabled = true (PRO-9)
- │   └── lua_scripts/unbound_mentor.lua    # The Mentor gossip Lua (loaded by ALE at worldserver start)
+ │   └── lua_scripts/                      # installed by scripts/lua-sync.sh from wrath-unbound/ (PRO-269) — never hand-placed
+ │       ├── unbound_mentor.lua            #   The Mentor gossip Lua (loaded by ALE at worldserver start)
+ │       └── ranger_vex_gossip.lua         #   Ranger Vex (900200) flavor gossip, T4 "The Murloc Tide" (PRO-269)
 ├── docker-compose.override.yml           # generated copy of wrath-unbound/docker-compose.override.yml (PRO-178)
 ├── docker-compose.loadtest.override.yml  # generated copy of wrath-unbound/docker-compose.loadtest.override.yml (PRO-180)
 ├── scripts/compose-sync.sh               # installs the two root copies; --check asserts no drift (PRO-180)
+├── scripts/lua-sync.sh                   # installs the ALE Lua scripts; --check asserts no drift and no hand-placed orphan (PRO-269)
 ├── src/server/apps/worldserver/worldserver.conf.dist   # modified: ValidateSkillLearnedBySpells = 0
 ├── docs/dev-environment.md               # this doc
 └── wrath-unbound/                        # tracked snapshot of the provisioned payload (reprovisioning source)
@@ -247,6 +255,44 @@ are not in the `pira` group, so a bare `scripts/compose-sync.sh` exits `1` on
 the first `cp`; prefix it with `sudo -u pira` (as above) or run from a `pira`
 shell. `--check` only reads and is safe as any user.
 
+### Keep the ALE Lua scripts in sync (pre-boot assertion)
+
+ALE loads every `*.lua` it finds in `ALE.ScriptPath`
+(`env/dist/etc/modules/lua_scripts`, gitignored via `/env/dist/*`), so a script
+that is only ever hand-placed there is invisible to git: it survives until
+something re-syncs or recreates that directory, and then the worldserver
+simply stops loading it. That is exactly how `ranger_vex_gossip.lua` (Ranger
+Vex `900200`, quests `900101`/`900102`) ended up live with no tracked copy
+behind it — [PRO-163](/PRO/issues/PRO-163) red flag **R6**, filed as
+[PRO-269](/PRO/issues/PRO-269). A lost script reads as a content regression in
+whatever change is under test, which is the misattribution the PRO-37 smoke
+pass must not make.
+
+Since PRO-269 the tracked snapshots under
+`wrath-unbound/env/dist/etc/modules/lua_scripts/` are the single source of
+truth and `scripts/lua-sync.sh` owns the deployed directory:
+
+```bash
+cd <repo root>
+scripts/lua-sync.sh --check        # read-only pre-boot assertion; any user
+sudo -u pira scripts/lua-sync.sh   # install: this WRITES — tree owner only
+```
+
+Run `--check` alongside `scripts/compose-sync.sh --check` before any
+`docker compose up`/`build`. Like compose-sync there is no allowlist: every
+tracked script must be byte-identical (`cmp`), and — the part compose-sync has
+no analogue for — a `*.lua` in the deployed directory that the snapshot does
+not have is reported as an **orphan** and also fails the check. That is the
+signal that would have caught PRO-269 at boot time. The installer never
+deletes an orphan: a hand-placed script is either committed into the snapshot
+directory (the normal case) or removed by hand, deliberately, because silently
+deleting a script a live worldserver depends on is the failure being prevented.
+
+Confirming the install actually took effect is a log check, not a file check
+(`ALE.BytecodeCache = true`): `docker logs ac-worldserver | grep UNBOUND` must
+show a load line per script, e.g.
+`[UNBOUND] ranger_vex_gossip.lua loaded: entry 900200, quests 900101/900102`.
+
 ### Load testing (randombot volume, PRO-33)
 
 The stack runs **50/50** randombots in normal operation
@@ -259,6 +305,7 @@ the root copy is generated). It is **not** merged by a plain
 ```bash
 cd <repo root>
 scripts/compose-sync.sh --check
+scripts/lua-sync.sh --check
 COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
   bash ops/deploy/worldserver-up.sh --force-recreate
 # back to the 50-bot default:
@@ -460,7 +507,7 @@ doc:
 | Core | branch `Playerbot` @ fork head (in-tree core hook patches committed: `f5b197b8d` unbound, `b732dfd71` custom-classes) |
 | Git remotes | `origin` → `https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git` (the previous base-repo remote was replaced) |
 | Modules | plain source trees staged from the pinned/fork-snapshot sources: `mod-ale` @ `1cb86c960026`, `mod-playerbots` @ `7bae1b5c58c7`, `mod-unbound` + `mod-custom-classes` from the tracked `wrath-unbound/` snapshot, plus host-only `mod-arac` (kept) |
-| Conf | `env/dist/etc/modules/mod_ale.conf`, `mod_custom_classes.conf`, `lua_scripts/unbound_mentor.lua` in place; live `worldserver.conf` untouched |
+| Conf | `env/dist/etc/modules/mod_ale.conf`, `mod_custom_classes.conf` in place; `lua_scripts/unbound_mentor.lua` + `lua_scripts/ranger_vex_gossip.lua` installed by `scripts/lua-sync.sh` from the tracked snapshot (PRO-269 — never hand-placed); live `worldserver.conf` untouched |
 | Running binary | `AzerothCore rev. 34d6f4b0e8c7+ (Playerbot branch)`, built 2026-10-25 21:12 from this tree (the `+` marks untracked content in the tree at build time). Earlier verified run: `fd6df4549+` (2026-10-19) |
 
 Before the resync, safety artifacts were written to
@@ -553,7 +600,10 @@ Healthy boot shows unbound-class log lines **including the marker**:
 [UNBOUND] Prereq map built.
 ```
 
-plus ALE loading lines for `unbound_mentor.lua`. If **no** ALE lines appear
+plus ALE loading lines for every installed script — `unbound_mentor.lua` and
+`ranger_vex_gossip.lua` (PRO-269; a missing `ranger_vex_gossip.lua` line means
+the deployed directory drifted from the snapshot, so run
+`scripts/lua-sync.sh --check`). If **no** ALE lines appear
 at all, prove mod-ale is compiled in before debugging further:
 
 ```bash
@@ -683,10 +733,12 @@ git -C modules/mod-ale checkout 1cb86c9600260c3731c96dc3c98d25b4fc3f2153
 # snapshot (see wrath-unbound/README.md for the mapping)
 cp -r wrath-unbound/modules/mod-unbound modules/
 cp -r wrath-unbound/modules/mod-custom-classes modules/
-mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
-cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
+# ALE Lua is installed by the installer, never hand-placed (PRO-269): it copies
+# every tracked script into env/dist/etc/modules/lua_scripts/ and --check
+# fails on drift or on a hand-placed orphan
+scripts/lua-sync.sh
 # installs both generated root overrides. On a fresh clone the tree is owned
 # by you, so no sudo is needed; on the existing build-host checkout (owned by
 # pira:pira, and agent logins are not in that group) use
@@ -874,6 +926,17 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   below) — and run
   `scripts/compose-sync.sh --check` before any `up`/`build`. Hand-editing the
   root copies is what produced the PRO-33/PRO-65/PRO-178 drift.
+- **ALE Lua is installed, not hand-placed (PRO-269):** the gitignored
+  `env/dist/etc/modules/lua_scripts/` is installed by `scripts/lua-sync.sh`
+  from `wrath-unbound/env/dist/etc/modules/lua_scripts/`. Add new Lua to the
+  snapshot, run `sudo -u pira scripts/lua-sync.sh` on the build host, and run
+  `scripts/lua-sync.sh --check` before any `up`/`build`. Never `scp` a script
+  straight into the deployed directory: `ranger_vex_gossip.lua` lived there
+  untracked that way (PRO-163 red flag R6) and would have silently disappeared
+  on the next sync or `--force-recreate`, which QA would have misread as a
+  content regression. The check also fails on a deployed `*.lua` the snapshot
+  does not have; the installer never deletes such an orphan — commit it or
+  remove it deliberately.
 - This fork's `AGENTS.md`: SQL outside `data/sql/updates/pending_db_*/` is
   immutable; module work lives under `modules/`; C++ is 4-space, no tabs,
   LF, ≤120 cols.
