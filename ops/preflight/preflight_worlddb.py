@@ -152,10 +152,17 @@ class MySQL:
     # -- execution ----------------------------------------------------------- #
 
     def _run(self, argv, stdin: bytes | None = None, timeout: int | None = None):
+        # `input=None` must not leave the child on the gate's own stdin: check [0] runs
+        # `docker compose exec -T ac-database mysql ...`, and with no terminal that
+        # mysql inherits the gate's stdin and drains it. A caller piped into
+        # `ssh host 'bash -s'` then loses the rest of its own script after the first
+        # DB check — it prints a marker and silently stops (PRO-307 A4). DEVNULL is the
+        # only honest "no stdin" here, and `input` and `stdin` cannot both be passed.
+        feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
         try:
             proc = subprocess.run(
-                argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout or self.timeout, cwd=str(self.compose_root),
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout or self.timeout, cwd=str(self.compose_root), **feed,
             )
         except FileNotFoundError as exc:
             raise OperationalError(f"cannot execute {argv[0]}: {exc}") from exc
@@ -1285,6 +1292,48 @@ class Preflight:
     def _reflog_present(self, refname: str) -> bool:
         return bool(self._reflog_path(refname))
 
+    # One line per ref a fetch actually brought down: `<sha>\t\tbranch 'Playerbot' of
+    # <url>`. A fetch that never reached its remote writes no such line — measured on
+    # git 2.43.0 with GIT_ALLOW_PROTOCOL=none it exits 128 and leaves FETCH_HEAD at
+    # 0 bytes (sha256 e3b0c44298fc…, the empty-string digest), so `Path.exists()` on
+    # that file is not evidence that anything was fetched (PRO-307 A1).
+    FETCH_HEAD_ENTRY_RE = re.compile(r"^([0-9a-fA-F]{7,64})(?:\s|$)")
+
+    def _fetch_head_evidence(self) -> tuple[bool, str]:
+        """Did a fetch leave anything readable in FETCH_HEAD? (bool, detail) — local only.
+
+        An absent, 0-byte or whitespace-only FETCH_HEAD answers "no". That is the shape
+        a *failed* fetch leaves behind, and counting mere existence as fetch evidence
+        turned a bootable clone into a refusal whose recovery text blamed the operator
+        for a deletion they had not made (PRO-307 A1). Content that names no fetched
+        object is still not empty, so it stays evidence — the gate must not hand the
+        exemption back just because a file holds something unexpected — but it is
+        reported as what it is, never as a fetch this gate observed.
+        """
+        rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
+        if rc != 0 or not fp.strip():
+            return False, ""
+        declared = fp.strip()
+        p = Path(declared)
+        if not p.is_absolute():
+            p = self.git_root / p
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            return False, ""
+        if not raw.strip():
+            return False, ""
+        lines = [ln for ln in raw.decode("utf-8", "replace").splitlines()
+                 if ln.strip()]
+        entries = [ln for ln in lines if self.FETCH_HEAD_ENTRY_RE.match(ln)]
+        if entries:
+            first = self.FETCH_HEAD_ENTRY_RE.match(entries[0]).group(1)
+            return True, (f"{declared} lists {len(entries)} fetched ref(s), the first at "
+                          f"{first[:12]}, so a fetch completed in this clone")
+        return True, (f"{declared} holds {len(raw)} byte(s) that do not parse as fetched-ref "
+                      f"lines, which is more than a failed fetch leaves but is not a fetch "
+                      f"this gate can read")
+
     # -- durable last-verified attestation (PRO-300) ---------------------------- #
 
     # Where a satisfied gate leaves its proof. `missing_ref_evidence()` reads files a
@@ -1632,7 +1681,10 @@ class Preflight:
           deletes it again, so on its own it only catches a ref removed some other
           way (a loose-ref `rm`, a rename). It is the signal the review named, so it
           is checked; it is not sufficient, which is why the other two are here.
-        - `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not.
+        - `FETCH_HEAD`, but only what a fetch actually **wrote**. `git fetch` opens the
+          file before it has anything to record, so a fetch that fails on transport
+          leaves it present and empty; existence alone is not evidence and a 0-byte or
+          whitespace-only file counts as none (PRO-307 A1).
         - any sibling ref under the same `refs/remotes/<remote>/` namespace other
           than `<remote>/HEAD` that carries **its own reflog**. The reflog is the
           point: `git clone` populates `refs/remotes/<remote>/*` itself, so a sibling
@@ -1641,12 +1693,17 @@ class Preflight:
           refused a boot to an untouched clone (PRO-291 review B1).
 
         A genuinely never-fetched clone has none of the three and keeps its `WARN`.
+        FETCH_HEAD is also not monotone: a good fetch writes it and one later failed
+        fetch truncates it back to 0 bytes, erasing that signal on its own. That is
+        why it is one of three probes rather than the answer, and why the durable
+        attestation below exists.
 
         `certainty` says how far the evidence actually reaches: 'held' when this
         clone holds `ref`'s own reflog, which is a record of *this* ref having been
         here; 'fetched' when the strongest signal is someone else's — a FETCH_HEAD
-        or a sibling reflog — which proves the clone has fetched but not that the
-        configured ref ever arrived. Callers must not assert a deletion on 'fetched'.
+        that names fetched refs, or a sibling reflog — which proves the clone has
+        fetch history but not that the configured ref ever arrived. Callers must not
+        assert a deletion on 'fetched'.
         """
         found: list[str] = []
         certainty = ""
@@ -1654,13 +1711,9 @@ class Preflight:
         if own:
             found.append(f"its reflog ({own}) is still in this clone")
             certainty = "held"
-        rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
-        if rc == 0 and fp.strip():
-            fhp = Path(fp.strip())
-            if not fhp.is_absolute():
-                fhp = self.git_root / fhp
-            if fhp.exists():
-                found.append(f"{fp.strip()} is here, so this clone has fetched")
+        fetch_head, fh_detail = self._fetch_head_evidence()
+        if fetch_head:
+            found.append(fh_detail)
         if ref.startswith("refs/remotes/"):
             remote = ref[len("refs/remotes/"):].partition("/")[0]
             ns = f"refs/remotes/{remote}/"
@@ -1952,7 +2005,8 @@ class Preflight:
                            f"attests that an earlier run of this gate verified it at "
                            f"{(up.get('attestedOid') or '')[:12]} on "
                            f"{up.get('attestedWhen')}, while this clone holds no reflog, "
-                           f"no FETCH_HEAD and no sibling reflog either. A clone that "
+                           f"no FETCH_HEAD that names a fetched ref and no sibling reflog "
+                           f"either. A clone that "
                            f"has genuinely never fetched has no attestation to lose, so "
                            f"this is a stripped one")
                 if self.allow_missing_upstream_ref():
@@ -2163,9 +2217,13 @@ class Preflight:
                 evidence = "a ref that this clone demonstrably had and no longer does " \
                            "is not that"
             else:
-                evidence = "this clone has fetched, so the ref either arrived and was " \
-                           "deleted or never existed here, and the gate will not grant " \
-                           "the exemption on the difference"
+                # PRO-307 A1: the strongest signal here may be a FETCH_HEAD that only
+                # proves somebody fetched, which is not the same as this ref having
+                # arrived. The refusal stays fail-closed; the sentence stops claiming
+                # a fetch it did not observe.
+                evidence = "this clone has fetch history, so the ref either arrived and " \
+                           "was deleted or never existed here, and the gate will not " \
+                           "grant the exemption on the difference"
             bad("upstream-ref-deleted",
                 f"{f['rel']} is new in the upstream-tagged directory "
                 f"{db_path} and the upstream exemption was about to be "
@@ -3531,7 +3589,10 @@ def render(report: Report, args) -> str:
     out = []
     out.append("PRO-179 world-DB updater pre-flight")
     out.append(f"  compose root : {args.compose_root}")
-    out.append(f"  sql root     : {report.data.get('sql_root','')}")
+    out.append(f"  sql root     : {report.data.get('sql_root','')} "
+               f"(what check 0b compares to the container's sql bind)")
+    out.append(f"  scanned from : {report.data.get('scanned_from','')} "
+               f"(the $-relative updates_include paths the scan walked resolve here)")
     out.append(f"  live database: {args.live_db} (read-only)")
     out.append(f"  scratch      : {args.scratch_db} (dropped after the run)")
     out.append("")
@@ -3562,8 +3623,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compose-root", default=os.environ.get("COMPOSE_ROOT", "/mnt/data/wow-server"))
-    ap.add_argument("--sql-root", default=None)
-    ap.add_argument("--git-root", default=None)
+    ap.add_argument("--sql-root", default=None,
+                    help="the directory the boot-path mount check (check 0b) compares against "
+                         "the container's /azerothcore/data/sql bind, and the base the report "
+                         "prints as \"sql root\". It does NOT choose which files are scanned: "
+                         "the scan walks the `updates_include` paths from the live database, "
+                         "and those $-relative paths resolve against --git-root. Pointing "
+                         "--sql-root somewhere else while --git-root names another tree prints "
+                         "a banner for a tree the gate never walked (PRO-307 A3). Defaults to "
+                         "<compose-root>/data/sql.")
+    ap.add_argument("--git-root", default=None,
+                    help="the tracked tree the gate reads: git runs here, and the $-relative "
+                         "`updates_include` paths the file scan walks are resolved against it "
+                         "($/data/sql/db_world -> <git-root>/data/sql/db_world). This is what "
+                         "decides which files the gate actually looked at. Defaults to "
+                         "<compose-root>.")
     ap.add_argument("--policy", default=str(here / "preflight-policy.json"))
     ap.add_argument("--live-db", default=None)
     ap.add_argument("--scratch-db", default=None,
@@ -3617,7 +3691,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="same as --strict-all but keeps the origin note")
     ap.add_argument("--clean-dead-ref-max-count", type=int, default=3)
     ap.add_argument("--max-dead-list", type=int, default=20)
-    ap.add_argument("--json", dest="json_out", default=None)
+    ap.add_argument("--json", dest="json_out", default=None,
+                    help="write the machine-readable report to this path; the parent "
+                         "directory must already exist (PRO-307 A5)")
     ap.add_argument("--json-only", action="store_true")
     return ap
 
@@ -3636,6 +3712,17 @@ def main(argv=None) -> int:
     if args.scratch_db is None:
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.scratch_db = f"{SCRATCH_PREFIX}_{os.getpid()}_{stamp}"
+    # Fail before the run rather than after it: a `--json` path under a directory that
+    # does not exist used to raise a raw traceback at the last line of main(), after a
+    # gate that had already done all of its work (PRO-307 A5). It still exits non-zero;
+    # this only makes the answer an operational error instead of a stack trace.
+    if args.json_out:
+        parent = Path(args.json_out).parent
+        if not parent.is_dir():
+            print(f"preflight: operational error: --json path {args.json_out} has no "
+                  f"parent directory {parent}; create it or name a path that exists",
+                  file=sys.stderr)
+            return EXIT_ERROR
 
     report = Report()
     report.data["started"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -3643,6 +3730,10 @@ def main(argv=None) -> int:
     try:
         pf = Preflight(args, policy, report)
         report.data["sql_root"] = str(pf.sql_root)
+        # The banner has to say which tree the walk was rooted in, not only which one
+        # `--sql-root` was pointed at — those are different directories and only one of
+        # them decides what the gate read (PRO-307 A3).
+        report.data["scanned_from"] = str(pf.git_root)
         rc = pf.run()
     except OperationalError as exc:
         print(f"preflight: operational error: {exc}", file=sys.stderr)
@@ -3659,7 +3750,12 @@ def main(argv=None) -> int:
             "sections": report.sections,
             "findings": [f.__dict__ for f in report.findings],
         }
-        Path(args.json_out).write_text(json.dumps(payload, indent=2, sort_keys=True))
+        try:
+            Path(args.json_out).write_text(json.dumps(payload, indent=2, sort_keys=True))
+        except OSError as exc:
+            print(f"preflight: operational error: cannot write --json path "
+                  f"{args.json_out}: {exc}", file=sys.stderr)
+            return EXIT_ERROR
     return rc
 
 
