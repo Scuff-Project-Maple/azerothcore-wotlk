@@ -226,11 +226,11 @@ VALUES
  '[{"talent_tree": 7, "role": "damage", "spell_whitelist": []}]',
  '{"spells": [36, 1752, 1766], "items": [1260, 5002], "action_bar": [1, 2, 3, 17, 18, 19]}',
  18,
-  2,
-  3,
-  4096,
-  1,
-  'Fictional example row for the contract doc. Tree 7 = Rogue Assassination.');
+ 2,
+ 3,
+ 4096,
+ 1,
+ 'Fictional example row for the contract doc. Tree 7 = Rogue Assassination.');
 ```
 
 Notes:
@@ -309,9 +309,10 @@ example: a new class = one row like the one below, chosen from the fields in
 
 The zero-C++ claim is re-checked against `origin/Playerbot` rather than
 asserted from memory. The load-bearing check is
-`git grep -nE "OnPlayerOnline|OnPlayerAfterUpdateAllStats|OnPlayerLfgSetRoles|GetUnboundClassMask" src/`,
-which returns exactly the **twelve** files the two generic core patches
-install — all class-agnostic:
+`git grep -lE "OnPlayerOnline|OnPlayerAfterUpdateAllStats|OnPlayerLfgSetRoles|GetUnboundClassMask" src/`,
+which lists exactly the **twelve** files the two generic core patches install
+(`-n` instead of `-l` gives 22 matching lines over the same twelve) — all
+class-agnostic:
 
 - `wrath-unbound/modules/mod-unbound/unbound-core-access.patch` → **six**
   files holding the generic `Player::GetUnboundClassMask()` accessor and its
@@ -333,10 +334,13 @@ copies staged under `modules/`). None of the added lines branch on a class:
 hooks are class-agnostic plumbing. `git grep -i customclass src/` is empty,
 but that check only proves an absence of *naming* — none of the hook
 additions contain the token `customclass`, so it stays empty whether or not
-`custom-class-core-access.patch` is applied; the grep above is the one that
-measures the claim. Every other core-source commit since the pinned Playerbot
-base is conf-only or DB/subsystem work with no class branching (PRO-32 async
-DB-pool hardening, the PRO-9/PRO-57 `worldserver.conf.dist` edits, and the
+`custom-class-core-access.patch` is applied. The grep above is the check that
+measures the claim, and it measures it in one direction: it pins where those
+four tokens live and what the added lines do. That the *rest* of core adds no
+class branching is a commit-history claim, not a grep result — every other
+core-source commit since the pinned Playerbot base is conf-only or
+DB/subsystem work with no class branching (PRO-32 async DB-pool hardening, the
+PRO-9/PRO-57 `worldserver.conf.dist` edits, and the
 `ValidateSkillLearnedBySpells = 0` conf change §12 relies on for the 1515
 cross-class grant). Nothing in `Player` branches on a custom class.
 
