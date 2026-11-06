@@ -2193,6 +2193,22 @@ class TestTheCiWorkflowMatchesItsDocumentation(unittest.TestCase):
             self.assertIn(self.flat(command), self.flat(self.yaml),
                           "README promises `%s` and no workflow step runs it" % command)
 
+    def test_the_verdict_table_rows_are_run_lines_not_prose(self):
+        # The check above matches against the whole file, comments included, because the
+        # prose legitimately quotes the local form of a command. That is too weak for the
+        # table, which is the thing that claims a step runs it: every command in a table
+        # row has to survive comment stripping, so a comment can never satisfy a promise
+        # the table makes (PRO-295 review N3).
+        rows = [line for line in self.in_ci.splitlines() if line.strip().startswith("|")]
+        promised = [c for row in rows
+                    for c in re.findall(r"`(python3 ops/preflight/[^`]+)`", row)]
+        self.assertEqual(4, len(promised),
+                         "the In CI table no longer lists the four steps, so the verdict "
+                         "column is describing something other than this workflow")
+        for command in promised:
+            self.assertIn(self.flat(command), self.flat(self.code),
+                          "the table promises `%s` and no run line contains it" % command)
+
     def test_the_check_cannot_be_retired_by_a_repository_guard(self):
         # sql-codestyle.yml is the cautionary tale: it only runs on azerothcore/azerothcore-wotlk,
         # so on this fork the check does not fail, it simply stops existing.

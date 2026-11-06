@@ -10,6 +10,14 @@ name: World DB pre-flight
 # ("In CI"). In one line: findings in the `company` provenance column fail the check,
 # the `upstream` columns are measured and reported and never fail it, and a run whose
 # provenance could not be attributed fails rather than passing quietly.
+#
+# Do not mark either job as a required status check on this repo. Both triggers are
+# `paths:`-filtered, so a PR that touches neither `ops/preflight/**` nor `data/sql/**`
+# never starts a run, and a required check that never starts is "Expected — waiting"
+# forever: every ordinary PR would be unable to merge (PRO-295 review N2). The check is
+# meant to be read, and it is a real gate because a violating PR cannot hide the red.
+# If a branch-protection rule is ever wanted, it goes on a branch that only ever carries
+# in-scope changes, or this filter moves to `paths-ignore` of the unrelated trees.
 
 on:
   pull_request:
@@ -22,11 +30,23 @@ on:
       - ops/preflight/**
       - data/sql/**
       - .github/workflows/worlddb-preflight.yml
+  push:
+    # The same sweep on the branch itself (PRO-295 review N1). A merge that lands on
+    # Playerbot through a path that never opened a PR — a direct push, a rebase-and-merge
+    # of a stale head, a revert — otherwise carries the engine change with no sweep at
+    # all, which is precisely the state PRO-285 was written to end.
+    branches:
+      - Playerbot
+    paths:
+      - ops/preflight/**
+      - data/sql/**
+      - .github/workflows/worlddb-preflight.yml
   workflow_dispatch: {}
 
 concurrency:
   # New commits on a PR cancel the still-running check on the old commit. github.ref
-  # is refs/pull/<N>/merge, so the group is stable per PR.
+  # is refs/pull/<N>/merge for a PR and refs/heads/<branch> for a push, so the group is
+  # stable per PR, and a push to Playerbot never shares a group with a PR run.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 

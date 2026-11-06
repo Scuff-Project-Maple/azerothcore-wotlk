@@ -303,8 +303,13 @@ you will sweep the engine you just replaced.
 ### In CI (`.github/workflows/worlddb-preflight.yml`)
 
 The sweep is wired up (PRO-285). On a pull request touching `ops/preflight/**` or `data/sql/**`,
-two jobs run. Both are pure Python against the checkout: **no MySQL, no Docker, no deploy host**,
-and nothing in either job shells out to a database.
+and on a push to `Playerbot` touching the same paths (PRO-295 review N1 — a merge that never opened
+a PR otherwise lands an engine change with no sweep), two jobs run. Both are pure Python against the
+checkout: **no MySQL, no Docker, no deploy host**, and nothing in either job shells out to a database.
+
+Neither job is a required status check, and neither should be made one (PRO-295 review N2). Both
+triggers are `paths:`-filtered, so a PR outside that scope starts no run at all, and a required check
+that never starts sits at "Expected — waiting" forever. Read the check; do not gate a branch on it.
 
 | Step | Command | Verdict |
 | --- | --- | --- |
@@ -313,12 +318,33 @@ and nothing in either job shells out to a database.
 | corpus sweep | `python3 ops/preflight/corpus_sweep.py --strict-all --out "$RUNNER_TEMP/corpus-sweep.json"` | gates on the `company` column |
 | provenance guard | `python3 ops/preflight/ci_provenance_guard.py "$RUNNER_TEMP/corpus-sweep.json"` | gates |
 
+Measured on the runner and on a 6-core box, so the wait is predictable rather than mysterious:
+the engine tests are ~2 s and the schema audit ~4 s, the sweep is **4 min 14 s on the runner**
+(4 min 33 s locally, both with the default 8 workers) and the guard under a second — the whole
+workflow is 5–6 minutes, and `timeout-minutes: 30` on the sweep job is that measurement with room,
+not a guess. The sweep's cost is the per-file `git log -1 -- <path>` author lookups, which is also
+why it is the step that gets a full checkout.
+
+What a trustworthy tally for this tree looks like, from the head of the branch that added this
+section — compare a CI tally against it before reading a green:
+
+```
+head=6582d07fe files=3060 under-policy=3060 statements=131625 findings=444726
+provenance[company=7 upstream=3053 unknown=0] companyFindings=0 rowsListed=0
+history[commits=20276 shallow=False authors=8]
+region-scan consultations=1 multi-table-write=1 unmatched=0
+```
+
 Read the verdict column literally.
 
 - **gates** means the check is red when the command fails, and the commands are the ones above,
   verbatim, un-wrapped. Reproduce a failure locally by checking out the PR head and running the
   same line; the log names the rule per finding (`data/sql/updates/pending_db_world/x.sql:12:
-  table-not-allowed: ...`).
+  table-not-allowed: ...`). One substitution is needed: `$RUNNER_TEMP` is set by Actions and is
+  unset in a shell, so locally write the tally somewhere that exists —
+  `python3 ops/preflight/corpus_sweep.py --strict-all --out /tmp/corpus-sweep.json` — and pass that
+  path to the guard. An unusable `--out` (or a missing `--diff` baseline) is now refused at startup
+  with exit 2 instead of after ~4.5 minutes of `git log` (PRO-295 review N3).
 - The `upstream` columns **report only**. This tree measures ~444 700 upstream findings and always
   will; a number moving there is information for the reviewer, not a merge failure. That is the same
   decision the boot gate makes about upstream content, written down instead of left to whoever reads
@@ -334,7 +360,16 @@ Read the verdict column literally.
   and all 444 726 move to `upstream` and the column the check gates on reads **0**. So the sweep
   records `shallow`, `commits` and `authors` in its tally and the guard refuses a shallow repo, a
   one-commit history, one distinct author across thousands of files, or a corpus with no upstream
-  files at all. The sweep job also checks out with `fetch-depth: 0`; the guard is the net, not the
+  files at all. The same question is asked of the column that is actually gated: a tally in which
+  **no scanned file is company-attributed** is refused too, because `company=0` is what that column
+  reports whether the rules are satisfied or the company directories were never in the sweep (delete
+  `pending_db_world` from `includedDirs`, or check out a tree without it, and the check goes green on
+  an empty verdict — PRO-295 review B1). And it refuses a tally that measured nothing: `statements=0`,
+  `findings=0`, no rule in `byRule`, or no `companyFindingList` to check the gated count against, each
+  on a corpus of thousands of files. Those four are the shapes a dead engine leaves behind — an
+  emptied `forbiddenStatements`, a rule registry that failed to load — and a green from a check that
+  ran but parsed nothing must not look like a green from a clean corpus (PRO-295 review B2). The
+  sweep job also checks out with `fetch-depth: 0`; the guard is the net, not the
   fix.
 - The guard runs **after a red sweep too** (`if: ${{ !cancelled() }}`), because a provenance
   collapse and a genuine policy violation look identical in the log: both print a `company` column
