@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 from argparse import Namespace
@@ -942,6 +943,62 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         code, text = self._sweep(self.RESULT_DIRTY, ["--measure-only"])
         self.assertEqual(0, code)
         self.assertIn("COMPANY findings", text)
+
+    def _sweep_with_spy(self, tmp_argv):
+        """Run cs.main() with the corpus stubbed out, and say whether it was reached."""
+        import corpus_sweep as cs
+        swept = []
+        saved = cs.build_files, cs.tally
+
+        def build(engine, policy, workers):
+            swept.append(1)
+            return []
+
+        cs.build_files = build
+        cs.tally = lambda engine, files: dict(self.RESULT_CLEAN)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                self._give_it_a_tree(tmp)
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = cs.main(["--compose-root", tmp, *tmp_argv])
+        finally:
+            cs.build_files, cs.tally = saved
+        return code, out.getvalue(), err.getvalue(), swept
+
+    def test_an_unusable_out_path_is_refused_before_the_sweep_runs(self):
+        # PRO-295 review N3. The In CI row quotes `$RUNNER_TEMP/corpus-sweep.json`, and
+        # that variable exists only on a runner; locally it expands to a path at the
+        # filesystem root. The tally was written at the very end of main(), so the
+        # reviewer reproducing a red check paid for every `git log` first and then died
+        # on an OSError ~4.5 minutes in.
+        code, _, err, swept = self._sweep_with_spy(
+            ["--out", "/no-such-dir-here/corpus-sweep.json"])
+        self.assertEqual(2, code)
+        self.assertEqual([], swept, "the corpus was swept before discovering there was "
+                                    "nowhere to write the tally")
+        self.assertIn("--out", err)
+        self.assertIn("/tmp/corpus-sweep.json", err,
+                      "the refusal must name a path that works locally")
+
+    def test_a_missing_diff_baseline_is_refused_before_the_sweep_runs(self):
+        code, _, err, swept = self._sweep_with_spy(
+            ["--diff", "/no-such-dir-here/before.json"])
+        self.assertEqual(2, code)
+        self.assertEqual([], swept, "the diff is compared after the whole corpus, so a "
+                                    "missing baseline has to be caught first")
+        self.assertIn("--diff", err)
+
+    def test_a_usable_out_path_still_writes_the_tally(self):
+        # Positive control: the startup check must not become an unconditional refusal.
+        import corpus_sweep as cs
+        with tempfile.TemporaryDirectory() as tmp:
+            self._give_it_a_tree(tmp)
+            target = Path(tmp) / "corpus-sweep.json"
+            code, _, err, _ = self._sweep_with_spy(["--out", str(target)])
+            self.assertEqual(0, code, err)
+            self.assertTrue(target.is_file(), "--out stopped writing the tally")
+            self.assertEqual(3, json.loads(target.read_text())["files"])
 
     def test_diff_measures_the_company_column_not_just_the_totals(self):
         _, text = self._sweep(self.RESULT_DIRTY, [])
@@ -2343,6 +2400,513 @@ class TestRev5RegionScanImpliesRefusal(unittest.TestCase):
                 self.assertEqual([], seen, f"{sql!r} passed but consulted the region scan")
         finally:
             pw._region_tables = real
+
+class TestCorpusSweepNamesTheOffendingCompanyFile(unittest.TestCase):
+    """PRO-285: the CI check fails on the company column, so it has to name it."""
+
+    class StubEngine:
+        def __init__(self, violations):
+            self.violations = violations
+            self.policy_stats = {"files": 2, "statements": 4}
+
+        def check_policy(self, files):
+            pass
+
+    def _tally(self):
+        import corpus_sweep as cs
+        files = [
+            {"rel": "pending.sql", "origin": "company", "author": "scuff@paperclip.local",
+             "dir": {"db_path": "$/pending"}},
+            {"rel": "archive.sql", "origin": "upstream", "author": "someone@azerothcore.org",
+             "dir": {"db_path": "$/archive"}},
+        ]
+        violations = [
+            {"file": "pending.sql", "line": 7, "rule": "table-not-allowed",
+             "detail": "writes `updates`"},
+            {"file": "archive.sql", "line": 3, "rule": "reserved-band",
+             "detail": "entry 1234 below the band"},
+        ]
+        return cs.tally(self.StubEngine(violations), files)
+
+    def test_tally_records_the_company_rows_and_the_provenance_file_counts(self):
+        result = self._tally()
+        self.assertEqual([{"file": "pending.sql", "line": 7, "rule": "table-not-allowed",
+                           "detail": "writes `updates`"}], result["companyFindingList"],
+                         "the upstream finding leaked into the company list")
+        self.assertEqual({"company": 1, "upstream": 1}, result["provenanceFiles"])
+
+    def test_the_written_row_list_is_capped_and_says_so(self):
+        # A shallow checkout once wrote a 120 MB tally by listing all 444 726 company
+        # rows; the guard reads counts, so the JSON carries a cap and a flag.
+        import corpus_sweep as cs
+        violations = [{"file": "pending.sql", "line": i, "rule": "reserved-band",
+                       "detail": "below the band"}
+                      for i in range(cs.COMPANY_JSON_LIMIT + 5)]
+        result = cs.tally(self.StubEngine(violations), [
+            {"rel": "pending.sql", "origin": "company", "author": "scuff@paperclip.local",
+             "dir": {"db_path": "$/pending"}}])
+        self.assertEqual(cs.COMPANY_JSON_LIMIT, len(result["companyFindingList"]))
+        self.assertTrue(result["companyFindingListTruncated"],
+                        "a cap nobody can see is how rows get hidden")
+
+    def test_the_company_rows_are_printed_with_rule_and_file(self):
+        import corpus_sweep as cs
+        result = dict(TestCorpusSweepCompanyColumn.RESULT_DIRTY)
+        result["companyFindingList"] = [
+            {"file": "data/sql/updates/pending_db_world/x.sql", "line": 12,
+             "rule": "table-not-allowed", "detail": "writes `updates`"}]
+        result["provenanceFiles"] = {"company": 1, "upstream": 2}
+        saved = cs.build_files, cs.tally
+        cs.build_files = lambda engine, policy, workers: []
+        cs.tally = lambda engine, files: dict(result)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                code = cs.main([])
+        finally:
+            cs.build_files, cs.tally = saved
+        text = out.getvalue()
+        self.assertEqual(1, code)
+        self.assertIn("table-not-allowed", text)
+        self.assertIn("pending_db_world/x.sql:12", text,
+                      "the check fails without saying which file and rule refused")
+
+    def test_a_tally_without_the_new_keys_still_exits_on_the_company_column(self):
+        # A baseline captured before PRO-285 has no companyFindingList; the exit status
+        # must not depend on a key the baseline never had.
+        import corpus_sweep as cs
+        saved = cs.build_files, cs.tally
+        cs.build_files = lambda engine, policy, workers: []
+        cs.tally = lambda engine, files: dict(TestCorpusSweepCompanyColumn.RESULT_DIRTY)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(1, cs.main([]))
+        finally:
+            cs.build_files, cs.tally = saved
+
+
+class TestCiProvenanceGuard(unittest.TestCase):
+    """PRO-285: a company column that collapsed to zero must not read as a pass."""
+
+    # The healthy tally this tree actually measures: 3 060 files, 131 625 statements,
+    # 444 726 findings, every one of them upstream (companyFindings=0) over a 20 279-commit
+    # history with 8 distinct authors. The per-rule counts are the sweep's own output at
+    # the head the README baseline was taken at, and `findings` is their sum because
+    # `corpus_sweep.py` derives it that way — a fixture that could drift from its own
+    # arithmetic would quietly unpin the guard's add-up clauses (PRO-298 review N8).
+    BY_RULE = {
+        "reserved-band": 323749, "table-not-allowed": 83025, "band-not-literal": 35537,
+        "unbounded-write": 1985, "forbidden-statement": 167,
+        "insert-columns-required": 100, "key-column-assigned": 68,
+        "custom-table-only": 43, "or-in-where": 22, "ledger-table": 15,
+        "unknown-statement": 10, "insert-select": 4, "multi-table-write": 1,
+    }
+
+    GOOD = {
+        "head": "0123456789abcdef0123456789abcdef01234567",
+        "files": 3060, "filesUnderPolicy": 3060, "statements": 131625,
+        "findings": sum(BY_RULE.values()),
+        "byRule": BY_RULE,
+        "byRuleOrigin": {r: {"upstream": n} for r, n in BY_RULE.items()},
+        "companyFindings": 0, "companyFindingList": [],
+        # The production shape, key absence and all: `provenanceFiles` is a
+        # `dict(Counter(...))`, so a class with no members is missing rather than 0.
+        "provenanceFiles": {"company": 7, "upstream": 3053},
+        "shallow": False, "commits": 20279, "authors": 8,
+    }
+
+    def _origins(self, origin="upstream", **splits):
+        """The healthy per-rule breakdown, with named rules re-split.
+
+        Each rule keeps a breakdown that sums to its `byRule` count, so a test that
+        mutates an origin column tests that column and not the guard's arithmetic.
+        """
+        origins = {r: {origin: n} for r, n in self.BY_RULE.items()}
+        origins.update(splits)
+        return origins
+
+    def _run(self, tally=None, write=True):
+        import ci_provenance_guard as guard
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sweep.json"
+            if write:
+                path.write_text(json.dumps(self.GOOD if tally is None else tally))
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = guard.main([str(path)])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_an_attributable_tally_passes(self):
+        code, out, _ = self._run()
+        self.assertEqual(0, code)
+        self.assertIn("company=7", out)
+        self.assertIn("upstream=3053", out)
+
+    def test_unattributable_files_fail(self):
+        tally = dict(self.GOOD)
+        tally["provenanceFiles"] = {"company": 0, "upstream": 0, "unknown": 3060}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("fetch-depth", err)
+
+    def test_findings_in_the_unknown_column_fail(self):
+        tally = dict(self.GOOD)
+        tally["byRuleOrigin"] = self._origins(
+            **{"table-not-allowed": {"upstream": 83020, "unknown": 5}})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("table-not-allowed=5", err)
+        self.assertEqual(1, len([l for l in err.splitlines()
+                                 if l.startswith("GUARD FAIL")]),
+                         "the unknown column has its own clause; a second reason here "
+                         "means the fixture stopped adding up")
+
+    def test_a_sweep_that_scanned_nothing_fails(self):
+        tally = dict(self.GOOD, files=0, filesUnderPolicy=0)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("no .sql", err)
+
+    def test_a_partial_run_without_strict_all_fails(self):
+        tally = dict(self.GOOD, filesUnderPolicy=8)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("--strict-all", err)
+
+    def test_a_head_that_is_not_a_sha_fails(self):
+        code, _, err = self._run(dict(self.GOOD, head="unknown"))
+        self.assertEqual(2, code)
+        self.assertIn("not a commit sha", err)
+
+    def test_a_pre_provenance_tally_is_never_skipped_silently(self):
+        tally = {k: v for k, v in self.GOOD.items() if k != "provenanceFiles"}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("provenanceFiles", err)
+
+    def test_a_shallow_checkout_fails_even_though_nothing_says_unknown(self):
+        # Measured on a `--depth 1` clone: the grafted root answers `git log -- <path>`
+        # for every file, so every file is the tip author's and `unknown` stays empty.
+        tally = dict(self.GOOD, shallow=True, commits=1, authors=1,
+                     provenanceFiles={"company": 3060, "upstream": 0, "unknown": 0},
+                     byRuleOrigin=self._origins("company"))
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("shallow", err)
+        self.assertIn("fetch-depth", err)
+
+    def test_the_silent_green_shallow_case_fails_on_history_alone(self):
+        # The dangerous shape: an upstream-authored tip puts every finding in `upstream`,
+        # the column the CI check gates on reads 0, and nothing about the provenance
+        # columns themselves looks wrong. History is the only thing left that can see it,
+        # so this tally keeps a healthy provenanceFiles and fails on the history clauses
+        # alone.
+        tally = dict(self.GOOD, shallow=True, commits=1, authors=1)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        for needle in ("shallow", "commits=1", "authors=1", "upstream"):
+            self.assertIn(needle, err)
+
+    def test_the_measured_shallow_collapse_is_also_refused_by_the_company_column(self):
+        # What a `--depth 1` clone of this repo actually produced (PRO-285), now caught
+        # twice over: the history clauses, and since PRO-295 B1, the gated column having
+        # no company file behind it.
+        tally = dict(self.GOOD, shallow=True, commits=1, authors=1,
+                     provenanceFiles={"company": 0, "upstream": 3060, "unknown": 0})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        for needle in ("shallow", "commits=1", "authors=1", "upstream",
+                       "attributed to `company`"):
+            self.assertIn(needle, err)
+
+    def test_a_single_author_across_the_corpus_fails(self):
+        code, _, err = self._run(dict(self.GOOD, authors=1))
+        self.assertEqual(2, code)
+        self.assertIn("single commit author", err)
+
+    def test_a_corpus_with_no_upstream_files_fails(self):
+        tally = dict(self.GOOD, provenanceFiles={"company": 3060, "upstream": 0,
+                                                 "unknown": 0})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("attributed to `upstream`", err)
+
+    def test_a_corpus_with_no_company_files_fails(self):
+        # PRO-295 B1. Drop `pending_db_world` from `includedDirs` and the gated column
+        # has nothing behind it: files=3053, provenanceFiles.company=0, companyFindings=0.
+        # That is the same zero a compliant corpus produces, and until this clause the
+        # guard read it as a verdict.
+        tally = dict(self.GOOD, files=3053, filesUnderPolicy=3053,
+                     provenanceFiles={"company": 0, "upstream": 3053, "unknown": 0})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("attributed to `company`", err)
+        self.assertIn("not a policy", err)
+
+    def test_a_tally_omitting_the_company_key_fails(self):
+        # The shape above is what a hand-written tally looks like; this is what the sweep
+        # writes. `provenanceFiles` is `dict(Counter(...))` (corpus_sweep.py), so a class
+        # with no members is an absent key, not a zero — and the whole company corpus is
+        # the 7 files of `pending_db_world`, so dropping that directory from
+        # `includedDirs` produces exactly this file (PRO-298 review N5). `company=0` and
+        # no `company` at all are the same claim about the corpus and must not be read
+        # differently: defaulting the lookup to anything but 0 brings the PRO-295 B1
+        # green back with every other test in this class still passing.
+        tally = dict(self.GOOD, files=3053, filesUnderPolicy=3053,
+                     provenanceFiles={"upstream": 3053})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("attributed to `company`", err)
+        self.assertIn("not a policy", err)
+
+    def test_a_sweep_that_parsed_no_statements_fails(self):
+        # PRO-295 B2. files>0 with statements=0 means the engine was handed the corpus
+        # and read nothing out of it; every count below it, gated column included, is a
+        # count over nothing.
+        code, _, err = self._run(dict(self.GOOD, statements=0))
+        self.assertEqual(2, code)
+        self.assertIn("statements=0", self._only_reason(err))
+
+    def test_a_sweep_that_found_nothing_at_all_fails(self):
+        # PRO-295 B2. This tree measures 444 726 findings and always will, so findings=0
+        # over 3 060 files is a dead engine — an emptied `forbiddenStatements`, a rule
+        # registry that failed to load — not a clean corpus. The refusal points at the
+        # README baseline instead of quoting a count, because a frozen number inside a
+        # red run's error message goes false the first time the corpus legitimately
+        # changes (PRO-298 review N7). The add-up clause keeps out of the way: a dead
+        # engine has one name in the log, not two, so nobody diffs byRule against a total
+        # that was always going to be 0.
+        code, _, err = self._run(dict(self.GOOD, findings=0))
+        self.assertEqual(2, code)
+        reason = self._only_reason(err)
+        self.assertIn("findings=0", reason)
+        self.assertIn("ops/preflight/README.md", reason)
+        self.assertNotIn("444 726", err)
+
+    def test_a_sweep_with_no_rule_that_fired_fails(self):
+        # The per-rule form of the same claim: findings>0 but nothing in byRule is the
+        # tally describing its own counts inconsistently, and an empty byRule with
+        # findings=0 is the dead engine again.
+        code, _, err = self._run(dict(self.GOOD, byRule={}, findings=0,
+                                      byRuleOrigin={}))
+        self.assertEqual(2, code)
+        self.assertIn("byRule is empty", err)
+
+    def _only_reason(self, err):
+        reasons = [line for line in err.splitlines() if line.startswith("GUARD FAIL")]
+        self.assertEqual(1, len(reasons),
+                         "expected one refusal so no clause masks another, got:\n"
+                         + "\n".join(reasons))
+        return reasons[0]
+
+    def test_a_findings_total_the_rules_do_not_add_up_to_fails(self):
+        # PRO-298 review N8. `corpus_sweep.py` sets `findings = sum(by_rule.values())`,
+        # so on the CI path these two cannot disagree; a tally where they do was not
+        # written by the sweep, and the guard is being asked to attest a document.
+        code, _, err = self._run(dict(self.GOOD,
+                                      findings=sum(self.BY_RULE.values()) + 1))
+        self.assertEqual(2, code)
+        self.assertIn("does not add up", self._only_reason(err))
+
+    def test_a_rule_with_no_origin_breakdown_fails(self):
+        # The load-bearing half of N8, and not bookkeeping: `company` findings are
+        # counted out of `byRuleOrigin` (corpus_sweep.company_by_rule), so a rule that is
+        # in `byRule` and missing from `byRuleOrigin` shows up in the printed report while
+        # contributing nothing to the column the check gates on. Here the whole
+        # `reserved-band` corpus — 323 749 findings, company-authored ones included —
+        # vanishes from the verdict while `companyFindings` stays 0.
+        origins = dict(self.GOOD["byRuleOrigin"])
+        del origins["reserved-band"]
+        code, _, err = self._run(dict(self.GOOD, byRuleOrigin=origins))
+        self.assertEqual(2, code)
+        self.assertIn("no breakdown for it", self._only_reason(err))
+
+    def test_an_origin_breakdown_that_does_not_sum_to_its_rule_fails(self):
+        # Same clause one level down: a split that loses rows hides them from the gated
+        # column exactly as a missing rule does, so the total and the column are counted
+        # from different sets of rows.
+        code, _, err = self._run(dict(
+            self.GOOD,
+            byRuleOrigin=self._origins(**{"reserved-band": {"upstream": 23749}})))
+        self.assertEqual(2, code)
+        self.assertIn("different sets of rows", self._only_reason(err))
+
+    def test_a_tally_without_a_company_row_list_is_never_skipped_silently(self):
+        # PRO-295 B2. `companyFindingList` was the only gated key whose absence the guard
+        # tolerated; provenanceFiles, shallow/commits and authors are all hard refusals
+        # when missing and this had better match them.
+        tally = {k: v for k, v in self.GOOD.items() if k != "companyFindingList"}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("companyFindingList", err)
+        tally = dict(self.GOOD, companyFindingList=None)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("companyFindingList", err)
+
+    def test_history_keys_absent_are_never_skipped_silently(self):
+        tally = {k: v for k, v in self.GOOD.items() if k not in ("shallow", "commits")}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("shallow", err)
+
+    def test_an_author_count_absent_is_never_skipped_silently(self):
+        tally = {k: v for k, v in self.GOOD.items() if k != "authors"}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("authors", err)
+
+    def test_a_capped_row_list_that_adds_up_still_passes(self):
+        row = {"file": "a.sql", "line": 1, "rule": "reserved-band", "detail": ""}
+        tally = dict(self.GOOD, companyFindings=444726,
+                     companyFindingList=[dict(row) for _ in range(2000)],
+                     companyFindingListTruncated=True)
+        code, _, _ = self._run(tally)
+        self.assertEqual(0, code)
+
+    def test_a_truncation_flag_that_lies_fails(self):
+        row = {"file": "a.sql", "line": 1, "rule": "reserved-band", "detail": ""}
+        tally = dict(self.GOOD, companyFindings=1, companyFindingList=[dict(row)],
+                     companyFindingListTruncated=True)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("rows it did not have", err)
+
+    def test_a_self_contradicting_company_column_fails(self):
+        tally = dict(self.GOOD, companyFindings=3)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("contradicts itself", err)
+
+    def test_company_findings_are_the_sweep_verdict_not_the_guards(self):
+        tally = dict(self.GOOD, companyFindings=1,
+                     companyFindingList=[{"file": "p.sql", "line": 1,
+                                          "rule": "table-not-allowed", "detail": ""}])
+        code, _, _ = self._run(tally)
+        self.assertEqual(0, code, "the guard re-litigating the policy verdict is a "
+                                  "second owner for one decision")
+
+    def test_a_missing_or_unparseable_tally_is_a_usage_error(self):
+        code, _, err = self._run(write=False)
+        self.assertEqual(1, code)
+        self.assertIn("no tally there", err)
+        import ci_provenance_guard as guard
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sweep.json"
+            path.write_text("{not json")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(1, guard.main([str(path)]))
+
+
+class TestTheCiWorkflowMatchesItsDocumentation(unittest.TestCase):
+    """The README says what CI runs; CI had better run exactly that.
+
+    PRO-285 exists because this file claimed a check that no workflow implemented. These
+    are the tests that make the two artefacts fail together instead of drifting, plus
+    the properties that were each measured to be load-bearing (full history, a guard
+    that survives a red sweep, no repository guard that can retire the check in
+    silence, and no step that needs MySQL, Docker or the deploy host).
+    """
+
+    REPO = Path(__file__).resolve().parents[2]
+    WORKFLOW = REPO / ".github" / "workflows" / "worlddb-preflight.yml"
+    README = REPO / "ops" / "preflight" / "README.md"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.yaml = cls.WORKFLOW.read_text()
+        cls.readme = cls.README.read_text()
+        start = cls.readme.index("### In CI")
+        rest = cls.readme[start + len("### In CI"):]
+        end = rest.index("\n## ")
+        cls.in_ci = rest[:end]
+
+    @staticmethod
+    def flat(text):
+        return " ".join(text.split())
+
+    @property
+    def code(self):
+        """The workflow with comments stripped — prose may describe a thing it does not do."""
+        return "\n".join(line.split("#", 1)[0] for line in self.yaml.splitlines())
+
+    def job_block(self, job):
+        _, _, tail = self.code.partition("\n  %s:" % job)
+        return tail
+
+    def readme_commands(self):
+        return [m for m in re.findall(r"`(python3 ops/preflight/[^`]+)`", self.in_ci)]
+
+    def test_every_command_the_readme_promises_for_ci_actually_runs(self):
+        commands = self.readme_commands()
+        self.assertGreaterEqual(len(commands), 4, "the In CI table lost a row")
+        for command in commands:
+            self.assertIn(self.flat(command), self.flat(self.yaml),
+                          "README promises `%s` and no workflow step runs it" % command)
+
+    def test_the_verdict_table_rows_are_run_lines_not_prose(self):
+        # The check above matches against the whole file, comments included, because the
+        # prose legitimately quotes the local form of a command. That is too weak for the
+        # table, which is the thing that claims a step runs it: every command in a table
+        # row has to survive comment stripping, so a comment can never satisfy a promise
+        # the table makes (PRO-295 review N3).
+        rows = [line for line in self.in_ci.splitlines() if line.strip().startswith("|")]
+        promised = [c for row in rows
+                    for c in re.findall(r"`(python3 ops/preflight/[^`]+)`", row)]
+        self.assertEqual(4, len(promised),
+                         "the In CI table no longer lists the four steps, so the verdict "
+                         "column is describing something other than this workflow")
+        for command in promised:
+            self.assertIn(self.flat(command), self.flat(self.code),
+                          "the table promises `%s` and no run line contains it" % command)
+
+    def test_the_check_cannot_be_retired_by_a_repository_guard(self):
+        # sql-codestyle.yml is the cautionary tale: it only runs on azerothcore/azerothcore-wotlk,
+        # so on this fork the check does not fail, it simply stops existing.
+        self.assertNotIn("github.repository", self.code)
+        self.assertNotIn("github.event.pull_request.draft", self.code,
+                         "a draft PR is exactly when a policy violation should be visible")
+
+    def test_the_sweep_checkout_carries_the_history_the_provenance_needs(self):
+        self.assertIn("fetch-depth: 0", self.job_block("corpus-sweep"))
+
+    def test_the_guard_still_runs_when_the_sweep_has_already_failed(self):
+        _, _, tail = self.code.partition("name: Provenance attribution guard")
+        step, _, _ = tail.partition("\n      - ")
+        condition = [line for line in step.splitlines() if line.strip().startswith("if:")]
+        self.assertEqual(1, len(condition), "the guard step has no single explicit condition")
+        self.assertIn("!cancelled()", condition[0],
+                      "skipping the guard on a red sweep removes the only answer to "
+                      "'is this company column real or a provenance collapse'")
+        self.assertIn("ci_provenance_guard.py", step)
+
+    def test_no_step_needs_mysql_docker_or_the_deploy_host(self):
+        for banned in ("services:", "mysql", "docker", "self-hosted", "ssh ", "deployhost",
+                       "docker-compose"):
+            self.assertNotIn(banned, self.code,
+                             "a step that needed `%s` would not belong in this workflow" % banned)
+
+    def test_the_sweep_job_carries_an_explicit_budget(self):
+        block = self.job_block("corpus-sweep")
+        budget = [line for line in block.splitlines() if "timeout-minutes" in line]
+        self.assertEqual(1, len(budget), "a hung `git log` with no budget burns the runner")
+        minutes = int(budget[0].split("timeout-minutes:")[1].strip())
+        self.assertGreaterEqual(minutes, 10, "the sweep alone measures ~5 min")
+
+    def test_the_sweep_has_exactly_one_ci_caller(self):
+        callers = [p.name for p in (self.REPO / ".github" / "workflows").glob("*.y*ml")
+                   if "corpus_sweep.py" in p.read_text()]
+        self.assertEqual(["worlddb-preflight.yml"], callers,
+                         "a second caller is a second definition of what the gate means")
+
+    def test_the_two_claims_that_started_this_do_not_come_back(self):
+        for gone in ("wired into CI rather than read by eye",
+                     "CI runs `--policy-all` report-only",
+                     "the CI / merge-gate rehearsal form",
+                     "nothing under `.github/workflows/` references `ops/preflight`",
+                     "nothing in .github/workflows/ calls corpus_sweep.py"):
+            self.assertNotIn(gone, self.readme,
+                             "README re-adopted a CI claim about a check that does not exist: %r" % gone)
 
 
 if __name__ == "__main__":
