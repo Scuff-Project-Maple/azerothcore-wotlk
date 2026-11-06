@@ -124,7 +124,10 @@ reviewer and the next real fetch moves the ref back — where the author forge w
 command. It is also no wider a privilege than the ones already in the same file: whoever can
 `update-ref` can edit `preflight-policy.json` outright (`companyEmailDomains`,
 `includedDirs[].origin`, `reservedIdBands`), which is why the policy is pinned by
-`audit_policy_schema.py` and CI rather than by this check. An upstream file that trips the reserved
+`audit_policy_schema.py` rather than by this check. That pin is real but manual: step 3 of
+"Adding a table to the policy" below is what runs it, and a reviewer re-runs it — there is no
+CI job for it, and nothing under `.github/workflows/` references `ops/preflight`. An upstream
+file that trips the reserved
 bands stays exempt from check 4, and the corpus `upstream` column records those 444 726 findings as
 review material, not boot failures.
 
@@ -132,9 +135,11 @@ So **check 4 covers company content only**, by design. `--strict-all` (policy on
 warnings too) is not a usable boot-time setting: against this tree it fails ~754 of 861 upstream
 files — 77094 reserved-band, 52967 table-not-allowed, 1666 band-not-literal, 1452 unbounded-write,
 25 `DROP`, 4 on `updates`, 2 `EXECUTE` — every one of them upstream content the updater has
-always applied. `--policy-all` reports the same set without failing; **CI runs `--policy-all`
-report-only** and the boot gate runs the default company-only mode. Anything that must hold
-against upstream too is a review question, not a boot gate.
+always applied. `--policy-all` reports the same set without failing and is the form a review
+or a sweep runs by hand; the boot gate runs the default company-only mode. Neither form is
+wired into CI — nothing under `.github/workflows/` references `ops/preflight`, so the gate is
+only as strong as the boot path in `ops/deploy/worldserver-up.sh` that runs it. Anything that
+must hold against upstream too is a review question, not a boot gate.
 
 ## Write policy (check 4)
 
@@ -298,7 +303,11 @@ dry run. There is no operator-settable scratch prefix.
    DDL in `data/sql/base/db_world` **and** the module SQL that creates the `customTables`
    (`modules/`, `wrath-unbound/modules/`, `nodeps/modules/`, discovered with `git ls-files` so a
    clean clone sees them too). `--no-modules` skips the module half and says so per unchecked
-   table; it never skips silently.
+   table; it never skips silently. Pass it the **same** `--policy` (and `--repo`) you pass the
+   gate: the auditor otherwise reads the policy sitting next to itself, so a gate run with
+   `--policy /some/other.json` would be audited against a document it is not enforcing — a
+   policy the auditor never opened can pass while the file that decides the boot is not (PRO-248
+   review N5). `python3 ops/preflight/audit_policy_schema.py --policy "$POLICY" --repo "$TREE"`.
 4. `PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py` before committing
    (plain `python3 -m unittest discover -s ops/preflight` fails: the directory is not a package).
 
