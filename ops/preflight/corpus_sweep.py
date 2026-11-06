@@ -25,9 +25,12 @@ the per-rule company delta alongside the total, because a finding that migrates
 company total is expected and must not fail the run.
 
 The `--out` tally is also the input to `ci_provenance_guard.py`, which reads
-`provenanceFiles`/`byRuleOrigin` and refuses a run whose provenance could not be
-attributed — a green company column on a checkout that could not attribute anything is
-a check that measured nothing (PRO-285).
+`provenanceFiles`/`byRuleOrigin`/`shallow`/`commits`/`authors` and refuses a run whose
+provenance it cannot vouch for. Provenance is a `git log` read per file, so a checkout
+with too little history can empty the `company` column the CI check gates on without
+the policy getting any easier — and it does not even always say `unknown` while doing
+it (see `git_history()`). A green column produced by the absence of history is a check
+that measured nothing (PRO-285).
 
 Exit status: 0 clean, 1 findings in the company column, 2 on a usage/operational error.
 """
@@ -49,6 +52,12 @@ sys.path.insert(0, str(HERE))
 # short; the cap only exists so a policy change that suddenly refuses company content
 # cannot bury the rest of the CI log.
 COMPANY_DETAIL_LIMIT = 100
+
+# `--out` is read by the guard, not by a human. A shallow checkout can attribute every
+# finding in the corpus to the company — measured at 444 726 (PRO-285) — and writing all
+# of them out makes a 120 MB tally that proves nothing. The guard needs the count and
+# the first rows, so the JSON carries the first rows and says it truncated.
+COMPANY_JSON_LIMIT = 2000
 
 import preflight_worlddb as pf  # noqa: E402
 
@@ -89,6 +98,38 @@ def git_head(root: Path) -> str:
     return proc.stdout.decode().strip() or "unknown"
 
 
+def git_history(root: Path) -> dict:
+    """How much history the provenance was read out of.
+
+    Provenance is `git log -1 -- <path>` per file, so the answer depends on the
+    checkout, not only on the corpus. A shallow clone has a **grafted root**: that one
+    commit is a root commit, so `git log -- <path>` returns it for *every* path and
+    every file is attributed to the tip author — nothing comes back `unknown` to warn
+    anyone. Measured on a `--depth 1` clone of this repo: 3 060 files, all classified
+    `company`, 444 726 company findings, because the tip commit is company-authored;
+    with an upstream-authored tip (the usual case on `Playerbot`, which is merged into
+    from upstream) the same checkout puts all 444 726 in `upstream` and the column the
+    CI check gates on reads 0. Record it so the guard can refuse the run either way
+    (PRO-285).
+    """
+    out: dict = {"shallow": None, "commits": None}
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=str(root),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if proc.returncode == 0:
+            out["shallow"] = proc.stdout.decode().strip() == "true"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    try:
+        proc = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=str(root),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if proc.returncode == 0:
+            out["commits"] = int(proc.stdout.decode().strip() or 0)
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return out
+
+
 def build_files(engine: pf.Preflight, policy: dict, workers: int) -> list[dict]:
     dirs = []
     for entry in policy["includedDirs"]:
@@ -100,9 +141,15 @@ def build_files(engine: pf.Preflight, policy: dict, workers: int) -> list[dict]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         authors = dict(zip(paths, ex.map(engine.git_author_origin, paths)))
     for f in files:
+        author_origin, author_detail = authors[f["path"]]
         origin, provenance = engine.classify_origin(f, author=authors[f["path"]])
         f["origin"] = origin
         f["provenance"] = provenance
+        # The email the attribution rested on, kept so the tally can show *how many*
+        # authors it drew on: one distinct address across thousands of upstream files is
+        # a grafted history, not a monorepo of one author.
+        f["author"] = (None if author_origin == "unknown"
+                       else author_detail.split("\t", 1)[0].lower())
     return files
 
 
@@ -148,6 +195,7 @@ def tally(engine: pf.Preflight, files: list[dict]) -> dict:
         if (by_rel.get(v["file"]) or {}).get("origin") == "company"
     ]
     provenance_files = dict(Counter(f.get("origin", "unknown") for f in files))
+    company_rows = sorted(company_list, key=lambda v: (v["file"], v["line"] or 0, v["rule"]))
     return {
         "files": len(files),
         "filesUnderPolicy": engine.policy_stats.get("files", 0),
@@ -159,9 +207,10 @@ def tally(engine: pf.Preflight, files: list[dict]) -> dict:
         "byRuleOrigin": {r: dict(c) for r, c in sorted(by_rule_origin.items())},
         "byDir": dict(sorted(by_dir.items())),
         "perFile": dict(Counter(v["file"] for v in engine.violations).most_common(25)),
-        "companyFindingList": sorted(
-            company_list, key=lambda v: (v["file"], v["line"] or 0, v["rule"])),
+        "companyFindingList": company_rows[:COMPANY_JSON_LIMIT],
+        "companyFindingListTruncated": len(company_rows) > COMPANY_JSON_LIMIT,
         "provenanceFiles": {k: v for k, v in sorted(provenance_files.items())},
+        "authors": len({f.get("author") for f in files} - {None}),
     }
 
 
@@ -172,6 +221,10 @@ def print_report(result: dict, top: int, rule_filter: str | None,
     print(f"region-scan consultations={result.get('regionScanConsultations', '?')} "
           f"multi-table-write={result['byRule'].get('multi-table-write', 0)} "
           f"unmatched={result.get('scanConsultationsWithoutRefusal', '?')}")
+    if "shallow" in result or "authors" in result:
+        # Provenance is read out of git, so say how much git there was to read out of.
+        print(f"history[commits={result.get('commits')} shallow={result.get('shallow')} "
+              f"authors={result.get('authors')}]")
     print("\nrule                              total   company  upstream  unknown")
     for rule, count in sorted(result["byRule"].items(), key=lambda kv: -kv[1])[:top]:
         o = result["byRuleOrigin"].get(rule, {})
@@ -278,10 +331,12 @@ def main(argv=None) -> int:
         policy, pf.Report())
     files = build_files(engine, policy, args.workers)
     result = tally(engine, files)
+    hist = git_history(root)
     result.update({"head": git_head(root), "composeRoot": str(root),
                    "policy": str(policy_path),
                    "liveDatabase": engine.live_db,
                    "strictAll": bool(args.strict_all),
+                   "shallow": hist["shallow"], "commits": hist["commits"],
                    "companyFindings": company_total(result)})
 
     print_report(result, args.top, args.rule, engine)
@@ -300,8 +355,11 @@ def main(argv=None) -> int:
         listed = result.get("companyFindingList") or []
         for v in listed[:COMPANY_DETAIL_LIMIT]:
             print(f"  {v['file']}:{v.get('line')}: {v['rule']}: {v['detail']}")
-        if len(listed) > COMPANY_DETAIL_LIMIT:
-            print(f"  ... and {len(listed) - COMPANY_DETAIL_LIMIT} more; "
+        if not listed:
+            print("  (this tally recorded no companyFindingList; run --rule RULE to "
+                  "list them)")
+        elif result["companyFindings"] > COMPANY_DETAIL_LIMIT:
+            print(f"  ... and {result['companyFindings'] - COMPANY_DETAIL_LIMIT} more; "
                   f"--rule RULE lists one rule in full")
         if not args.measure_only:
             exit_code = 1

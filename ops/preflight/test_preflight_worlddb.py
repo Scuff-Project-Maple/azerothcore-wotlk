@@ -1801,8 +1801,10 @@ class TestCorpusSweepNamesTheOffendingCompanyFile(unittest.TestCase):
     def _tally(self):
         import corpus_sweep as cs
         files = [
-            {"rel": "pending.sql", "origin": "company", "dir": {"db_path": "$/pending"}},
-            {"rel": "archive.sql", "origin": "upstream", "dir": {"db_path": "$/archive"}},
+            {"rel": "pending.sql", "origin": "company", "author": "scuff@paperclip.local",
+             "dir": {"db_path": "$/pending"}},
+            {"rel": "archive.sql", "origin": "upstream", "author": "someone@azerothcore.org",
+             "dir": {"db_path": "$/archive"}},
         ]
         violations = [
             {"file": "pending.sql", "line": 7, "rule": "table-not-allowed",
@@ -1818,6 +1820,20 @@ class TestCorpusSweepNamesTheOffendingCompanyFile(unittest.TestCase):
                            "detail": "writes `updates`"}], result["companyFindingList"],
                          "the upstream finding leaked into the company list")
         self.assertEqual({"company": 1, "upstream": 1}, result["provenanceFiles"])
+
+    def test_the_written_row_list_is_capped_and_says_so(self):
+        # A shallow checkout once wrote a 120 MB tally by listing all 444 726 company
+        # rows; the guard reads counts, so the JSON carries a cap and a flag.
+        import corpus_sweep as cs
+        violations = [{"file": "pending.sql", "line": i, "rule": "reserved-band",
+                       "detail": "below the band"}
+                      for i in range(cs.COMPANY_JSON_LIMIT + 5)]
+        result = cs.tally(self.StubEngine(violations), [
+            {"rel": "pending.sql", "origin": "company", "author": "scuff@paperclip.local",
+             "dir": {"db_path": "$/pending"}}])
+        self.assertEqual(cs.COMPANY_JSON_LIMIT, len(result["companyFindingList"]))
+        self.assertTrue(result["companyFindingListTruncated"],
+                        "a cap nobody can see is how rows get hidden")
 
     def test_the_company_rows_are_printed_with_rule_and_file(self):
         import corpus_sweep as cs
@@ -1866,6 +1882,7 @@ class TestCiProvenanceGuard(unittest.TestCase):
         "byRuleOrigin": {"reserved-band": {"upstream": 323749}},
         "companyFindings": 0, "companyFindingList": [],
         "provenanceFiles": {"company": 8, "upstream": 3052, "unknown": 0},
+        "shallow": False, "commits": 41873, "authors": 112,
     }
 
     def _run(self, tally=None, write=True):
@@ -1920,6 +1937,67 @@ class TestCiProvenanceGuard(unittest.TestCase):
         code, _, err = self._run(tally)
         self.assertEqual(2, code)
         self.assertIn("provenanceFiles", err)
+
+    def test_a_shallow_checkout_fails_even_though_nothing_says_unknown(self):
+        # Measured on a `--depth 1` clone: the grafted root answers `git log -- <path>`
+        # for every file, so every file is the tip author's and `unknown` stays empty.
+        tally = dict(self.GOOD, shallow=True, commits=1, authors=1,
+                     provenanceFiles={"company": 3060, "upstream": 0, "unknown": 0},
+                     byRuleOrigin={"reserved-band": {"company": 323749}})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("shallow", err)
+        self.assertIn("fetch-depth", err)
+
+    def test_the_silent_green_shallow_case_fails_on_history_alone(self):
+        # The dangerous shape: an upstream-authored tip puts every finding in `upstream`,
+        # the column the CI check gates on reads 0, and no other rule here complains.
+        tally = dict(self.GOOD, shallow=True, commits=1, authors=1,
+                     provenanceFiles={"company": 0, "upstream": 3060, "unknown": 0})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        for needle in ("shallow", "commits=1", "authors=1", "upstream"):
+            self.assertIn(needle, err)
+
+    def test_a_single_author_across_the_corpus_fails(self):
+        code, _, err = self._run(dict(self.GOOD, authors=1))
+        self.assertEqual(2, code)
+        self.assertIn("single commit author", err)
+
+    def test_a_corpus_with_no_upstream_files_fails(self):
+        tally = dict(self.GOOD, provenanceFiles={"company": 3060, "upstream": 0,
+                                                 "unknown": 0})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("attributed to `upstream`", err)
+
+    def test_history_keys_absent_are_never_skipped_silently(self):
+        tally = {k: v for k, v in self.GOOD.items() if k not in ("shallow", "commits")}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("shallow", err)
+
+    def test_an_author_count_absent_is_never_skipped_silently(self):
+        tally = {k: v for k, v in self.GOOD.items() if k != "authors"}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("authors", err)
+
+    def test_a_capped_row_list_that_adds_up_still_passes(self):
+        row = {"file": "a.sql", "line": 1, "rule": "reserved-band", "detail": ""}
+        tally = dict(self.GOOD, companyFindings=444726,
+                     companyFindingList=[dict(row) for _ in range(2000)],
+                     companyFindingListTruncated=True)
+        code, _, _ = self._run(tally)
+        self.assertEqual(0, code)
+
+    def test_a_truncation_flag_that_lies_fails(self):
+        row = {"file": "a.sql", "line": 1, "rule": "reserved-band", "detail": ""}
+        tally = dict(self.GOOD, companyFindings=1, companyFindingList=[dict(row)],
+                     companyFindingListTruncated=True)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("rows it did not have", err)
 
     def test_a_self_contradicting_company_column_fails(self):
         tally = dict(self.GOOD, companyFindings=3)

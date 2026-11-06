@@ -310,11 +310,18 @@ Read the verdict column literally.
   decision the boot gate makes about upstream content, written down instead of left to whoever reads
   a log.
 - The guard is not a second policy verdict — company findings are `corpus_sweep.py`'s to fail on.
-  It fails a run whose provenance could not be attributed. `git_author_origin()` asks
-  `git log -1 -- <path>` per file; on a partial history that returns nothing, files are classified
-  `unknown`, and the `company` column falls to zero **by itself** — a green check produced by the
-  absence of a measurement. That is what the guard refuses, and why the sweep job checks out with
-  `fetch-depth: 0`.
+  It fails a run whose provenance was never read out of history. `git_author_origin()` asks
+  `git log -1 -- <path>` per file, so the **checkout** decides the answer as much as the corpus
+  does, and a shallow clone is worse than unattributable: its grafted root answers for *every*
+  path, so each file inherits the tip author and the `unknown` column stays empty to warn nobody.
+  Measured on a `--depth 1` clone of this repo, all 3 060 scanned files came back `company` and
+  444 726 findings landed in the gated column — a red check with the entire upstream corpus in the
+  dock. Give the same checkout an upstream-authored tip, which is what `Playerbot` normally has,
+  and all 444 726 move to `upstream` and the column the check gates on reads **0**. So the sweep
+  records `shallow`, `commits` and `authors` in its tally and the guard refuses a shallow repo, a
+  one-commit history, one distinct author across thousands of files, or a corpus with no upstream
+  files at all. The sweep job also checks out with `fetch-depth: 0`; the guard is the net, not the
+  fix.
 
 What a green check does **not** say: it is not a boot rehearsal. None of these steps reads the
 `updates` ledger, hashes pending files, replays them into a scratch schema or checks a compose
