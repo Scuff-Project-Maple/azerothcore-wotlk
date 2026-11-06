@@ -226,11 +226,11 @@ VALUES
  '[{"talent_tree": 7, "role": "damage", "spell_whitelist": []}]',
  '{"spells": [36, 1752, 1766], "items": [1260, 5002], "action_bar": [1, 2, 3, 17, 18, 19]}',
  18,
- 2,
- 3,
- 2048,
- 1,
- 'Fictional example row for the contract doc. Tree 7 = Rogue Assassination.');
+  2,
+  3,
+  4096,
+  1,
+  'Fictional example row for the contract doc. Tree 7 = Rogue Assassination.');
 ```
 
 Notes:
@@ -243,7 +243,9 @@ Notes:
   the grimweaver can use a hunter-tame spell to tame that family.
 - `weapon_prof_mask = 2` (`1 << ITEM_SUBCLASS_WEAPON_DAGGERS`) → dagger
   proficiency granted on login; `armor_prof_mask = 3` → leather + cloth.
-- `unbound_mask_bit = 2048` → the first allocation per §6.
+- `unbound_mask_bit = 4096` → example only. `2048` (`1<<11`) is already
+  allocated to warden (§6 ledger); a new class takes the next free bit from
+  that ledger, not this number.
 - `action_bar` is recorded for client tooling; the server ignores it.
 
 ## 9. Designer guide: how to add a class
@@ -306,19 +308,37 @@ example: a new class = one row like the one below, chosen from the fields in
 §2–§6. No C++, no new spell ids, no new talent trees.
 
 The zero-C++ claim is re-checked against `origin/Playerbot` rather than
-asserted from memory: `git grep -i customclass src/` is empty, and the only
-core-side surface is the generic `Player::GetUnboundClassMask()` accessor
-plus the unbound consult sites installed by the two generic 6-file core
-patches:
-`Player.h`, `Player.cpp`, `PlayerStorage.cpp`, `PlayerQuest.cpp`,
-`ConditionMgr.cpp`, `Trainer.cpp`. Each patch lives in its module's tracked
-home — `wrath-unbound/modules/mod-unbound/unbound-core-access.patch` and
-`wrath-unbound/modules/mod-custom-classes/custom-class-core-access.patch`
-(the build consumes the working copies staged under `modules/`). Every other
-core-source commit since the pinned Playerbot base is conf-only or
-subsystem work with no class branching — PRO-32 async DB-pool hardening in
-`src/server/database/` and the PRO-9/PRO-57 `worldserver.conf.dist` edits.
-Nothing in `Player` branches on a custom class.
+asserted from memory. The load-bearing check is
+`git grep -nE "OnPlayerOnline|OnPlayerAfterUpdateAllStats|OnPlayerLfgSetRoles|GetUnboundClassMask" src/`,
+which returns exactly the **twelve** files the two generic core patches
+install — all class-agnostic:
+
+- `wrath-unbound/modules/mod-unbound/unbound-core-access.patch` → **six**
+  files holding the generic `Player::GetUnboundClassMask()` accessor and its
+  unbound consult sites: `Player.h`, `Player.cpp`, `PlayerStorage.cpp`,
+  `PlayerQuest.cpp`, `ConditionMgr.cpp`, `Trainer.cpp`.
+- `wrath-unbound/modules/mod-custom-classes/custom-class-core-access.patch`
+  → a **disjoint six** files installing three generic `PlayerScript` hooks
+  (`OnPlayerOnline`, `OnPlayerAfterUpdateAllStats`, `OnPlayerLfgSetRoles`):
+  `src/server/game/Entities/Unit/StatSystem.cpp`,
+  `src/server/game/Handlers/CharacterHandler.cpp`,
+  `src/server/game/Handlers/LFGHandler.cpp`,
+  `src/server/game/Scripting/ScriptDefines/PlayerScript.cpp`,
+  `src/server/game/Scripting/ScriptDefines/PlayerScript.h`,
+  `src/server/game/Scripting/ScriptMgr.h`.
+
+Each patch lives in its module's tracked home (the build consumes the working
+copies staged under `modules/`). None of the added lines branch on a class:
+`GetUnboundClassMask()` is a plain accessor and the three `PlayerScript`
+hooks are class-agnostic plumbing. `git grep -i customclass src/` is empty,
+but that check only proves an absence of *naming* — none of the hook
+additions contain the token `customclass`, so it stays empty whether or not
+`custom-class-core-access.patch` is applied; the grep above is the one that
+measures the claim. Every other core-source commit since the pinned Playerbot
+base is conf-only or DB/subsystem work with no class branching (PRO-32 async
+DB-pool hardening, the PRO-9/PRO-57 `worldserver.conf.dist` edits, and the
+`ValidateSkillLearnedBySpells = 0` conf change §12 relies on for the 1515
+cross-class grant). Nothing in `Player` branches on a custom class.
 
 **The exact input set Warden needed** (world DB `custom_class_template`,
 applied by `data/sql/updates/pending_db_world/2026_10_05_00.sql`,
@@ -335,8 +355,8 @@ validation queries in `2026_10_05_01.sql`):
 | `ap_curve` | `{"melee": {"1": 27, …, "80": 522}}` | melee only; no ranged for Warden |
 | `spellpower_curve` | `{"1": 6, …, "80": 180}` | non-zero on purpose: vanilla paladin base spell power is 0; gives the Holy/healer spec a healing identity |
 | `crit_curve` | *(empty)* | keep vanilla agility-driven melee crit |
-| `specs` | 3 entries: tree `381` Retribution / role `damage`, tree `382` Holy / role `healer`, tree `383` Protection / role `tank` | one spec per paladin tab, one LFG role each; whitelists = the full vanilla per-tab talent id lists (381: 26 ids, 382: 26 ids, 383: 25 ids), so all three trees stay learnable — spec *gating*, not spell removal, is what Warden exercises |
-| `starting_kit` | spells `[1515, 642, 633, 4987, 635, 19740, 853, 20154, 20271, 465]`, no items, no action bar | 1515 Tame Beast is cross-class (hunter spell on a paladin) — granted only because `ValidateSkillLearnedBySpells = 0`; 1032 Judgement deliberately excluded (trainer TEACH-id grant quirk, see mod-unbound `14_judgement_fix.sql`) |
+| `specs` | 3 entries: tree `381` Retribution / role `damage`, tree `382` Holy / role `healer`, tree `383` Protection / role `tank` | one spec per paladin tab, one LFG role each; whitelists = the full vanilla per-tab talent id lists (381: 26 ids, 382: 26 ids, 383: 26 ids), so all three trees stay learnable — spec *gating*, not spell removal, is what Warden exercises |
+| `starting_kit` | spells `[1515, 642, 633, 4987, 635, 19740, 853, 20154, 20271, 465]`, no items, no action bar | 1515 Tame Beast is cross-class (hunter spell on a paladin) — granted only because `ValidateSkillLearnedBySpells = 0`; 10321 Judgement deliberately excluded (trainer TEACH-id grant quirk, see mod-unbound `14_judgement_fix.sql`) |
 | `pet_family` | `4` (Beasts) | enables the taming path (§2 `pet_family` + the generic `IsClass(CLASS_HUNTER, CLASS_CONTEXT_PET)` override) |
 | `weapon_prof_mask` / `armor_prof_mask` | `0` / `0` | Warden characters are paladin characters; they inherit vanilla paladin profs. Non-zero masks are granted idempotently on login by the same hook, no code change |
 | `unbound_mask_bit` | `2048` (`1<<11`) | first ledger allocation (§6); OR-ed into the player's unbound mask on login so every existing unbound consult site accepts Warden |
