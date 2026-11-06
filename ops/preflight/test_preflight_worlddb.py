@@ -1897,13 +1897,72 @@ class TestUpstreamRefProvenance(unittest.TestCase):
     def test_a_fetch_head_is_evidence_the_clone_fetched(self):
         d = self._repo()
         p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
-        (d / ".git" / "FETCH_HEAD").write_text("abc123\t\tbranch 'Playerbot' of origin\n")
+        # The shape git actually writes: `<sha>\t\tbranch '<name>' of <url>`. The gate
+        # reads the sha, so a fixture whose id is shorter than a short id would pass
+        # the assertion while exercising the unparsable branch instead (PRO-307 A1).
+        (d / ".git" / "FETCH_HEAD").write_text(
+            "0d8a474fc67971fb3dd7616e26323d3066442555\t\tbranch 'Playerbot' of origin\n")
         pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
         up = pf.upstream_ref()
         self.assertEqual("missing", up["state"])
         self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
         self.assertIn("FETCH_HEAD", up["wasTrackedDetail"])
+        self.assertIn("fetched ref", up["wasTrackedDetail"])
+        self.assertIn("0d8a474fc679", up["wasTrackedDetail"])
+        self.assertEqual("fetched", up["wasTrackedCertainty"])
         self.assertEqual(pf.REF_INDETERMINATE, pf.upstream_ref_state(p)[0])
+
+    # -- a failed fetch leaves a FETCH_HEAD behind, and it is not a deletion ------- #
+
+    def _one_signal(self, pf):
+        """Answer every history probe but FETCH_HEAD, whose file the test writes."""
+        return self._stub_git_shapes(
+            pf, commit_peel=(1, "", "fatal: Needed a single revision"), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD", ""), namespace=(0, "", ""))
+
+    def test_a_fetch_head_a_failed_fetch_left_behind_is_not_fetch_evidence(self):
+        # PRO-307 A1, measured on the deployhost: `GIT_ALLOW_PROTOCOL=none git fetch
+        # origin Playerbot` exits 128 and leaves .git/FETCH_HEAD present at 0 bytes
+        # (sha256 e3b0c44298fc…, the empty digest). Reading `fhp.exists()` as "this
+        # clone has fetched" reclassified a clone that had never fetched from the honest
+        # `upstream-ref-unverified` WARN it is promised into a hard `upstream-ref-deleted`
+        # refusal — the gate accusing an operator of a deletion they had not made.
+        for shape in (b"", b"\n", b"  \n\t \n", b"\r\n"):
+            with self.subTest(repr(shape)):
+                d = self._repo()
+                p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+                (d / ".git" / "FETCH_HEAD").write_bytes(shape)
+                pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+                self._one_signal(pf)
+                up = pf.upstream_ref()
+                self.assertEqual("missing", up["state"])
+                self.assertFalse(up["wasTracked"], up["wasTrackedDetail"])
+                self.assertEqual("", up["wasTrackedCertainty"], up["wasTrackedDetail"])
+                self._run(pf, self._file(d, p))
+                fails, warns = self._outcomes(pf)
+                self.assertNotIn("upstream-ref-deleted", [r for r, _ in fails],
+                                 f"{shape!r} was read as a deletion: {[r for r, _ in fails]}")
+                self.assertIn("upstream-ref-unverified", warns)
+                self.assertFalse(pf.r.failed)
+                self.assertEqual(pf.REF_UNCHECKED, pf.upstream_ref_state(p)[0])
+
+    def test_a_fetch_head_that_names_no_fetched_ref_is_evidence_but_says_so(self):
+        # Content that is not empty is still more than a failed fetch leaves, and the
+        # gate must not hand the exemption back because a file holds something it did
+        # not expect. What it must not do is claim a fetch it did not observe.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        (d / ".git" / "FETCH_HEAD").write_text("not a fetch record\n")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._one_signal(pf)
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("do not parse", up["wasTrackedDetail"])
+        self.assertNotIn("so a fetch completed", up["wasTrackedDetail"])
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
 
     # -- each of the three history signals, on its own (review N4) ----------------- #
 
@@ -2193,7 +2252,7 @@ class TestUpstreamRefProvenance(unittest.TestCase):
             fetch_head_path=(0, ".git/FETCH_HEAD", ""), namespace=(0, "", ""))
         self._empty_own_reflog(d, "refs/remotes/origin/Absent")
         (d / ".git" / "FETCH_HEAD").write_text(
-            "abc123\t\tbranch 'Playerbot' of origin\n")
+            "0d8a474e1b2c3d4e5f60718293a4b5c6d7e8f901\t\tbranch 'Playerbot' of origin\n")
         up = pf.upstream_ref()
         self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
         self.assertEqual("fetched", up["wasTrackedCertainty"],
@@ -2209,11 +2268,21 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self._run(pf, self._file(d, p))
         self.assertTrue(pf.r.failed)
 
-    def test_an_empty_fetch_head_fails_closed_without_claiming_a_fetch(self):
-        # PRO-301 review N2: the same presence/observation conflation one level up. A
-        # 0-byte FETCH_HEAD is a file `exists()` says yes to, and `exists()` alone was
-        # buying the word "fetched". It stays a trace — so the boot is still refused —
-        # but it earns neither the fetch claim nor the deletion claim.
+    def test_a_zero_byte_fetch_head_is_no_evidence_at_all(self):
+        # PRO-307 A1, and a deliberate correction of PRO-301 review N2's shape. N2 kept
+        # the 0-byte FETCH_HEAD as a trace that fails closed, but the shape is not one a
+        # successful fetch ever leaves: `git fetch` opens FETCH_HEAD and truncates it
+        # before transport has produced anything, so `GIT_ALLOW_PROTOCOL=none git fetch
+        # origin Playerbot` exits 128 and leaves exactly this file. A clone that merely
+        # lost its network — an air-gapped host, a wrong remote URL, a blocked run — was
+        # refused a boot and told to restore a ref it never had.
+        #
+        # Nothing fail-closed is lost by the WARN: the exemption is not granted on this
+        # path either (the file is still treated as company content), and an operator who
+        # really wanted the deletion answer never had to leave an empty file — `rm
+        # .git/FETCH_HEAD` reaches the identical state today. The durable PRO-300
+        # last-verified record, which those commands cannot reach, is what answers
+        # "this clone did once carry the ref".
         d = self._repo()
         p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
         pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
@@ -2223,17 +2292,19 @@ class TestUpstreamRefProvenance(unittest.TestCase):
             fetch_head_path=(0, ".git/FETCH_HEAD", ""), namespace=(0, "", ""))
         (d / ".git" / "FETCH_HEAD").write_bytes(b"")
         up = pf.upstream_ref()
-        self.assertTrue(up["wasTracked"],
-                        "an empty FETCH_HEAD was read as a clone that never fetched")
-        self.assertEqual("unobserved", up["wasTrackedCertainty"],
-                         "an empty FETCH_HEAD was allowed to claim a fetch")
-        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+        self.assertFalse(up["wasTracked"],
+                         "the 0-byte FETCH_HEAD a failed fetch leaves was read as fetch "
+                         "history and bought an upstream-ref-deleted refusal")
+        self.assertEqual("", up["wasTrackedCertainty"],
+                         "an empty file was given a certainty tier")
+        self.assertNotEqual("ref-deleted", pf.upstream_ref_state(p)[2],
+                            "a clone that has never fetched was refused a boot")
         self._run(pf, self._file(d, p))
-        fails, _ = self._outcomes(pf)
-        self.assertTrue(pf.r.failed, "an empty FETCH_HEAD let the exemption through")
-        msg = next(m for r, m in fails if r == "upstream-ref-deleted")
-        self.assertNotIn("this clone has fetched", msg)
-        self.assertIn("records nothing", msg)
+        fails, warns = self._outcomes(pf)
+        self.assertNotIn("upstream-ref-deleted", [r for r, _ in fails])
+        self.assertIn("upstream-ref-unverified", warns)
+        self.assertFalse(pf.r.failed,
+                         "a failed fetch alone refused the boot")
 
     def test_a_reflog_that_is_not_a_regular_file_answers_that_nothing_was_observed(self):
         # PRO-301 review N4: every other probe here is a `git` call with a 60s timeout.
@@ -3882,6 +3953,172 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertFalse(partial)
 
 
+class TestGateDoesNotEatItsCallersStdin(unittest.TestCase):
+    """PRO-307 A4: check [0] handed the DB client the gate's own stdin.
+
+    `subprocess.run(argv, input=None)` leaves the child on the caller's fd 0, so
+    `docker compose exec -T ac-database mysql` drained whatever had been piped to the
+    gate. Measured on the deployhost: the same script piped into `ssh host 'bash -s'`
+    printed its first marker and stopped dead after the first DB check, while run as a
+    file it completed. A gate that eats the rest of an operator's script is a gate that
+    reports nothing at all.
+    """
+
+    def _mysql(self):
+        # a real cwd: _run passes compose_root as cwd, and a child cannot start in a
+        # directory that does not exist
+        args = build_arg_parser().parse_args(["--compose-root", tempfile.gettempdir()])
+        return MySQL(args)
+
+    def _capture(self, stdin):
+        import preflight_worlddb as P
+        seen = {}
+
+        class Proc:
+            returncode, stdout, stderr = 0, b"", b""
+
+        def spy(argv, **kw):
+            seen.update(kw)
+            return Proc()
+
+        saved = P.subprocess.run
+        P.subprocess.run = spy
+        try:
+            self._mysql()._run(["docker", "compose", "exec", "-T", "ac-database", "mysql"],
+                               stdin=stdin)
+        finally:
+            P.subprocess.run = saved
+        return seen
+
+    def test_no_input_means_devnull_not_the_callers_stdin(self):
+        import subprocess
+        kw = self._capture(None)
+        self.assertNotIn("input", kw,
+                         "input=None is not 'no stdin', it is 'stdin the caller still owns'")
+        self.assertIs(subprocess.DEVNULL, kw.get("stdin"))
+
+    def test_the_sql_a_caller_does_pass_still_reaches_the_child(self):
+        sql = b"INSERT INTO t VALUES (1);\n"
+        kw = self._capture(sql)
+        self.assertEqual(sql, kw.get("input"))
+        self.assertNotIn("stdin", kw, "input and stdin together is a ValueError at exec time")
+
+    def test_a_child_with_no_sql_of_its_own_reads_an_empty_stdin_and_returns(self):
+        # The regression this pins is the silent stop, not an exception: an inherited
+        # fd 0 still holding the tail of a piped script makes `cat` swallow it instead
+        # of answering. DEVNULL is EOF at once, so this returns.
+        rc, out, err = self._mysql()._run(["cat"], timeout=15)
+        self.assertEqual((0, "", ""), (rc, out, err))
+
+
+class TestJsonReportPath(unittest.TestCase):
+    """PRO-307 A5: an unusable --json path answered with a raw traceback."""
+
+    def _main(self, argv):
+        import preflight_worlddb as P
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = P.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _argv(self, path):
+        return ["--policy", str(HERE / "preflight-policy.json"), "--json", path]
+
+    def test_a_missing_parent_directory_is_an_operational_error(self):
+        # PRO-307 A5 asked for an operational answer rather than a raw Python traceback
+        # when `--json` names a path whose parent does not exist. The gate got that from
+        # the payload half of PRO-313/PRO-325's rework: the write is guarded and its
+        # failure becomes a named, non-zero refusal, so there is nothing left for a
+        # traceback to be. What is pinned here is the property the operator actually
+        # needs — no stack trace, the path named, a documented rc, boot refused.
+        #
+        # The gate itself is stubbed: unstubbed it stops at check [0] with a
+        # db-access operational error on a host with no container, which is a different
+        # (and correct) answer and would never reach the payload write.
+        import preflight_worlddb as P
+
+        class StubPreflight:
+            def __init__(self, args, policy, report):
+                self.args, self.policy, self.report = args, policy, report
+                self.sql_root = Path(args.compose_root) / "data" / "sql"
+                self.git_root = Path(args.compose_root)
+
+            def run(self):
+                return P.EXIT_OK
+
+        saved = P.Preflight
+        P.Preflight = StubPreflight
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp) / "not-created" / "report.json")
+                code, _out, err = self._main(self._argv(path))
+        finally:
+            P.Preflight = saved
+        self.assertEqual(P.EXIT_ERROR, code)
+        self.assertIn("--json", err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("not-created", err)
+        self.assertIn("could not write", err)
+        self.assertIn("boot is refused", err)
+
+    def test_a_path_whose_parent_exists_is_not_refused_up_front(self):
+        # The path is the thing that must be refused, not the flag: with a real parent
+        # the run has to get as far as the gate itself. This is also the guard against
+        # re-adding an up-front `--json` parent-directory check, which would pre-empt the
+        # payload-vs-verdict split PRO-341 review B1 pinned.
+        import preflight_worlddb as P
+        saved = P.Preflight
+
+        def boom(*a, **k):
+            raise RuntimeError("reached the gate")
+
+        P.Preflight = boom
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(RuntimeError):
+                    self._main(self._argv(str(Path(tmp) / "report.json")))
+        finally:
+            P.Preflight = saved
+
+    def test_the_flag_says_the_parent_has_to_exist(self):
+        help_text = build_arg_parser().format_help()
+        self.assertIn("--json", help_text)
+
+
+class TestScanRootIsNamedHonestly(unittest.TestCase):
+    """PRO-307 A3 item 2: the banner has to admit which tree the scan walked.
+
+    `--sql-root` only feeds check 0b and the banner; the `updates_include` paths the
+    file scan walks are `$`-relative to `--git-root`. PRO-303 ran the gate with
+    `--git-root /mnt/data/wow-server --sql-root <worktree>/data/sql`, and the report
+    printed the worktree as "sql root" while having counted 3060 files from the other
+    tree — the one line that answers "which files did you actually look at" lied.
+    """
+
+    def test_the_banner_names_the_tree_the_scan_walked(self):
+        from preflight_worlddb import Report, render
+        report = Report()
+        report.data["sql_root"] = "/worktree/data/sql"
+        report.data["scanned_from"] = "/mnt/data/wow-server"
+        text = render(report, build_arg_parser().parse_args(["--compose-root", "/nonexistent"]))
+        self.assertIn("/mnt/data/wow-server", text)
+        self.assertIn("scanned from", text)
+        self.assertIn("/worktree/data/sql", text)
+        # The two lines must not be interchangeable: each says what its root is for.
+        self.assertIn("updates_include", text)
+        self.assertIn("0b", text)
+
+    def test_the_two_flags_say_which_one_steers_the_scan(self):
+        helps = {tuple(a.option_strings): (a.help or "")
+                 for a in build_arg_parser()._actions}
+        self.assertIn("does NOT choose which files are scanned", helps[("--sql-root",)])
+        self.assertIn("boot-path mount check (check 0b)", helps[("--sql-root",)])
+        self.assertIn("updates_include", helps[("--git-root",)])
+        self.assertIn("decides which files the gate actually looked at",
+                      helps[("--git-root",)])
+        self.assertIn("parent directory must already exist", helps[("--json",)])
+
+
 class TestPolicyAuditPinsProvenance(unittest.TestCase):
     """PRO-248 review N3: the ref the exemption rests on is a policy invariant too.
 
@@ -3957,6 +4194,140 @@ class TestPolicyAuditPinsProvenance(unittest.TestCase):
         policy = json.loads(json.dumps(POLICY))
         policy["upstreamProvenance"] = "origin/Playerbot"
         self.assertEqual(1, len(self._problems(policy)))
+
+    # -- the depth a text check cannot reach (PRO-307 A2, A3 item 1) ---------------- #
+
+    REF = "refs/remotes/origin/Playerbot"
+
+    def _git(self, d, *argv):
+        import subprocess
+        proc = subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *argv],
+                              cwd=str(d), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, text=True)
+        self.assertEqual(0, proc.returncode, f"git {' '.join(argv)}: {proc.stderr}")
+        return proc.stdout.strip()
+
+    def _repo(self, tmp, with_ddl=True):
+        d = Path(tmp)
+        if with_ddl:
+            (d / "data/sql/base/db_world").mkdir(parents=True)
+        (d / "README").write_text("seed\n")
+        self._git(d, "init", "-q", "-b", "master", ".")
+        self._git(d, "add", "-A")
+        self._git(d, "commit", "-qm", "seed")
+        return d
+
+    def _prov_policy(self, ref=None):
+        """The shipped policy's provenance block, with the column half taken away.
+
+        A temp repo cannot hold the 300-odd base tables the policy claims, and column
+        drift is not what these four cases are about; `upstreamProvenance` itself is
+        the shipped one, unchanged.
+        """
+        policy = {"upstreamProvenance": json.loads(json.dumps(POLICY["upstreamProvenance"]))}
+        self.assertEqual(POLICY["upstreamProvenance"], policy["upstreamProvenance"])
+        if ref is not None:
+            policy["upstreamProvenance"]["verifiedRef"] = ref
+        return policy
+
+    def _audit(self, repo, policy):
+        import audit_policy_schema
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            pfile = Path(tmp) / "policy.json"
+            pfile.write_text(json.dumps(policy))
+            with contextlib.redirect_stdout(out):
+                code = audit_policy_schema.main(
+                    ["--repo", str(repo), "--policy", str(pfile), "--no-modules"])
+        return code, out.getvalue()
+
+    def _problems_in(self, policy, repo):
+        import audit_policy_schema
+        return audit_policy_schema.provenance_problems(policy, repo)
+
+    def test_a_verified_ref_naming_a_tree_is_refused_where_a_repo_can_say_so(self):
+        # PRO-303 measured this on the deployhost: a policy copy naming
+        # refs/remotes/origin/pro303-drill-tree, created with
+        # `git update-ref ... $(git rev-parse 194697d5d^{tree})`, made the gate refuse
+        # the boot as `upstream-ref-not-a-commit` while the audit on the same repo and
+        # the same file printed "0 problem(s)" and exited 0. That is the divergence
+        # f96c40313 was written to close, and the `_comment` claiming the auditor
+        # "exits 1 on all three" was untrue for this shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._repo(tmp)
+            tree = self._git(d, "rev-parse", "HEAD^{tree}")
+            self.assertEqual("tree", self._git(d, "cat-file", "-t", tree))
+            self._git(d, "update-ref", self.REF, tree)
+            policy = self._prov_policy()
+            self.assertEqual([], self._problems(policy),
+                             "the shape check alone still passes it — that is the bug")
+            problems = self._problems_in(policy, d)
+            self.assertEqual(1, len(problems), problems)
+            self.assertIn("not a commit", problems[0])
+            self.assertIn(tree[:12], problems[0])
+            self.assertIn("not-a-commit", problems[0])
+            code, out = self._audit(d, policy)
+            self.assertEqual(1, code, out)
+            self.assertIn("RESOLVED", out)
+            self.assertIn("not a commit", out)
+            self.assertNotIn("0 problem(s)", out)
+
+    def test_a_verified_ref_deleted_from_the_clone_is_refused_where_a_repo_can_say_so(self):
+        # PRO-307 A3 item 1: the README said the auditor exits 1 when verifiedRef is
+        # "deleted", and it only ever meant a deleted *field*. With the unmodified
+        # shipped policy and a clone that no longer carries the ref, the gate refused
+        # the boot as upstream-ref-deleted while the audit exited 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._repo(tmp)
+            self.assertEqual([], self._problems(POLICY))
+            problems = self._problems_in(POLICY, d)
+            self.assertEqual(1, len(problems), problems)
+            self.assertIn("upstream-ref-deleted", problems[0])
+            self.assertIn(POLICY["upstreamProvenance"]["refreshCommand"], problems[0])
+            code, out = self._audit(d, self._prov_policy())
+            self.assertEqual(1, code, out)
+            self.assertIn("upstream-ref-deleted", out)
+
+    def test_a_verified_ref_that_peels_to_a_commit_audits_clean_resolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._repo(tmp)
+            self._git(d, "update-ref", self.REF, self._git(d, "rev-parse", "HEAD"))
+            code, out = self._audit(d, self._prov_policy())
+            self.assertEqual(0, code, out)
+            self.assertIn("RESOLVED", out)
+            self.assertIn("0 problem(s)", out)
+            self.assertNotIn("shape-only pass does not mean", out)
+
+    def test_the_output_says_which_depth_the_provenance_check_ran(self):
+        # "0 problem(s)" must never be readable as more than it means: with no repo the
+        # audit has only ever read the name.
+        import audit_policy_schema
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "tree"
+            plain.mkdir()
+            (plain / "data/sql/base/db_world").mkdir(parents=True)
+            self.assertEqual("shape-only",
+                             audit_policy_schema.provenance_mode(POLICY, None)[0])
+            self.assertEqual("shape-only", audit_policy_schema.provenance_mode(POLICY, plain)[0])
+            code, out = self._audit(plain, self._prov_policy())
+            self.assertEqual(0, code, out)
+            self.assertIn("SHAPE-ONLY", out)
+            self.assertIn("does not mean verifiedRef resolves", out)
+            d = self._repo(str(Path(tmp) / "git"))
+            self.assertEqual("resolved", audit_policy_schema.provenance_mode(POLICY, d)[0])
+
+    def test_a_malformed_name_is_reported_once_and_never_resolved(self):
+        # The two depths must not file the same defect twice, and a name the shape
+        # check already rejects is not worth a peel.
+        import audit_policy_schema
+        policy = json.loads(json.dumps(POLICY))
+        policy["upstreamProvenance"]["verifiedRef"] = "Playerbot"
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._repo(tmp)
+            problems = self._problems_in(policy, d)
+            self.assertEqual(1, len(problems), problems)
+            self.assertIn("refs/remotes/", problems[0])
+            self.assertEqual("shape-only", audit_policy_schema.provenance_mode(policy, d)[0])
 
 def targets_for(sql: str, known_names: set[str] | None = None) -> list[tuple[str | None, str]]:
     """The write targets a rejected region names, for assertions on the name scan."""
@@ -4826,6 +5197,9 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             def __init__(self, args, policy, report):
                 self.args, self.policy, self.report = args, policy, report
                 self.sql_root = Path(args.compose_root) / "data" / "sql"
+                # PRO-307 A3: main() reports which tree the scan walked, so the stub
+                # has to carry it the way the real Preflight does.
+                self.git_root = Path(args.compose_root)
 
             def run(self):
                 self.report.fail("3",
@@ -5205,6 +5579,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             def __init__(self, args, policy, report):
                 self.args, self.policy, self.report = args, policy, report
                 self.sql_root = pathlib.Path(args.compose_root) / "data" / "sql"
+                self.git_root = pathlib.Path(args.compose_root)
 
             def run(self):
                 self.report.fail("3", "fixture: refused on purpose",
