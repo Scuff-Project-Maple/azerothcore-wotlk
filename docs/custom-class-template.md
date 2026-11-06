@@ -171,8 +171,8 @@ bypass). The custom class system plugs into that existing mechanism:
    per-character unlocks.
 5. **Allocation ledger (current):** the range is free; assign the lowest
    free bit per template in `template_key` alphabetical order. Currently
-   allocated: *(none yet — first allocation happens with the PRO-10 Warden
-   seed, which takes `2048` = `1<<11`)*.
+   allocated: **warden** = `2048` (`1<<11`, PRO-10 seed row); next free
+   bit: `4096` (`1<<12`).
 
 Content code that needs to test "is this player the custom class X" uses
 `player->GetUnboundClassMask() & <bit>` — never a class check against the
@@ -228,7 +228,7 @@ VALUES
  18,
  2,
  3,
- 2048,
+ 4096,
  1,
  'Fictional example row for the contract doc. Tree 7 = Rogue Assassination.');
 ```
@@ -243,7 +243,9 @@ Notes:
   the grimweaver can use a hunter-tame spell to tame that family.
 - `weapon_prof_mask = 2` (`1 << ITEM_SUBCLASS_WEAPON_DAGGERS`) → dagger
   proficiency granted on login; `armor_prof_mask = 3` → leather + cloth.
-- `unbound_mask_bit = 2048` → the first allocation per §6.
+- `unbound_mask_bit = 4096` → example only. `2048` (`1<<11`) is already
+  allocated to warden (§6 ledger); a new class takes the next free bit from
+  that ledger, not this number.
 - `action_bar` is recorded for client tooling; the server ignores it.
 
 ## 9. Designer guide: how to add a class
@@ -296,3 +298,94 @@ Removing a class = `DELETE` the row (or set `enabled = 0`) and reload.
 - **Client cosmetics:** `color`/`icon`/`action_bar` are informational hints
   for client-side tooling (e.g. an addon); the server does not enforce
   client appearance.
+
+## 12. Warden — reference instance (PRO-10 / PRO-11)
+
+Warden is the first real template entry and the acceptance test of this
+contract: it was built from **this table plus the generic hooks only** —
+zero class-specific C++ outside `mod-custom-classes`. Designers copying this
+example: a new class = one row like the one below, chosen from the fields in
+§2–§6. No C++, no new spell ids, no new talent trees.
+
+The zero-C++ claim is re-checked against `origin/Playerbot` rather than
+asserted from memory. The load-bearing check is
+`git grep -lE "OnPlayerOnline|OnPlayerAfterUpdateAllStats|OnPlayerLfgSetRoles|GetUnboundClassMask" src/`,
+which lists exactly the **twelve** files the two generic core patches install
+(`-n` instead of `-l` gives 22 matching lines over the same twelve) — all
+class-agnostic:
+
+- `wrath-unbound/modules/mod-unbound/unbound-core-access.patch` → **six**
+  files holding the generic `Player::GetUnboundClassMask()` accessor and its
+  unbound consult sites: `Player.h`, `Player.cpp`, `PlayerStorage.cpp`,
+  `PlayerQuest.cpp`, `ConditionMgr.cpp`, `Trainer.cpp`.
+- `wrath-unbound/modules/mod-custom-classes/custom-class-core-access.patch`
+  → a **disjoint six** files installing three generic `PlayerScript` hooks
+  (`OnPlayerOnline`, `OnPlayerAfterUpdateAllStats`, `OnPlayerLfgSetRoles`):
+  `src/server/game/Entities/Unit/StatSystem.cpp`,
+  `src/server/game/Handlers/CharacterHandler.cpp`,
+  `src/server/game/Handlers/LFGHandler.cpp`,
+  `src/server/game/Scripting/ScriptDefines/PlayerScript.cpp`,
+  `src/server/game/Scripting/ScriptDefines/PlayerScript.h`,
+  `src/server/game/Scripting/ScriptMgr.h`.
+
+Each patch lives in its module's tracked home (the build consumes the working
+copies staged under `modules/`). None of the added lines branch on a class:
+`GetUnboundClassMask()` is a plain accessor and the three `PlayerScript`
+hooks are class-agnostic plumbing. `git grep -i customclass src/` is empty,
+but that check only proves an absence of *naming* — none of the hook
+additions contain the token `customclass`, so it stays empty whether or not
+`custom-class-core-access.patch` is applied. The grep above is the check that
+measures the claim, and it measures it in one direction: it pins where those
+four tokens live and what the added lines do. That the *rest* of core adds no
+class branching is a commit-history claim, not a grep result — every other
+core-source commit since the pinned Playerbot base is conf-only or
+DB/subsystem work with no class branching (PRO-32 async DB-pool hardening, the
+PRO-9/PRO-57 `worldserver.conf.dist` edits, and the
+`ValidateSkillLearnedBySpells = 0` conf change §12 relies on for the 1515
+cross-class grant). Nothing in `Player` branches on a custom class.
+
+**The exact input set Warden needed** (world DB `custom_class_template`,
+applied by `data/sql/updates/pending_db_world/2026_10_05_00.sql`,
+validation queries in `2026_10_05_01.sql`):
+
+| Input | Value | Why |
+|---|---|---|
+| `template_key` / `display_name` | `warden` / `Warden` | identity; display name is informational (client sees the backing class) |
+| `backing_class` | `2` (Paladin) | only vanilla class with one talent tree per LFG role — the tank/healer/dps reference |
+| `color` / `icon` | `8C7AE6` / `ability_paladin_sealofprotection` | informational client hints |
+| `primary_stat` | `0` (STRENGTH) | informational |
+| `health_curve` | `{"1": 74, "10": 238, "20": 455, "30": 773, "40": 1199, "50": 1735, "60": 2377, "70": 4749, "80": 8839}` | vanilla paladin base + 8% — a tank-leaning deviation large enough for QA to see the curve path in-game |
+| `mana_curve` | `{"1": 80, …, "80": 5574}` | paladin is a mana class; full table in the seed |
+| `ap_curve` | `{"melee": {"1": 27, …, "80": 522}}` | melee only; no ranged for Warden |
+| `spellpower_curve` | `{"1": 6, …, "80": 180}` | non-zero on purpose: vanilla paladin base spell power is 0; gives the Holy/healer spec a healing identity |
+| `crit_curve` | *(empty)* | keep vanilla agility-driven melee crit |
+| `specs` | 3 entries: tree `381` Retribution / role `damage`, tree `382` Holy / role `healer`, tree `383` Protection / role `tank` | one spec per paladin tab, one LFG role each; whitelists = the full vanilla per-tab talent id lists (381: 26 ids, 382: 26 ids, 383: 26 ids), so all three trees stay learnable — spec *gating*, not spell removal, is what Warden exercises |
+| `starting_kit` | spells `[1515, 642, 633, 4987, 635, 19740, 853, 20154, 20271, 465]`, no items, no action bar | 1515 Tame Beast is cross-class (hunter spell on a paladin) — granted only because `ValidateSkillLearnedBySpells = 0`; 10321 Judgement deliberately excluded (trainer TEACH-id grant quirk, see mod-unbound `14_judgement_fix.sql`) |
+| `pet_family` | `4` (Beasts) | enables the taming path (§2 `pet_family` + the generic `IsClass(CLASS_HUNTER, CLASS_CONTEXT_PET)` override) |
+| `weapon_prof_mask` / `armor_prof_mask` | `0` / `0` | Warden characters are paladin characters; they inherit vanilla paladin profs. Non-zero masks are granted idempotently on login by the same hook, no code change |
+| `unbound_mask_bit` | `2048` (`1<<11`) | first ledger allocation (§6); OR-ed into the player's unbound mask on login so every existing unbound consult site accepts Warden |
+
+Empty columns above (`crit_curve`, kit items/action bar, prof masks) are the
+"vanilla" default of the template — leaving a column empty is a feature, not
+an omission.
+
+**Verification status:**
+
+- Stage-1 and stage-2 validation passed on the running worldserver (host
+  `192.168.1.71`) at [PRO-11](/PRO/issues/PRO-11) sign-off, 2026-10-19:
+  `custom class registry ready: 1 template(s) active (0 removed after DBC
+  validation)`, i.e. all three spec trees resolve in `TalentTab.dbc` for the
+  paladin, every whitelist id exists in `Talent.dbc`, all ten kit spells
+  exist in `Spell.dbc`, and family 4 exists in `CreatureFamily.dbc`.
+- Zero-regression core audit: no class-branching code in `Player` or any
+  other core file outside `mod-custom-classes` (re-checked as described
+  above).
+- In-game acceptance (stat bases per curve, trainer/talent gating, starting
+  kit on a fresh character, LFG role clamp, taming, and Warden co-existing
+  with an unbound class unlock) is **still outstanding**. The
+  external-client login stall that originally blocked it
+  ([PRO-21](/PRO/issues/PRO-21)) is closed; the pass now lands with the
+  [PRO-14](/PRO/issues/PRO-14) QA verdict, which is itself waiting on the
+  [PRO-13](/PRO/issues/PRO-13) review gate. Until that verdict lands, the
+  curve deviations and other design assumptions in the row above are still
+  assumptions, not measured results.
