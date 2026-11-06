@@ -914,11 +914,22 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp) / "baseline.json"
                 base.write_text(json.dumps(self.RESULT_CLEAN))
+                self._give_it_a_tree(tmp)
                 with contextlib.redirect_stdout(out):
-                    code = cs.main(["--diff", str(base), *argv])
+                    code = cs.main(["--diff", str(base), "--compose-root", tmp, *argv])
         finally:
             cs.build_files, cs.tally = saved
         return code, out.getvalue()
+
+    @staticmethod
+    def _give_it_a_tree(tmp: str) -> None:
+        """cs.main() refuses a tree with no data/sql, so give the temp tree one.
+
+        Without this the suite only passes when the test file happens to sit in a real
+        repo checkout: default_root is corpus_sweep.py's parents[2], so an installed
+        ops/preflight/ directory outside a checkout exits 2 on every sweep test.
+        """
+        (Path(tmp) / "data" / "sql").mkdir(parents=True, exist_ok=True)
 
     def test_company_findings_drive_the_exit_status(self):
         clean, _ = self._sweep(self.RESULT_CLEAN, [])
@@ -1010,8 +1021,10 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         cs.tally = lambda engine, files: dict(self.RESULT_CLEAN)
         cs.pf.Preflight = Spy
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                code = cs.main([])
+            with tempfile.TemporaryDirectory() as tmp:
+                self._give_it_a_tree(tmp)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = cs.main(["--compose-root", tmp])
         finally:
             cs.build_files, cs.tally, cs.pf.Preflight = saved
         self.assertEqual(0, code)
