@@ -1,0 +1,88 @@
+name: World DB pre-flight
+
+# The three checks that answer "did a change to the write-policy engine, or to the SQL
+# it governs, just start refusing syntax it must accept" — the question the boot gate
+# cannot answer, because it only policy-checks files the updater has not applied yet.
+# Everything here is pure Python against the checkout: no MySQL, no Docker, no deploy
+# host. A step that needed one of those would not belong in this workflow.
+#
+# What gates and what only reports is written out in ops/preflight/README.md
+# ("In CI"). In one line: findings in the `company` provenance column fail the check,
+# the `upstream` columns are measured and reported and never fail it, and a run whose
+# provenance could not be attributed fails rather than passing quietly.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    paths:
+      - ops/preflight/**
+      - data/sql/**
+      - .github/workflows/worlddb-preflight.yml
+  workflow_dispatch: {}
+
+concurrency:
+  # New commits on a PR cancel the still-running check on the old commit. github.ref
+  # is refs/pull/<N>/merge, so the group is stable per PR.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy-engine:
+    runs-on: ubuntu-latest
+    name: Write policy — engine tests and schema audit
+    timeout-minutes: 10
+    # No `github.repository == ...` guard on purpose: a guard that names the wrong
+    # repository makes the check stop existing rather than fail, and a check that never
+    # runs is the exact failure mode this workflow exists to close (PRO-285).
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - name: Write-policy unit tests
+        # ~0.5 s, no DB. Plain `python3 -m unittest discover -s ops/preflight` does not
+        # work: the directory is not a package.
+        run: python3 ops/preflight/test_preflight_worlddb.py
+      - name: Policy tables vs the real DDL
+        # Checks every baseTables/customTables column against data/sql/base/db_world and
+        # the module SQL that creates the custom tables. Discovers module DDL with
+        # `git ls-files`, so it needs a checkout and nothing else.
+        run: python3 ops/preflight/audit_policy_schema.py --include-modules
+
+  corpus-sweep:
+    runs-on: ubuntu-latest
+    name: Write policy — corpus sweep (company column gates, upstream columns report)
+    # Measured 4m32s on a 6-core box with the default 8 workers, ~6 min on 4 workers.
+    # The per-file `git log` author lookups dominate, so the budget is history-bound.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Provenance is read from `git log -1 -- <path>` per file. On a partial
+          # history those lookups come back empty, every file lands in `unknown`, and
+          # the `company` column the check gates on collapses to zero on its own. The
+          # guard step below turns that into a red check; the full fetch is what stops
+          # it from happening.
+          fetch-depth: 0
+      - name: Setup python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+      - name: Whole-corpus write policy
+        # The gate. Exits 1 on any finding in the `company` column and prints each one
+        # as file:line: rule. Reproduce locally from a checkout of the PR head with the
+        # identical command:
+        #   python3 ops/preflight/corpus_sweep.py --strict-all --out /tmp/corpus-sweep.json
+        run: >-
+          python3 ops/preflight/corpus_sweep.py --strict-all
+          --out "$RUNNER_TEMP/corpus-sweep.json"
+      - name: Provenance attribution guard
+        # Second half of the gate: refuses a tally that could not attribute the files it
+        # scanned, so a green company column cannot come from a checkout that has no
+        # history to read.
+        run: python3 ops/preflight/ci_provenance_guard.py "$RUNNER_TEMP/corpus-sweep.json"

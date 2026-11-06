@@ -9,7 +9,12 @@ It refuses the boot unless the four `db_world` directories that
     PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py  # policy-engine tests, no DB needed
 
 `PREFLIGHT_CHECK_ONLY=1 ops/deploy/worldserver-up.sh` runs the gate without touching the
-stack — that is the CI / merge-gate rehearsal form. The wrapper **verifies** the single-writer
+stack — the rehearsal form, for a human on a machine that has the live database. The PR
+workflow does **not** run it: `.github/workflows/worlddb-preflight.yml` runs only the
+pure-Python checks (see "In CI" below), because the boot gate reads the live schema and no
+CI job has one.
+
+The wrapper **verifies** the single-writer
 lease at `<compose_root>/.stack/lease` and refuses to boot if it is missing, unreadable or
 past its `expectedMinutes` window, but it never **takes** it: the gate is read-only against the
 live database plus one scratch schema it drops afterwards, and a gate that could grab the lease
@@ -124,9 +129,11 @@ reviewer and the next real fetch moves the ref back — where the author forge w
 command. It is also no wider a privilege than the ones already in the same file: whoever can
 `update-ref` can edit `preflight-policy.json` outright (`companyEmailDomains`,
 `includedDirs[].origin`, `reservedIdBands`), which is why the policy is pinned by
-`audit_policy_schema.py` rather than by this check. That pin is real but manual: step 3 of
-"Adding a table to the policy" below is what runs it, and a reviewer re-runs it — there is no
-CI job for it, and nothing under `.github/workflows/` references `ops/preflight`. An upstream
+`audit_policy_schema.py` rather than by this check. That pin is now run in CI — the
+`Write policy — engine tests and schema audit` job of
+`.github/workflows/worlddb-preflight.yml` runs `audit_policy_schema.py --include-modules` and
+fails the check on any problem (PRO-285) — and step 3 of "Adding a table to the policy" below is
+what runs it locally before a push. An upstream
 file that trips the reserved
 bands stays exempt from check 4, and the corpus `upstream` column records those 444 726 findings as
 review material, not boot failures.
@@ -135,11 +142,10 @@ So **check 4 covers company content only**, by design. `--strict-all` (policy on
 warnings too) is not a usable boot-time setting: against this tree it fails ~754 of 861 upstream
 files — 77094 reserved-band, 52967 table-not-allowed, 1666 band-not-literal, 1452 unbounded-write,
 25 `DROP`, 4 on `updates`, 2 `EXECUTE` — every one of them upstream content the updater has
-always applied. `--policy-all` reports the same set without failing and is the form a review
-or a sweep runs by hand; the boot gate runs the default company-only mode. Neither form is
-wired into CI — nothing under `.github/workflows/` references `ops/preflight`, so the gate is
-only as strong as the boot path in `ops/deploy/worldserver-up.sh` that runs it. Anything that
-must hold against upstream too is a review question, not a boot gate.
+always applied. `--policy-all` reports the same set without failing and is what a reviewer runs by
+hand; **nothing in CI runs `--policy-all`** — the CI sweep uses `--strict-all` and gates on the
+`company` column only (see "In CI" below). The boot gate runs the default company-only mode.
+Anything that must hold against upstream too is a review question, not a boot gate.
 
 ## Write policy (check 4)
 
@@ -205,16 +211,12 @@ python3 ops/preflight/corpus_sweep.py --rule table-not-allowed  # offending file
 The number that matters is the `company` column: it must stay 0, because a finding in
 company-authored SQL is a boot refusal. It is therefore also the exit status — a non-zero company
 total, or a `--diff` that shows findings migrating `upstream → company` at constant totals, exits
-1 (PRO-179 review NB-C). `--measure-only` returns 0 regardless, which is what a baseline capture
-needs. The `upstream` columns are the corpus the gate exempts by default, and are measured with
-`--strict-all` to see how much syntax the engine understands. `liveDatabase` is read from the
-policy file, so `cross-schema-write` is measured against the schema the gate actually uses.
-
-**Be honest about the CI claim:** the exit status is *shaped* for CI, but nothing in
-`.github/workflows/` calls `corpus_sweep.py` today, so nothing fails a pull request on a parser
-regression. A run over the whole corpus costs a few minutes (the per-file `git log` author lookups
-dominate), which is the actual reason it is not wired up yet. Until someone adds the workflow,
-treat the sweep as a review step you run, not a check that runs you.
+1, and the failing run prints each company row as `file:line: rule: detail` so the log names the
+file and the rule instead of sending the reader to `--rule` (PRO-179 review NB-C, PRO-285).
+`--measure-only` returns 0 regardless, which is what a baseline capture needs. The `upstream`
+columns are the corpus the gate exempts by default, and are measured with `--strict-all` to see how
+much syntax the engine understands; they are **reported, never gated**. `liveDatabase` is read from
+the policy file, so `cross-schema-write` is measured against the schema the gate actually uses.
 
 The second invariant the sweep enforces (PRO-179 review rank 3) is printed on its own line:
 
@@ -283,6 +285,41 @@ author or left dirty in the work tree, and both return to 0 once the file is res
 a detached work tree: `git reset --hard HEAD` does **not** undo the crafted commit (reset to the
 base commit), and that reset also reverts `ops/preflight/` — re-copy the engine files after it or
 you will sweep the engine you just replaced.
+
+### In CI (`.github/workflows/worlddb-preflight.yml`)
+
+The sweep is wired up (PRO-285). On a pull request touching `ops/preflight/**` or `data/sql/**`,
+two jobs run. Both are pure Python against the checkout: **no MySQL, no Docker, no deploy host**,
+and nothing in either job shells out to a database.
+
+| Step | Command | Verdict |
+| --- | --- | --- |
+| engine tests | `python3 ops/preflight/test_preflight_worlddb.py` | gates |
+| schema audit | `python3 ops/preflight/audit_policy_schema.py --include-modules` | gates |
+| corpus sweep | `python3 ops/preflight/corpus_sweep.py --strict-all --out "$RUNNER_TEMP/corpus-sweep.json"` | gates on the `company` column |
+| provenance guard | `python3 ops/preflight/ci_provenance_guard.py "$RUNNER_TEMP/corpus-sweep.json"` | gates |
+
+Read the verdict column literally.
+
+- **gates** means the check is red when the command fails, and the commands are the ones above,
+  verbatim, un-wrapped. Reproduce a failure locally by checking out the PR head and running the
+  same line; the log names the rule per finding (`data/sql/updates/pending_db_world/x.sql:12:
+  table-not-allowed: ...`).
+- The `upstream` columns **report only**. This tree measures ~444 700 upstream findings and always
+  will; a number moving there is information for the reviewer, not a merge failure. That is the same
+  decision the boot gate makes about upstream content, written down instead of left to whoever reads
+  a log.
+- The guard is not a second policy verdict — company findings are `corpus_sweep.py`'s to fail on.
+  It fails a run whose provenance could not be attributed. `git_author_origin()` asks
+  `git log -1 -- <path>` per file; on a partial history that returns nothing, files are classified
+  `unknown`, and the `company` column falls to zero **by itself** — a green check produced by the
+  absence of a measurement. That is what the guard refuses, and why the sweep job checks out with
+  `fetch-depth: 0`.
+
+What a green check does **not** say: it is not a boot rehearsal. None of these steps reads the
+`updates` ledger, hashes pending files, replays them into a scratch schema or checks a compose
+mount — those belong to the boot gate (see "Dry run (check 5)"). Green here means the write-policy
+engine agrees with itself over the corpus in this checkout, and that the corpus was attributable.
 
 ## Dry run (check 5)
 

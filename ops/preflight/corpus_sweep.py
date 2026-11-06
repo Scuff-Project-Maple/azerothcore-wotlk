@@ -17,11 +17,17 @@ the policy from preflight-policy.json, exactly as the gate reads them.
 
 The invariant the README names is the `company` column: those are the findings that
 turn into `REFUSING BOOT`. It is therefore also the exit status — a non-zero company
-total exits 1, so this can be wired into CI instead of read by eye. `--diff` prints
+total exits 1, and `.github/workflows/worlddb-preflight.yml` runs it that way on every
+pull request that touches `ops/preflight/**` or `data/sql/**`. `--diff` prints
 the per-rule company delta alongside the total, because a finding that migrates
 `upstream -> company` leaves the totals untouched while creating a new boot refusal
 (PRO-179 review NB-C). Use `--measure-only` for a baseline capture, where a non-zero
 company total is expected and must not fail the run.
+
+The `--out` tally is also the input to `ci_provenance_guard.py`, which reads
+`provenanceFiles`/`byRuleOrigin` and refuses a run whose provenance could not be
+attributed — a green company column on a checkout that could not attribute anything is
+a check that measured nothing (PRO-285).
 
 Exit status: 0 clean, 1 findings in the company column, 2 on a usage/operational error.
 """
@@ -38,6 +44,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+# A company-authored file is supposed to have zero findings, so the list is normally
+# short; the cap only exists so a policy change that suddenly refuses company content
+# cannot bury the rest of the CI log.
+COMPANY_DETAIL_LIMIT = 100
 
 import preflight_worlddb as pf  # noqa: E402
 
@@ -125,6 +136,18 @@ def tally(engine: pf.Preflight, files: list[dict]) -> dict:
         dirn = f["dir"]["db_path"] if f else "?"
         by_rule_origin.setdefault(v["rule"], Counter())[origin] += 1
         by_dir[dirn] += 1
+    # Report fidelity only — no judgement in here changes which statements the engine
+    # accepts. The `company` column is the one the CI check gates on, and "COMPANY
+    # findings: N" is not an actionable failure: the reader has to learn which file and
+    # which rule, and `--rule` re-runs the whole sweep to answer it (PRO-285). So the
+    # offending rows are recorded while the tallies are being counted.
+    company_list = [
+        {"file": v["file"], "line": v.get("line"), "rule": v["rule"],
+         "detail": (v.get("detail") or "")[:200]}
+        for v in engine.violations
+        if (by_rel.get(v["file"]) or {}).get("origin") == "company"
+    ]
+    provenance_files = dict(Counter(f.get("origin", "unknown") for f in files))
     return {
         "files": len(files),
         "filesUnderPolicy": engine.policy_stats.get("files", 0),
@@ -136,6 +159,9 @@ def tally(engine: pf.Preflight, files: list[dict]) -> dict:
         "byRuleOrigin": {r: dict(c) for r, c in sorted(by_rule_origin.items())},
         "byDir": dict(sorted(by_dir.items())),
         "perFile": dict(Counter(v["file"] for v in engine.violations).most_common(25)),
+        "companyFindingList": sorted(
+            company_list, key=lambda v: (v["file"], v["line"] or 0, v["rule"])),
+        "provenanceFiles": {k: v for k, v in sorted(provenance_files.items())},
     }
 
 
@@ -270,7 +296,13 @@ def main(argv=None) -> int:
                 exit_code = 1
     if result["companyFindings"]:
         print(f"\nCOMPANY findings: {result['companyFindings']} — every one of these is a "
-              f"boot refusal today; list them with --rule RULE")
+              f"boot refusal today")
+        listed = result.get("companyFindingList") or []
+        for v in listed[:COMPANY_DETAIL_LIMIT]:
+            print(f"  {v['file']}:{v.get('line')}: {v['rule']}: {v['detail']}")
+        if len(listed) > COMPANY_DETAIL_LIMIT:
+            print(f"  ... and {len(listed) - COMPANY_DETAIL_LIMIT} more; "
+                  f"--rule RULE lists one rule in full")
         if not args.measure_only:
             exit_code = 1
     unmatched = result.get("scanConsultationsWithoutRefusal")

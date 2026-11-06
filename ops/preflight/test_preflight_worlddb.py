@@ -1787,6 +1787,165 @@ class TestRev5RegionScanImpliesRefusal(unittest.TestCase):
         finally:
             pw._region_tables = real
 
+class TestCorpusSweepNamesTheOffendingCompanyFile(unittest.TestCase):
+    """PRO-285: the CI check fails on the company column, so it has to name it."""
+
+    class StubEngine:
+        def __init__(self, violations):
+            self.violations = violations
+            self.policy_stats = {"files": 2, "statements": 4}
+
+        def check_policy(self, files):
+            pass
+
+    def _tally(self):
+        import corpus_sweep as cs
+        files = [
+            {"rel": "pending.sql", "origin": "company", "dir": {"db_path": "$/pending"}},
+            {"rel": "archive.sql", "origin": "upstream", "dir": {"db_path": "$/archive"}},
+        ]
+        violations = [
+            {"file": "pending.sql", "line": 7, "rule": "table-not-allowed",
+             "detail": "writes `updates`"},
+            {"file": "archive.sql", "line": 3, "rule": "reserved-band",
+             "detail": "entry 1234 below the band"},
+        ]
+        return cs.tally(self.StubEngine(violations), files)
+
+    def test_tally_records_the_company_rows_and_the_provenance_file_counts(self):
+        result = self._tally()
+        self.assertEqual([{"file": "pending.sql", "line": 7, "rule": "table-not-allowed",
+                           "detail": "writes `updates`"}], result["companyFindingList"],
+                         "the upstream finding leaked into the company list")
+        self.assertEqual({"company": 1, "upstream": 1}, result["provenanceFiles"])
+
+    def test_the_company_rows_are_printed_with_rule_and_file(self):
+        import corpus_sweep as cs
+        result = dict(TestCorpusSweepCompanyColumn.RESULT_DIRTY)
+        result["companyFindingList"] = [
+            {"file": "data/sql/updates/pending_db_world/x.sql", "line": 12,
+             "rule": "table-not-allowed", "detail": "writes `updates`"}]
+        result["provenanceFiles"] = {"company": 1, "upstream": 2}
+        saved = cs.build_files, cs.tally
+        cs.build_files = lambda engine, policy, workers: []
+        cs.tally = lambda engine, files: dict(result)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                code = cs.main([])
+        finally:
+            cs.build_files, cs.tally = saved
+        text = out.getvalue()
+        self.assertEqual(1, code)
+        self.assertIn("table-not-allowed", text)
+        self.assertIn("pending_db_world/x.sql:12", text,
+                      "the check fails without saying which file and rule refused")
+
+    def test_a_tally_without_the_new_keys_still_exits_on_the_company_column(self):
+        # A baseline captured before PRO-285 has no companyFindingList; the exit status
+        # must not depend on a key the baseline never had.
+        import corpus_sweep as cs
+        saved = cs.build_files, cs.tally
+        cs.build_files = lambda engine, policy, workers: []
+        cs.tally = lambda engine, files: dict(TestCorpusSweepCompanyColumn.RESULT_DIRTY)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(1, cs.main([]))
+        finally:
+            cs.build_files, cs.tally = saved
+
+
+class TestCiProvenanceGuard(unittest.TestCase):
+    """PRO-285: a company column that collapsed to zero must not read as a pass."""
+
+    GOOD = {
+        "head": "0123456789abcdef0123456789abcdef01234567",
+        "files": 3060, "filesUnderPolicy": 3060, "statements": 131625,
+        "findings": 444726,
+        "byRule": {"reserved-band": 323749},
+        "byRuleOrigin": {"reserved-band": {"upstream": 323749}},
+        "companyFindings": 0, "companyFindingList": [],
+        "provenanceFiles": {"company": 8, "upstream": 3052, "unknown": 0},
+    }
+
+    def _run(self, tally=None, write=True):
+        import ci_provenance_guard as guard
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sweep.json"
+            if write:
+                path.write_text(json.dumps(self.GOOD if tally is None else tally))
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = guard.main([str(path)])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_an_attributable_tally_passes(self):
+        code, out, _ = self._run()
+        self.assertEqual(0, code)
+        self.assertIn("company=8", out)
+
+    def test_unattributable_files_fail(self):
+        tally = dict(self.GOOD)
+        tally["provenanceFiles"] = {"company": 0, "upstream": 0, "unknown": 3060}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("fetch-depth", err)
+
+    def test_findings_in_the_unknown_column_fail(self):
+        tally = dict(self.GOOD)
+        tally["byRuleOrigin"] = {"table-not-allowed": {"unknown": 5}}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("table-not-allowed=5", err)
+
+    def test_a_sweep_that_scanned_nothing_fails(self):
+        tally = dict(self.GOOD, files=0, filesUnderPolicy=0)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("no .sql", err)
+
+    def test_a_partial_run_without_strict_all_fails(self):
+        tally = dict(self.GOOD, filesUnderPolicy=8)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("--strict-all", err)
+
+    def test_a_head_that_is_not_a_sha_fails(self):
+        code, _, err = self._run(dict(self.GOOD, head="unknown"))
+        self.assertEqual(2, code)
+        self.assertIn("not a commit sha", err)
+
+    def test_a_pre_provenance_tally_is_never_skipped_silently(self):
+        tally = {k: v for k, v in self.GOOD.items() if k != "provenanceFiles"}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("provenanceFiles", err)
+
+    def test_a_self_contradicting_company_column_fails(self):
+        tally = dict(self.GOOD, companyFindings=3)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("contradicts itself", err)
+
+    def test_company_findings_are_the_sweep_verdict_not_the_guards(self):
+        tally = dict(self.GOOD, companyFindings=1,
+                     companyFindingList=[{"file": "p.sql", "line": 1,
+                                          "rule": "table-not-allowed", "detail": ""}])
+        code, _, _ = self._run(tally)
+        self.assertEqual(0, code, "the guard re-litigating the policy verdict is a "
+                                  "second owner for one decision")
+
+    def test_a_missing_or_unparseable_tally_is_a_usage_error(self):
+        code, _, err = self._run(write=False)
+        self.assertEqual(1, code)
+        self.assertIn("no tally there", err)
+        import ci_provenance_guard as guard
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sweep.json"
+            path.write_text("{not json")
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(1, guard.main([str(path)]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
