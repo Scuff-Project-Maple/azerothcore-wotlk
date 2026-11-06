@@ -416,11 +416,20 @@ def unquote_ident(token: str) -> str:
 
 
 def split_qualified(token: str) -> tuple[str | None, str]:
-    token = token.strip()
-    if token.count(".") == 1:
-        db, tbl = token.split(".", 1)
-        return unquote_ident(db), unquote_ident(tbl)
-    return None, unquote_ident(token)
+    """(schema, table) for a possibly qualified name token.
+
+    The split is the backtick-aware one in `_ident_parts()`, so a name that contains a
+    dot is one component and not two: `` `acore_world`.`my.table` `` is `my.table` in
+    schema `acore_world`, not the string ``acore_world`.`my.table`` (PRO-179 review
+    rank 1). Callers that must decide whether a schema was *claimed* use
+    `_ident_parts()`/`_schema_of()` instead, which still see the quoting.
+    """
+    parts = _ident_parts(token)
+    if len(parts) == 2:
+        return unquote_ident(parts[0]), unquote_ident(parts[1])
+    if len(parts) == 1:
+        return None, unquote_ident(parts[0])
+    return None, ".".join(parts)
 
 
 def paren_depths(masked: str) -> list[int]:
@@ -932,16 +941,64 @@ def blank_backticked(s: str) -> str:
     return "".join(out)
 
 
-def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str],
-                                          str | None, str]:
+def _ident_parts(token: str) -> list[str]:
+    """The identifier components of a possibly qualified name token.
+
+    Split on the dots that sit *outside* backticks. ``token.split(".")`` is wrong: a
+    backticked name may contain a dot, and `` `acore_world`.`my.table` `` then yields
+    three pieces of which the last is ``table` `` — not quote-balanced, so the bare-name
+    test said "heuristic" about a fully quoted name, and the all-quoted test said
+    "invented" about a schema the file really did quote (PRO-179 review rank 1). Both
+    judgements are made per component, so both have to come from a tokenisation that
+    knows where the backticks are. An unbalanced run leaves the remainder in one piece,
+    which the region grammar then rejects anyway.
+    """
+    parts: list[str] = []
+    cur: list[str] = []
+    quoted = False
+    for ch in token:
+        if ch == "`":
+            quoted = not quoted
+            cur.append(ch)
+        elif ch == "." and not quoted:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _is_quoted(part: str) -> bool:
+    return len(part) >= 2 and part.startswith("`") and part.endswith("`")
+
+
+def _schema_of(parts: list[str]) -> str | None:
+    """The schema a qualified name claims, or None when it does not earn being believed.
+
+    A component is believed only when the writer quoted it. Nothing is ever read out of
+    bare text: ``a.b.c`` names no schema, while `` `other`.updates `` names `other` even
+    though the table half is bare (PRO-179 review rank 1).
+    """
+    if len(parts) == 2 and _is_quoted(parts[0]):
+        return unquote_ident(parts[0])
+    return None
+
+
+def write_targets(st: Statement,
+                  known_names: set[str] | None = None) -> tuple[list[tuple[str | None, str]],
+                                                                 set[str], str | None, str,
+                                                                 bool]:
     """Parse the region between the verb and the first top-level SET/WHERE.
 
-    Returns `([(schema, table), ...], aliases, error, region)`. A well-formed
-    single-table write yields one target plus any alias, which the caller needs
-    so `WHERE c.guid = 9002020` counts as bounding `creature.guid`. Anything
+    Returns `([(schema, table), ...], aliases, error, region, heuristic)`. A
+    well-formed single-table write yields one target plus any alias, which the caller
+    needs so `WHERE c.guid = 9002020` counts as bounding `creature.guid`. Anything
     else yields an error string, the tables the region still names in a table
-    position (the ledger among them), and the other names it mentions — see
-    `_region_tables()`.
+    position (the ledger among them), the other names it mentions, and whether those
+    names came from the bare-name scan rather than from quoted identifiers — see
+    `_region_tables()`. `known_names` is the policy/ledger table-name set, which
+    keeps a real table that happens to spell a keyword visible.
 
     Only one write target is accepted. MySQL's multi-table forms (`UPDATE a JOIN
     b`, `UPDATE a, b`, `DELETE a, b FROM ...`, derived tables, index hints) are
@@ -950,36 +1007,42 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
     through: only the first table was ever examined.
     """
     masked = st.masked
+    # Clause keywords are located in a backtick-blanked copy. Backticked content is a
+    # name, never syntax, so an identifier spelled `from` cannot be mistaken for the
+    # FROM keyword (PRO-179 review NB-2). blank_backticked() is length-preserving, so
+    # every offset found in `bt` still slices `masked` correctly.
+    bt = blank_backticked(masked)
     from_end: int | None = None
     if st.verb == "UPDATE":
         head = UPDATE_HEAD_RE.match(masked)
         if not head:
-            return [], set(), "could not locate the UPDATE keyword", ""
-        stops = top_level_positions(masked, "SET")
+            return [], set(), "could not locate the UPDATE keyword", "", False
+        stops = top_level_positions(bt, "SET")
         lo, hi = head.end(), (stops[0] if stops else len(masked))
         pre = ""
     elif st.verb == "DELETE":
         head = DELETE_HEAD_RE.match(masked)
         if not head:
-            return [], set(), "could not locate the DELETE keyword", ""
-        froms = top_level_positions(masked, "FROM")
+            return [], set(), "could not locate the DELETE keyword", "", False
+        froms = top_level_positions(bt, "FROM")
         if not froms:
-            return [], set(), "DELETE has no FROM clause", ""
+            return [], set(), "DELETE has no FROM clause", "", False
         pre = masked[head.end():froms[0]]
         from_end = froms[0] + len("FROM")
         lo = from_end
-        ends = [p for p in (top_level_positions(masked, "WHERE")
-                            + top_level_positions(masked, "ORDER")
-                            + top_level_positions(masked, "LIMIT")) if p > lo]
+        ends = [p for p in (top_level_positions(bt, "WHERE")
+                            + top_level_positions(bt, "ORDER")
+                            + top_level_positions(bt, "LIMIT")) if p > lo]
         hi = min(ends) if ends else len(masked)
     else:
-        return [], set(), None, ""
+        return [], set(), None, "", False
 
     if pre.strip():
         region = masked[head.end():hi]
-        tables, others = _region_tables(masked, head.end(), hi, from_end)
+        tables, others, heuristic = _region_tables(masked, head.end(), hi, from_end, known_names)
         return tables, others, \
-            f"table list {pre.strip()[:60]!r} before FROM is multi-table DELETE syntax", region
+            f"table list {pre.strip()[:60]!r} before FROM is multi-table DELETE syntax", \
+            region, heuristic
     region_names = PARTITION_CLAUSE_RE.sub(" ", masked[lo:hi])
     # The three syntax tests read the region with backticked names blanked, so an
     # alias spelled `join`/`using` or a name containing a comma cannot manufacture a
@@ -1000,11 +1063,11 @@ def write_targets(st: Statement) -> tuple[list[tuple[str | None, str]], set[str]
     if err is None and not m:
         err = "the write region is not a single table with an optional alias"
     if err is not None:
-        tables, others = _region_tables(masked, lo, hi, from_end)
-        return tables, others, err, region
+        tables, others, heuristic = _region_tables(masked, lo, hi, from_end, known_names)
+        return tables, others, err, region, heuristic
     schema, table = split_qualified(m.group("tbl"))
     aliases = {unquote_ident(m.group("alias")).lower()} if m.group("alias") else set()
-    return [(schema, table)], aliases, None, region
+    return [(schema, table)], aliases, None, region, False
 
 
 def _region_names(fragment: str) -> list[str]:
@@ -1012,9 +1075,10 @@ def _region_names(fragment: str) -> list[str]:
     return [m.group(0) for m in REGION_NAME_RE.finditer(fragment)]
 
 
-def _region_tables(masked: str, lo: int, hi: int,
-                   from_end: int | None = None) -> tuple[list[tuple[str | None, str]], set[str]]:
-    """(tables, other names) for a rejected write region, in order of first appearance.
+def _region_tables(masked: str, lo: int, hi: int, from_end: int | None = None,
+                   known_names: set[str] | None = None) -> tuple[
+                       list[tuple[str | None, str]], set[str], bool]:
+    """(tables, other names, heuristic) for a rejected write region, in order of first appearance.
 
     Used only on the rejection path, so the report can name the table a rejected
     statement was reaching for (the ledger among them). The region is split on the
@@ -1025,7 +1089,7 @@ def _region_tables(masked: str, lo: int, hi: int,
     allow-list check reported a phantom `table-not-allowed` for each (PRO-179
     review NB-2).
 
-    Three refinements, all report fidelity on an already-rejected statement:
+    Four refinements, all report fidelity on an already-rejected statement:
 
     * a qualified name is read as one unit, so ``UPDATE `acore_world`.`updates` `u``
       names `updates` in a table position instead of promoting the schema to table
@@ -1037,7 +1101,23 @@ def _region_tables(masked: str, lo: int, hi: int,
       of each fragment is a table and the rest are aliases. A delete target that an
       alias in the FROM list defines is that alias, not a second table, which is what
       keeps ``DELETE `u`, `c` FROM `updates` `u` JOIN `creature` `c``` naming
-      `updates` and `creature` instead of `u` and `c` (PRO-179 review NB-B).
+      `updates` and `creature` instead of `u` and `c` (PRO-179 review NB-B);
+    * the third return value says whether any name in the *table list* came from the
+      bare-name scan. The bare scan cannot tell a table from an `ON`-clause column or
+      an index hint, so a name list built from it is a hint at what to look at, not a
+      verdict — the caller labels both lists it returns as such (PRO-179 review NB-3,
+      rank 4). Names that only reach the `others` set are noise whatever their
+      spelling, so they do not flip it.
+
+    A schema is believed only when the writer quoted the half that claims one, which is
+    what `_ident_parts()` / `_schema_of()` decide from the token's own backticks. Where
+    the scan invented one from bare tokens, `cross-schema-write` accused files that never
+    name a schema, and it is the one accusation in this path that costs an engineer an
+    afternoon (PRO-179 review NB-3); where it dropped one the file did quote, the report
+    lost the accusation instead (PRO-179 review rank 1). `ledger-table` and
+    `table-not-allowed` still fire on the table name, which is what a reviewer acts on.
+    A name is never dropped for spelling a keyword when the policy or the ledger actually
+    has a table of that name (PRO-179 review NB-4).
 
     What a bare-name scan cannot tell is an index hint: `USE INDEX (idx)` contributes
     `idx` as a name. That is noise in a message about a statement that is already
@@ -1045,41 +1125,68 @@ def _region_tables(masked: str, lo: int, hi: int,
     cost report fidelity, because `multi-table-write` is raised independently of it.
     """
     raw = masked[lo:hi]
-    scan = blank_backticked(PARTITION_CLAUSE_RE.sub(" ", raw))
+    # The PARTITION blank must be length-preserving: the fragment bounds below are
+    # derived from `scan` and then used to slice `raw`, so a substitution that shrinks
+    # the string puts every name past it out of phase and compares a raw-space offset
+    # against a scan-space one (PRO-179 review NB-1).
+    scan = blank_backticked(PARTITION_CLAUSE_RE.sub(
+        lambda m: " " * (m.end() - m.start()), raw))
     bounds = [0] + [m.end() for m in REGION_SPLIT_RE.finditer(scan)] + [len(scan)]
     from_off = None if from_end is None else from_end - lo
-    tables: dict[str, tuple[str | None, str]] = {}
-    aliases: set[str] = set()
-    targets: dict[str, tuple[str | None, str]] = {}
-    seen: set[str] = set()
+    known = {k.lower() for k in (known_names or ())}
 
-    def record(token: str) -> tuple[str, tuple[str | None, str]] | None:
-        schema, table = split_qualified(token)
+    def record(token: str) -> tuple[str, tuple[str | None, str], bool] | None:
+        parts = _ident_parts(token)
+        if not parts:
+            return None
+        table = split_qualified(token)[1]
         if not table:
             return None
-        if not token.startswith("`") and table.lower() in REGION_NAME_STOPWORDS:
+        tbl_bare = not _is_quoted(parts[-1])
+        # The stopword list removes syntax noise where a bare name is expected. A
+        # policy table whose real name spells a keyword is not noise.
+        if tbl_bare and table.lower() in REGION_NAME_STOPWORDS and table.lower() not in known:
             return None
-        return table.lower(), (schema, table)
+        # Believed only when the writer quoted the half that claims a schema; `parts`
+        # is the only thing left here that still knows where the backticks were.
+        schema = _schema_of(parts)
+        return table.lower(), (schema, table), tbl_bare
 
+    parsed: list[tuple[bool, list[tuple[int, str, tuple[str | None, str], bool]]]] = []
+    aliases: set[str] = set()
     for a, b in zip(bounds, bounds[1:]):
         in_from = from_off is None or a >= from_off
+        hits: list[tuple[int, str, tuple[str | None, str], bool]] = []
         for idx, token in enumerate(_region_names(raw[a:b])):
             hit = record(token)
             if hit is None:
                 continue
-            key, ident = hit
+            key, ident, tbl_bare = hit
+            hits.append((idx, key, ident, tbl_bare))
+        parsed.append((in_from, hits))
+        if in_from:
+            aliases.update(key for idx, key, _, _ in hits if idx)
+
+    # One pass in region order, so "in order of first appearance" is what the caller
+    # gets: a pre-FROM delete target used to be appended after every FROM-list table
+    # (PRO-179 review NB-5). The alias set is known from the pass above, so a delete
+    # target that is really an alias is still skipped where it appears.
+    tables: dict[str, tuple[str | None, str]] = {}
+    seen: set[str] = set()
+    heuristic = False
+    for in_from, hits in parsed:
+        for idx, key, ident, tbl_bare in hits:
             seen.add(key)
             if in_from:
                 if idx == 0:
+                    if key not in tables and tbl_bare:
+                        heuristic = True
                     tables.setdefault(key, ident)
-                else:
-                    aliases.add(key)
-            else:
-                targets.setdefault(key, ident)
-    for key, ident in targets.items():
-        if key not in aliases:
-            tables.setdefault(key, ident)
-    return list(tables.values()), {k for k in seen if k not in tables}
+            elif key not in aliases:
+                if key not in tables and tbl_bare:
+                    heuristic = True
+                tables.setdefault(key, ident)
+    return list(tables.values()), {k for k in seen if k not in tables}, heuristic
 
 
 # --------------------------------------------------------------------------- #
@@ -2178,12 +2285,19 @@ class Preflight:
         so a green result never depends on the grammar having anticipated a
         syntax.
         """
-        targets, qualifiers, err, region = write_targets(st)
+        known = {k.lower() for k in base} | {k.lower() for k in custom} \
+            | {t.lower() for t in self._LEDGER_TABLES}
+        targets, qualifiers, err, region, heuristic = write_targets(st, known)
         if err:
             extra = ", ".join(sorted({t for _, t in targets})) or "none identifiable"
-            named = f"tables named: {extra}"
+            # Both name lists come out of the same bare-name scan, so both carry the
+            # same caveat: it cannot tell a table from an `ON`-clause column or an index
+            # hint. Labelling only the table list left `other names in region` reading
+            # as parsed fact (PRO-179 review rank 4).
+            suffix = " (heuristic — unquoted region)" if heuristic else ""
+            named = f"tables named{suffix}: {extra}"
             if qualifiers:
-                named += f"; other names in region: {', '.join(sorted(qualifiers))}"
+                named += f"; other names in region{suffix}: {', '.join(sorted(qualifiers))}"
             bad("multi-table-write",
                 f"{st.verb} is not a single-table write: {err} (write region {region!r}; "
                 f"{named}). Split it into one statement per table, each "
