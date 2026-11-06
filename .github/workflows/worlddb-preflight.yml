@@ -63,11 +63,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Provenance is read from `git log -1 -- <path>` per file. On a partial
-          # history those lookups come back empty, every file lands in `unknown`, and
-          # the `company` column the check gates on collapses to zero on its own. The
-          # guard step below turns that into a red check; the full fetch is what stops
-          # it from happening.
+          # Provenance is read from `git log -1 -- <path>` per file. A partial history
+          # does not return empty: a grafted root makes every path resolve to the tip
+          # commit, so all 3 060 files inherit the tip author. Measured on a --depth 1
+          # clone, that put 444 726 findings in one column — `company` if the tip is
+          # ours (loud red, useless), `upstream` if the tip is a merge commit (silently
+          # green, which is the one that matters). Nothing in the tally says `unknown`
+          # while this happens. The guard step below is what detects it; the full fetch
+          # is what stops it.
           fetch-depth: 0
       - name: Setup python
         uses: actions/setup-python@v7
@@ -82,7 +85,14 @@ jobs:
           python3 ops/preflight/corpus_sweep.py --strict-all
           --out "$RUNNER_TEMP/corpus-sweep.json"
       - name: Provenance attribution guard
+        if: ${{ !cancelled() }}
         # Second half of the gate: refuses a tally that could not attribute the files it
         # scanned, so a green company column cannot come from a checkout that has no
-        # history to read.
+        # history to read. It runs after a red sweep on purpose — a collapse in the
+        # `company` column looks exactly like a genuine policy violation, and the run
+        # that just went red is the run where "is this verdict real" still has to be
+        # answered. Without `!cancelled()` this step is skipped the moment the sweep
+        # fails, which is what it did on the first run of the self-test PR (PRO-285).
+        # The sweep writes the tally before it exits, so there is a file to read either
+        # way; if there is not one, the guard exits 1 rather than shrugging.
         run: python3 ops/preflight/ci_provenance_guard.py "$RUNNER_TEMP/corpus-sweep.json"

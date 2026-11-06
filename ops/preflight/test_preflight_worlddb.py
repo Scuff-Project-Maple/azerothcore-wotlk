@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 from argparse import Namespace
@@ -2023,6 +2024,101 @@ class TestCiProvenanceGuard(unittest.TestCase):
             path.write_text("{not json")
             with contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(1, guard.main([str(path)]))
+
+
+class TestTheCiWorkflowMatchesItsDocumentation(unittest.TestCase):
+    """The README says what CI runs; CI had better run exactly that.
+
+    PRO-285 exists because this file claimed a check that no workflow implemented. These
+    are the tests that make the two artefacts fail together instead of drifting, plus
+    the properties that were each measured to be load-bearing (full history, a guard
+    that survives a red sweep, no repository guard that can retire the check in
+    silence, and no step that needs MySQL, Docker or the deploy host).
+    """
+
+    REPO = Path(__file__).resolve().parents[2]
+    WORKFLOW = REPO / ".github" / "workflows" / "worlddb-preflight.yml"
+    README = REPO / "ops" / "preflight" / "README.md"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.yaml = cls.WORKFLOW.read_text()
+        cls.readme = cls.README.read_text()
+        start = cls.readme.index("### In CI")
+        rest = cls.readme[start + len("### In CI"):]
+        end = rest.index("\n## ")
+        cls.in_ci = rest[:end]
+
+    @staticmethod
+    def flat(text):
+        return " ".join(text.split())
+
+    @property
+    def code(self):
+        """The workflow with comments stripped — prose may describe a thing it does not do."""
+        return "\n".join(line.split("#", 1)[0] for line in self.yaml.splitlines())
+
+    def job_block(self, job):
+        _, _, tail = self.code.partition("\n  %s:" % job)
+        return tail
+
+    def readme_commands(self):
+        return [m for m in re.findall(r"`(python3 ops/preflight/[^`]+)`", self.in_ci)]
+
+    def test_every_command_the_readme_promises_for_ci_actually_runs(self):
+        commands = self.readme_commands()
+        self.assertGreaterEqual(len(commands), 4, "the In CI table lost a row")
+        for command in commands:
+            self.assertIn(self.flat(command), self.flat(self.yaml),
+                          "README promises `%s` and no workflow step runs it" % command)
+
+    def test_the_check_cannot_be_retired_by_a_repository_guard(self):
+        # sql-codestyle.yml is the cautionary tale: it only runs on azerothcore/azerothcore-wotlk,
+        # so on this fork the check does not fail, it simply stops existing.
+        self.assertNotIn("github.repository", self.code)
+        self.assertNotIn("github.event.pull_request.draft", self.code,
+                         "a draft PR is exactly when a policy violation should be visible")
+
+    def test_the_sweep_checkout_carries_the_history_the_provenance_needs(self):
+        self.assertIn("fetch-depth: 0", self.job_block("corpus-sweep"))
+
+    def test_the_guard_still_runs_when_the_sweep_has_already_failed(self):
+        _, _, tail = self.code.partition("name: Provenance attribution guard")
+        step, _, _ = tail.partition("\n      - ")
+        condition = [line for line in step.splitlines() if line.strip().startswith("if:")]
+        self.assertEqual(1, len(condition), "the guard step has no single explicit condition")
+        self.assertIn("!cancelled()", condition[0],
+                      "skipping the guard on a red sweep removes the only answer to "
+                      "'is this company column real or a provenance collapse'")
+        self.assertIn("ci_provenance_guard.py", step)
+
+    def test_no_step_needs_mysql_docker_or_the_deploy_host(self):
+        for banned in ("services:", "mysql", "docker", "self-hosted", "ssh ", "deployhost",
+                       "docker-compose"):
+            self.assertNotIn(banned, self.code,
+                             "a step that needed `%s` would not belong in this workflow" % banned)
+
+    def test_the_sweep_job_carries_an_explicit_budget(self):
+        block = self.job_block("corpus-sweep")
+        budget = [line for line in block.splitlines() if "timeout-minutes" in line]
+        self.assertEqual(1, len(budget), "a hung `git log` with no budget burns the runner")
+        minutes = int(budget[0].split("timeout-minutes:")[1].strip())
+        self.assertGreaterEqual(minutes, 10, "the sweep alone measures ~5 min")
+
+    def test_the_sweep_has_exactly_one_ci_caller(self):
+        callers = [p.name for p in (self.REPO / ".github" / "workflows").glob("*.y*ml")
+                   if "corpus_sweep.py" in p.read_text()]
+        self.assertEqual(["worlddb-preflight.yml"], callers,
+                         "a second caller is a second definition of what the gate means")
+
+    def test_the_two_claims_that_started_this_do_not_come_back(self):
+        for gone in ("wired into CI rather than read by eye",
+                     "CI runs `--policy-all` report-only",
+                     "the CI / merge-gate rehearsal form",
+                     "nothing under `.github/workflows/` references `ops/preflight`",
+                     "nothing in .github/workflows/ calls corpus_sweep.py"):
+            self.assertNotIn(gone, self.readme,
+                             "README re-adopted a CI claim about a check that does not exist: %r" % gone)
 
 
 if __name__ == "__main__":

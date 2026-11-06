@@ -322,6 +322,11 @@ Read the verdict column literally.
   one-commit history, one distinct author across thousands of files, or a corpus with no upstream
   files at all. The sweep job also checks out with `fetch-depth: 0`; the guard is the net, not the
   fix.
+- The guard runs **after a red sweep too** (`if: ${{ !cancelled() }}`), because a provenance
+  collapse and a genuine policy violation look identical in the log: both print a `company` column
+  full of rows. The run that just went red is exactly the run where "is this verdict attributable"
+  still has to be answered, so the sweep writes the tally before it exits and the guard reads it
+  either way.
 
 What a green check does **not** say: it is not a boot rehearsal. None of these steps reads the
 `updates` ledger, hashes pending files, replays them into a scratch schema or checks a compose
