@@ -944,6 +944,62 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("COMPANY findings", text)
 
+    def _sweep_with_spy(self, tmp_argv):
+        """Run cs.main() with the corpus stubbed out, and say whether it was reached."""
+        import corpus_sweep as cs
+        swept = []
+        saved = cs.build_files, cs.tally
+
+        def build(engine, policy, workers):
+            swept.append(1)
+            return []
+
+        cs.build_files = build
+        cs.tally = lambda engine, files: dict(self.RESULT_CLEAN)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                self._give_it_a_tree(tmp)
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = cs.main(["--compose-root", tmp, *tmp_argv])
+        finally:
+            cs.build_files, cs.tally = saved
+        return code, out.getvalue(), err.getvalue(), swept
+
+    def test_an_unusable_out_path_is_refused_before_the_sweep_runs(self):
+        # PRO-295 review N3. The In CI row quotes `$RUNNER_TEMP/corpus-sweep.json`, and
+        # that variable exists only on a runner; locally it expands to a path at the
+        # filesystem root. The tally was written at the very end of main(), so the
+        # reviewer reproducing a red check paid for every `git log` first and then died
+        # on an OSError ~4.5 minutes in.
+        code, _, err, swept = self._sweep_with_spy(
+            ["--out", "/no-such-dir-here/corpus-sweep.json"])
+        self.assertEqual(2, code)
+        self.assertEqual([], swept, "the corpus was swept before discovering there was "
+                                    "nowhere to write the tally")
+        self.assertIn("--out", err)
+        self.assertIn("/tmp/corpus-sweep.json", err,
+                      "the refusal must name a path that works locally")
+
+    def test_a_missing_diff_baseline_is_refused_before_the_sweep_runs(self):
+        code, _, err, swept = self._sweep_with_spy(
+            ["--diff", "/no-such-dir-here/before.json"])
+        self.assertEqual(2, code)
+        self.assertEqual([], swept, "the diff is compared after the whole corpus, so a "
+                                    "missing baseline has to be caught first")
+        self.assertIn("--diff", err)
+
+    def test_a_usable_out_path_still_writes_the_tally(self):
+        # Positive control: the startup check must not become an unconditional refusal.
+        import corpus_sweep as cs
+        with tempfile.TemporaryDirectory() as tmp:
+            self._give_it_a_tree(tmp)
+            target = Path(tmp) / "corpus-sweep.json"
+            code, _, err, _ = self._sweep_with_spy(["--out", str(target)])
+            self.assertEqual(0, code, err)
+            self.assertTrue(target.is_file(), "--out stopped writing the tally")
+            self.assertEqual(3, json.loads(target.read_text())["files"])
+
     def test_diff_measures_the_company_column_not_just_the_totals(self):
         _, text = self._sweep(self.RESULT_DIRTY, [])
         self.assertIn("company", text)

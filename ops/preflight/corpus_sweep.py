@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -323,6 +324,27 @@ def main(argv=None) -> int:
     policy = json.loads(policy_path.read_text())
     if not (root / "data" / "sql").is_dir():
         print(f"{root} has no data/sql — pass --compose-root", file=sys.stderr)
+        return 2
+    # Refuse an unusable --out/--diff before the minutes, not after them. The per-file
+    # `git log` author lookups dominate the run, and the README tells a reviewer to
+    # reproduce a CI failure with the workflow's own command line — where `$RUNNER_TEMP`
+    # is an Actions variable that is simply unset locally, so the sweep used to spend
+    # ~4.5 minutes and then die on an OSError at the write (PRO-295 review N3).
+    if args.out:
+        out_path = Path(args.out)
+        parent = out_path.parent
+        if out_path.is_dir() or not parent.is_dir() \
+                or not os.access(str(parent), os.W_OK):
+            print(f"--out {out_path} is not a writable file path (its directory "
+                  f"{str(parent) or '.'} does not exist or cannot be written): refusing to "
+                  f"sweep without anywhere to put the tally. In CI this is "
+                  f"$RUNNER_TEMP/corpus-sweep.json; locally use e.g. "
+                  f"--out /tmp/corpus-sweep.json", file=sys.stderr)
+            return 2
+    if args.diff and not Path(args.diff).is_file():
+        print(f"--diff {args.diff}: no saved tally there. The diff runs after the whole "
+              f"corpus, so this is refused before it starts rather than at the end",
+              file=sys.stderr)
         return 2
 
     engine = pf.Preflight(
