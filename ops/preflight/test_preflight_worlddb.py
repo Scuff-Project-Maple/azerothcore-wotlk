@@ -1803,8 +1803,57 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertEqual((pf.REF_UNCHECKED, "missing"), (state, cause))
         self.assertIn("git fetch --prune origin Playerbot", detail)
 
+    def _watch_git_verbs(self, pf):
+        """Record every git verb the gate runs, while delegating to real git."""
+        real = pf._git
+        seen = []
+
+        def spy(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return real(argv, *args, **kwargs)
+
+        pf._git = spy
+        return seen
+
+    def test_the_gate_never_fetches_on_any_ref_answer(self):
+        # "The genuine `git pull` case still boots offline: no fetching from inside the
+        # gate" is a claim about the argv the gate passes git, so it is checked at the
+        # argv boundary — and it has to cover the three PRO-291 local-history probes,
+        # which are the newest way to hand the boot gate a network command by accident.
+        network = {"fetch", "pull", "push", "clone", "ls-remote", "fetch-pack",
+                   "http-fetch", "http-pull", "archive", "upload-pack"}
+        for label, ref, prep in (
+                ("verified", "refs/remotes/origin/Playerbot",
+                 lambda d: self._git(d, "update-ref", "refs/remotes/origin/Playerbot",
+                                     "HEAD")),
+                ("never-fetched", "refs/remotes/origin/Absent", self._virgin),
+                ("ref-deleted", "refs/remotes/origin/Playerbot",
+                 lambda d: (self._git(d, "update-ref", "refs/remotes/origin/master",
+                                      "HEAD"),
+                            self._git(d, "update-ref", "-d",
+                                      "refs/remotes/origin/Playerbot"))),
+                ("not-a-commit", None, lambda d: None),
+        ):
+            with self.subTest(label):
+                d = self._repo()
+                p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+                prep(d)
+                pf = self._pf(d, verified_ref=(self._git(d, "rev-parse", "HEAD^{tree}")
+                                               if ref is None else ref))
+                seen = self._watch_git_verbs(pf)
+                self._run(pf, self._file(d, p))
+                self.assertEqual(
+                    [], [c for c in seen if c and c[0] in network],
+                    f"the gate reached the network while deciding {label}")
+                self.assertTrue(any(c[:1] == ["rev-parse"] for c in seen),
+                                "the probes never ran, so this checked nothing")
+                if label == "verified":
+                    self.assertFalse(pf.r.failed,
+                                     "a genuine upstream pull was refused offline")
+
     def test_a_missing_ref_is_not_rescued_by_the_flag_when_it_never_existed(self):
         # The flag widens the deleted-ref case only; it must not become a way to silence
+
         # the WARN for a ref that was simply never fetched, and it must never turn a
         # FAIL from another cause into a WARN.
         d = self._repo()
@@ -1874,6 +1923,34 @@ class TestPolicyAuditPinsProvenance(unittest.TestCase):
         policy = json.loads(json.dumps(POLICY))
         policy["upstreamProvenance"]["refreshCommand"] = ""
         self.assertIn("refreshCommand", " ".join(self._problems(policy)))
+
+    def test_a_peeled_verified_ref_is_a_problem(self):
+        # PRO-291 (PRO-248 review N1, opening 1). The gate refuses a verifiedRef that
+        # resolves to a tree/blob instead of a commit, so a policy that names one must
+        # not audit clean: an audit that exits 0 while the boot refuses is exactly the
+        # audit/gate divergence review N5 was about. These all pass the old
+        # `startswith("refs/remotes/")` test, which is why they needed their own.
+        for ref in ("refs/remotes/origin/Playerbot^{tree}",
+                    "refs/remotes/origin/Playerbot^{blob}",
+                    "refs/remotes/origin/Playerbot~1",
+                    "refs/remotes/origin/Playerbot@{0}"):
+            policy = json.loads(json.dumps(POLICY))
+            policy["upstreamProvenance"]["verifiedRef"] = ref
+            problems = self._problems(policy)
+            self.assertEqual(1, len(problems), ref)
+            self.assertIn("verifiedRef", problems[0])
+            self.assertIn("not-a-commit", problems[0])
+
+    def test_an_object_name_verified_ref_is_a_problem(self):
+        # A mistyped object name is the other way `^{commit}` comes back empty without
+        # the ref being absent (review N1). It is not a ref, so no fetch maintains it.
+        for ref in ("0d8a474fc67971fb3dd7616e26323d3066442555", "abc123"):
+            policy = json.loads(json.dumps(POLICY))
+            policy["upstreamProvenance"]["verifiedRef"] = ref
+            problems = self._problems(policy)
+            self.assertEqual(1, len(problems), ref)
+            self.assertIn("verifiedRef", problems[0])
+            self.assertIn("object name", problems[0])
 
     def test_a_non_dict_block_is_a_problem(self):
         policy = json.loads(json.dumps(POLICY))

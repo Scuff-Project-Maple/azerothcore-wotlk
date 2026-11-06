@@ -144,7 +144,11 @@ remote-tracking test is therefore "exit 0 **and** a name starting with `refs/rem
 else is answered as *not remote-tracking* and refuses the boot, because the person whose forged
 `--author` this rule exists to catch can create exactly that shadow branch. `audit_policy_schema.py`
 exits 1 when `verifiedRef` is deleted, empty, or does not start with `refs/remotes/`, so the
-qualifier cannot be dropped silently.
+qualifier cannot be dropped silently. It also exits 1 on a name carrying a revision selector
+(`refs/remotes/origin/Playerbot^{tree}`, `~1`, `@{0}`) or on a bare object name: those pass the
+prefix test but name something the gate cannot peel to a commit, and it refuses the boot on
+exactly that (`not-a-commit`), so an audit that accepted them would exit 0 on a policy the gate
+rejects (PRO-291).
 
 Content **is** consulted. The ref is listed with `git ls-tree -z -r` — NUL-delimited, so a genuine
 upstream filename like `2026_11_04_00_érfar.sql` is compared byte-for-byte instead of against git's

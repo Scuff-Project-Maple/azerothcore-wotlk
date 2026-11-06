@@ -33,6 +33,13 @@ from pathlib import Path
 CREATE_RE = re.compile(r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+`([^`]+)`\s*\(", re.I)
 COL_RE = re.compile(r"^\s*`([^`]+)`\s+[A-Za-z]", re.M)
 
+# A git refname cannot contain `^`, `~`, `@{`, `?`, `*`, `[`, `\` or a space
+# (`git check-ref-format --branch` refuses them), so any of these in `verifiedRef`
+# means the policy is naming a *revision expression* rather than a ref — which is
+# how PRO-248 review N1's `refs/tags/<annotated>^{tree}` shape reached the gate.
+SELECTOR_RE = re.compile(r"\^\{[^}]*\}|\^\d+|~\d*|@\{")
+OBJECT_NAME_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+
 # Relative to the repo root. Both layouts are listed because both are tracked
 # here; `git ls-files` is the primary discovery mechanism and these are the
 # patterns it is given (and the globs the filesystem fallback uses).
@@ -137,12 +144,30 @@ def provenance_problems(policy):
     if not ref:
         problems.append("upstreamProvenance.verifiedRef: empty, so the upstream "
                         "exemption is decided by directory+author alone")
+    elif OBJECT_NAME_RE.match(ref):
+        # PRO-291 (PRO-248 review N1): a mistyped object name resolves to *something*,
+        # so the gate files it 'not-a-commit' and refuses; an audit that exits 0 on it
+        # is the audit/gate divergence review N5 was about.
+        problems.append(
+            f"upstreamProvenance.verifiedRef: {ref!r} is an object name, not a ref — "
+            f"a fetch does not move it and it cannot be shown to be a commit the way a "
+            f"remote-tracking ref can (name e.g. refs/remotes/origin/Playerbot)")
     elif not ref.startswith("refs/remotes/"):
         problems.append(
             f"upstreamProvenance.verifiedRef: {ref!r} is not under refs/remotes/, so "
             f"the person whose forged `git commit --author=...` this rule exists to "
             f"catch can move it (name it fully qualified, e.g. "
             f"refs/remotes/origin/Playerbot)")
+    elif SELECTOR_RE.search(ref) is not None:
+        # `refs/remotes/origin/Playerbot^{tree}` passes the prefix test and names a
+        # tree, which is Rev's PRO-248 N1 POC. A refname cannot contain `^`, `~` or
+        # `@{`, so this is a revision expression and the gate cannot peel it to a
+        # commit — it refuses the boot on exactly that.
+        problems.append(
+            f"upstreamProvenance.verifiedRef: {ref!r} carries the revision selector "
+            f"{SELECTOR_RE.search(ref).group(0)!r}, so it names something other than a "
+            f"ref and the gate cannot peel it to a commit; it refuses the boot as "
+            f"not-a-commit (name the ref plainly, e.g. refs/remotes/origin/Playerbot)")
     if not str(cfg.get("refreshCommand") or "").strip():
         problems.append("upstreamProvenance.refreshCommand: empty, so a boot refusal "
                         "could not name the command that clears it")
