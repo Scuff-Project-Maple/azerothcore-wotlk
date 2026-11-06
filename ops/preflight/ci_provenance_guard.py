@@ -20,11 +20,14 @@ Exit status: 0 the tally is trustworthy, 2 it is not (an operational claim, the 
 meaning 2 has in `corpus_sweep.py`), 1 on a usage error. The guard deliberately does
 not re-litigate the policy verdict: company findings are `corpus_sweep.py`'s to fail
 on, and it does. This script only fails a run that would otherwise pass for the wrong
-reason, which means two questions, not one: was the corpus attributable (a shallow
-checkout, a one-commit history, one author across the archive, `unknown` rows), and was
-it measured at all (no files, no statements, no findings, no rule that fired, no company
-file in a corpus whose gated column is supposed to be about company files). A tally that
-fails either question reports zero, and zero from a check that never ran is not a pass.
+reason, which means three questions, not one: was the corpus attributable (a shallow
+checkout, a one-commit history, one author across the archive, `unknown` rows); was it
+measured at all (no files, no statements, no findings, no rule that fired, no company
+file in a corpus whose gated column is supposed to be about company files); and do its
+own counts agree (a `findings` total the `byRule` counts contradict, a rule in `byRule`
+with no `byRuleOrigin` split — and it is `byRuleOrigin` the gated column is counted
+from). A tally that fails any question reports zero, and zero from a check that never
+ran is not a pass.
 """
 
 from __future__ import annotations
@@ -65,8 +68,12 @@ def check(tally: dict) -> list[str]:
     # downstream of these three, so a dead engine — an emptied `forbiddenStatements`, a
     # rule registry that failed to load, a parser that stopped matching a whole
     # statement class — has to be refused here rather than mistaken for a pass
-    # (PRO-295 B2). This tree has measured 444 726 findings at every recording that was
-    # ever checked in, so `findings=0` is not a clean corpus, it is a non-measurement.
+    # (PRO-295 B2). This tree's upstream archive has measured a large, stable finding
+    # total at every recording ever checked in — `ops/preflight/README.md` carries the
+    # figure with the head it was measured at — so `findings=0` is not a clean corpus,
+    # it is a non-measurement. The number is deliberately not repeated in the refusal
+    # below: a frozen measurement inside an error message becomes a false statement
+    # printed by a red run the first time the corpus legitimately changes (PRO-298 N7).
     statements = int(tally.get("statements", 0) or 0)
     if files and statements <= 0:
         problems.append(
@@ -79,17 +86,53 @@ def check(tally: dict) -> list[str]:
     if files and findings <= 0:
         problems.append(
             f"findings={findings} over files={files} / statements={statements}: the "
-            f"upstream archive in this tree has produced 444 726 findings at every "
-            f"recorded run, so a total of zero is not a clean corpus but an engine that "
-            f"stopped matching rules — an emptied `forbiddenStatements`, a rule registry "
-            f"that failed to load, a parser that no longer recognises a statement class. "
-            f"A red sweep whose tally cannot be attributed and a green sweep that measured "
-            f"nothing must not be the same answer.")
+            f"upstream archive in this tree has produced a large finding total at every "
+            f"recorded run — ops/preflight/README.md records the measured baseline with "
+            f"the head it was taken at — so a total of zero is not a clean corpus but an "
+            f"engine that stopped matching rules: an emptied `forbiddenStatements`, a rule "
+            f"registry that failed to load, a parser that no longer recognises a statement "
+            f"class. A red sweep whose tally cannot be attributed and a green sweep that "
+            f"measured nothing must not be the same answer.")
 
     if files and not (tally.get("byRule") or {}):
         problems.append(
             f"byRule is empty while files={files}: no rule is recorded as having fired, "
             f"which is the per-rule form of findings=0 and fails for the same reason.")
+
+    # The three counts above each stand alone; this one asks them to agree with each
+    # other. `corpus_sweep.py` takes `findings` as `sum(by_rule.values())` and builds
+    # every per-rule origin split from the same violation list, so a tally the sweep
+    # wrote cannot disagree with itself. When it does, this guard is reading a document
+    # rather than a measurement — and one of those documents is the gated column itself:
+    # `company` findings are counted out of `byRuleOrigin`, so a rule that is present in
+    # `byRule` and missing from `byRuleOrigin` contributes nothing to the exit status
+    # while the totals say it fired (PRO-298 review N8).
+    rule_counts = tally.get("byRule") or {}
+    if files and findings > 0 and rule_counts:
+        total_of_rules = sum(int(n or 0) for n in rule_counts.values())
+        if total_of_rules != findings:
+            problems.append(
+                f"findings={findings} but the {len(rule_counts)} rule(s) in byRule total "
+                f"{total_of_rules}: the tally does not add up against itself, so neither "
+                f"the headline count nor the per-rule counts can be read. "
+                f"`corpus_sweep.py` derives one from the other, so a sweep that wrote "
+                f"this tally did not count what it says it counted.")
+        breakdowns = tally.get("byRuleOrigin") or {}
+        for rule, count in sorted(rule_counts.items()):
+            breakdown = breakdowns.get(rule)
+            if breakdown is None:
+                problems.append(
+                    f"byRule records {count} finding(s) for `{rule}` but byRuleOrigin has "
+                    f"no breakdown for it: the `company` column this check gates on is "
+                    f"counted out of byRuleOrigin, so those findings are invisible to the "
+                    f"exit status while the totals say they fired.")
+                continue
+            parts = sum(int(n or 0) for n in breakdown.values())
+            if parts != int(count or 0):
+                problems.append(
+                    f"byRule has {count} for `{rule}` but byRuleOrigin sums to {parts}: "
+                    f"the gated `company` column and the reported total are counted from "
+                    f"different sets of rows, so one of them is wrong about the corpus.")
 
     under = int(tally.get("filesUnderPolicy", 0) or 0)
     if files and under < files:
@@ -134,7 +177,12 @@ def check(tally: dict) -> list[str]:
     # company file — `data/sql/updates/pending_db_world` deleted from `includedDirs`,
     # or simply not present in the checkout — passed: provenanceFiles.company=0 is a
     # `company` column with nothing behind it, and zero is what it reports whether the
-    # rule is satisfied or the rule was never run.
+    # rule is satisfied or the rule was never run. Note the shape the sweep really
+    # writes: `provenanceFiles` is a `dict(Counter(...))`, so a class with no members is
+    # an ABSENT key, not a zero — `{"upstream": 3053}` is what dropping
+    # `pending_db_world` from `includedDirs` puts in the tally file. Both readings have
+    # to refuse, which is what `.get(..., 0) or 0` is for, and both are pinned by a test
+    # (PRO-298 review N5).
     if provenance_files is not None and files and \
             int(provenance_files.get("company", 0) or 0) == 0:
         problems.append(

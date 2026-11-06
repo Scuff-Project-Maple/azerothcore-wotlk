@@ -1931,16 +1931,42 @@ class TestCorpusSweepNamesTheOffendingCompanyFile(unittest.TestCase):
 class TestCiProvenanceGuard(unittest.TestCase):
     """PRO-285: a company column that collapsed to zero must not read as a pass."""
 
+    # The healthy tally this tree actually measures: 3 060 files, 131 625 statements,
+    # 444 726 findings, every one of them upstream (companyFindings=0) over a 20 279-commit
+    # history with 8 distinct authors. The per-rule counts are the sweep's own output at
+    # the head the README baseline was taken at, and `findings` is their sum because
+    # `corpus_sweep.py` derives it that way — a fixture that could drift from its own
+    # arithmetic would quietly unpin the guard's add-up clauses (PRO-298 review N8).
+    BY_RULE = {
+        "reserved-band": 323749, "table-not-allowed": 83025, "band-not-literal": 35537,
+        "unbounded-write": 1985, "forbidden-statement": 167,
+        "insert-columns-required": 100, "key-column-assigned": 68,
+        "custom-table-only": 43, "or-in-where": 22, "ledger-table": 15,
+        "unknown-statement": 10, "insert-select": 4, "multi-table-write": 1,
+    }
+
     GOOD = {
         "head": "0123456789abcdef0123456789abcdef01234567",
         "files": 3060, "filesUnderPolicy": 3060, "statements": 131625,
-        "findings": 444726,
-        "byRule": {"reserved-band": 323749},
-        "byRuleOrigin": {"reserved-band": {"upstream": 323749}},
+        "findings": sum(BY_RULE.values()),
+        "byRule": BY_RULE,
+        "byRuleOrigin": {r: {"upstream": n} for r, n in BY_RULE.items()},
         "companyFindings": 0, "companyFindingList": [],
-        "provenanceFiles": {"company": 8, "upstream": 3052, "unknown": 0},
-        "shallow": False, "commits": 41873, "authors": 112,
+        # The production shape, key absence and all: `provenanceFiles` is a
+        # `dict(Counter(...))`, so a class with no members is missing rather than 0.
+        "provenanceFiles": {"company": 7, "upstream": 3053},
+        "shallow": False, "commits": 20279, "authors": 8,
     }
+
+    def _origins(self, origin="upstream", **splits):
+        """The healthy per-rule breakdown, with named rules re-split.
+
+        Each rule keeps a breakdown that sums to its `byRule` count, so a test that
+        mutates an origin column tests that column and not the guard's arithmetic.
+        """
+        origins = {r: {origin: n} for r, n in self.BY_RULE.items()}
+        origins.update(splits)
+        return origins
 
     def _run(self, tally=None, write=True):
         import ci_provenance_guard as guard
@@ -1956,7 +1982,8 @@ class TestCiProvenanceGuard(unittest.TestCase):
     def test_an_attributable_tally_passes(self):
         code, out, _ = self._run()
         self.assertEqual(0, code)
-        self.assertIn("company=8", out)
+        self.assertIn("company=7", out)
+        self.assertIn("upstream=3053", out)
 
     def test_unattributable_files_fail(self):
         tally = dict(self.GOOD)
@@ -1967,10 +1994,15 @@ class TestCiProvenanceGuard(unittest.TestCase):
 
     def test_findings_in_the_unknown_column_fail(self):
         tally = dict(self.GOOD)
-        tally["byRuleOrigin"] = {"table-not-allowed": {"unknown": 5}}
+        tally["byRuleOrigin"] = self._origins(
+            **{"table-not-allowed": {"upstream": 83020, "unknown": 5}})
         code, _, err = self._run(tally)
         self.assertEqual(2, code)
         self.assertIn("table-not-allowed=5", err)
+        self.assertEqual(1, len([l for l in err.splitlines()
+                                 if l.startswith("GUARD FAIL")]),
+                         "the unknown column has its own clause; a second reason here "
+                         "means the fixture stopped adding up")
 
     def test_a_sweep_that_scanned_nothing_fails(self):
         tally = dict(self.GOOD, files=0, filesUnderPolicy=0)
@@ -2000,7 +2032,7 @@ class TestCiProvenanceGuard(unittest.TestCase):
         # for every file, so every file is the tip author's and `unknown` stays empty.
         tally = dict(self.GOOD, shallow=True, commits=1, authors=1,
                      provenanceFiles={"company": 3060, "upstream": 0, "unknown": 0},
-                     byRuleOrigin={"reserved-band": {"company": 323749}})
+                     byRuleOrigin=self._origins("company"))
         code, _, err = self._run(tally)
         self.assertEqual(2, code)
         self.assertIn("shallow", err)
@@ -2054,22 +2086,45 @@ class TestCiProvenanceGuard(unittest.TestCase):
         self.assertIn("attributed to `company`", err)
         self.assertIn("not a policy", err)
 
+    def test_a_tally_omitting_the_company_key_fails(self):
+        # The shape above is what a hand-written tally looks like; this is what the sweep
+        # writes. `provenanceFiles` is `dict(Counter(...))` (corpus_sweep.py), so a class
+        # with no members is an absent key, not a zero — and the whole company corpus is
+        # the 7 files of `pending_db_world`, so dropping that directory from
+        # `includedDirs` produces exactly this file (PRO-298 review N5). `company=0` and
+        # no `company` at all are the same claim about the corpus and must not be read
+        # differently: defaulting the lookup to anything but 0 brings the PRO-295 B1
+        # green back with every other test in this class still passing.
+        tally = dict(self.GOOD, files=3053, filesUnderPolicy=3053,
+                     provenanceFiles={"upstream": 3053})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("attributed to `company`", err)
+        self.assertIn("not a policy", err)
+
     def test_a_sweep_that_parsed_no_statements_fails(self):
         # PRO-295 B2. files>0 with statements=0 means the engine was handed the corpus
         # and read nothing out of it; every count below it, gated column included, is a
         # count over nothing.
         code, _, err = self._run(dict(self.GOOD, statements=0))
         self.assertEqual(2, code)
-        self.assertIn("statements=0", err)
+        self.assertIn("statements=0", self._only_reason(err))
 
     def test_a_sweep_that_found_nothing_at_all_fails(self):
         # PRO-295 B2. This tree measures 444 726 findings and always will, so findings=0
         # over 3 060 files is a dead engine — an emptied `forbiddenStatements`, a rule
-        # registry that failed to load — not a clean corpus.
+        # registry that failed to load — not a clean corpus. The refusal points at the
+        # README baseline instead of quoting a count, because a frozen number inside a
+        # red run's error message goes false the first time the corpus legitimately
+        # changes (PRO-298 review N7). The add-up clause keeps out of the way: a dead
+        # engine has one name in the log, not two, so nobody diffs byRule against a total
+        # that was always going to be 0.
         code, _, err = self._run(dict(self.GOOD, findings=0))
         self.assertEqual(2, code)
-        self.assertIn("findings=0", err)
-        self.assertIn("444 726", err)
+        reason = self._only_reason(err)
+        self.assertIn("findings=0", reason)
+        self.assertIn("ops/preflight/README.md", reason)
+        self.assertNotIn("444 726", err)
 
     def test_a_sweep_with_no_rule_that_fired_fails(self):
         # The per-rule form of the same claim: findings>0 but nothing in byRule is the
@@ -2079,6 +2134,45 @@ class TestCiProvenanceGuard(unittest.TestCase):
                                       byRuleOrigin={}))
         self.assertEqual(2, code)
         self.assertIn("byRule is empty", err)
+
+    def _only_reason(self, err):
+        reasons = [line for line in err.splitlines() if line.startswith("GUARD FAIL")]
+        self.assertEqual(1, len(reasons),
+                         "expected one refusal so no clause masks another, got:\n"
+                         + "\n".join(reasons))
+        return reasons[0]
+
+    def test_a_findings_total_the_rules_do_not_add_up_to_fails(self):
+        # PRO-298 review N8. `corpus_sweep.py` sets `findings = sum(by_rule.values())`,
+        # so on the CI path these two cannot disagree; a tally where they do was not
+        # written by the sweep, and the guard is being asked to attest a document.
+        code, _, err = self._run(dict(self.GOOD,
+                                      findings=sum(self.BY_RULE.values()) + 1))
+        self.assertEqual(2, code)
+        self.assertIn("does not add up", self._only_reason(err))
+
+    def test_a_rule_with_no_origin_breakdown_fails(self):
+        # The load-bearing half of N8, and not bookkeeping: `company` findings are
+        # counted out of `byRuleOrigin` (corpus_sweep.company_by_rule), so a rule that is
+        # in `byRule` and missing from `byRuleOrigin` shows up in the printed report while
+        # contributing nothing to the column the check gates on. Here the whole
+        # `reserved-band` corpus — 323 749 findings, company-authored ones included —
+        # vanishes from the verdict while `companyFindings` stays 0.
+        origins = dict(self.GOOD["byRuleOrigin"])
+        del origins["reserved-band"]
+        code, _, err = self._run(dict(self.GOOD, byRuleOrigin=origins))
+        self.assertEqual(2, code)
+        self.assertIn("no breakdown for it", self._only_reason(err))
+
+    def test_an_origin_breakdown_that_does_not_sum_to_its_rule_fails(self):
+        # Same clause one level down: a split that loses rows hides them from the gated
+        # column exactly as a missing rule does, so the total and the column are counted
+        # from different sets of rows.
+        code, _, err = self._run(dict(
+            self.GOOD,
+            byRuleOrigin=self._origins(**{"reserved-band": {"upstream": 23749}})))
+        self.assertEqual(2, code)
+        self.assertIn("different sets of rows", self._only_reason(err))
 
     def test_a_tally_without_a_company_row_list_is_never_skipped_silently(self):
         # PRO-295 B2. `companyFindingList` was the only gated key whose absence the guard

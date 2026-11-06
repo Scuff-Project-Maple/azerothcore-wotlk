@@ -139,10 +139,13 @@ against the real `CREATE TABLE` bodies in `data/sql/base/db_world` and the modul
 `.github/workflows/worlddb-preflight.yml` runs `audit_policy_schema.py --include-modules` and fails
 the check on any problem (PRO-285), while step 3 of "Adding a table to the policy" below is what
 runs it locally before a push. What it does **not** read is `includedDirs[].origin`,
-`companyEmailDomains` or `reservedIdBands`: no machine in this repository checks those three, so
-they are review material and nothing more. Deleting `data/sql/updates/pending_db_world` from
-`includedDirs`, widening `companyEmailDomains` to `["*"]`, or lowering a reserved band all edit
-check 4 into compliance rather than failing anything. The two partial tripwires are the falsification
+`companyEmailDomains`, or the **thresholds** inside the `bands`/`refs` blocks of
+`baseTables`/`customTables`: the auditor matches those blocks' column *names* against the real
+`CREATE TABLE` bodies and never compares a value against a bound, so those three are review
+material and nothing more (PRO-298 review N6 — the key is named `bands`/`refs`, not anything like
+`reservedIdBands`, which does not exist in the policy). Deleting `data/sql/updates/pending_db_world`
+from `includedDirs`, widening `companyEmailDomains` to `["*"]`, or lowering a reserved band's bounds
+all edit check 4 into compliance rather than failing anything. The two partial tripwires are the falsification
 recipes below (each rule is seen to fire on a crafted file, which a widened exemption stops doing)
 and the corpus tallies: the sweep records how many files it attributed to `company`, and
 `ci_provenance_guard.py` refuses a tally in which no scanned file is company-attributed at all, so
@@ -364,13 +367,24 @@ Read the verdict column literally.
   **no scanned file is company-attributed** is refused too, because `company=0` is what that column
   reports whether the rules are satisfied or the company directories were never in the sweep (delete
   `pending_db_world` from `includedDirs`, or check out a tree without it, and the check goes green on
-  an empty verdict — PRO-295 review B1). And it refuses a tally that measured nothing: `statements=0`,
-  `findings=0`, no rule in `byRule`, or no `companyFindingList` to check the gated count against, each
-  on a corpus of thousands of files. Those four are the shapes a dead engine leaves behind — an
-  emptied `forbiddenStatements`, a rule registry that failed to load — and a green from a check that
-  ran but parsed nothing must not look like a green from a clean corpus (PRO-295 review B2). The
-  sweep job also checks out with `fetch-depth: 0`; the guard is the net, not the
-  fix.
+   an empty verdict — PRO-295 review B1). That refusal reads the shape the sweep really writes:
+   `provenanceFiles` is a `dict(Counter(...))`, so a class with no members is an **absent key**, not
+   a `0` — drop `pending_db_world` from `includedDirs` and the tally says
+   `provenance[upstream=3053]` with no `company` at all (PRO-298 review N5). And it refuses a tally
+   that measured nothing: `statements=0`,
+   `findings=0`, no rule in `byRule`, or no `companyFindingList` to check the gated count against, each
+   on a corpus of thousands of files. Those four are the shapes a dead engine leaves behind — an
+   emptied `forbiddenStatements`, a rule registry that failed to load — and a green from a check that
+   ran but parsed nothing must not look like a green from a clean corpus (PRO-295 review B2). The
+   refusal names the shape of the defect, not a frozen finding count: the measured baseline lives in
+   the block above, where its head is pinned, rather than in an error message that goes stale the
+   first time the corpus legitimately changes (PRO-298 review N7). It also refuses a tally that does
+   not add up against itself — a `findings` total the `byRule` counts contradict, or a rule in `byRule`
+   with no `byRuleOrigin` split, or a split whose origins do not sum to its rule's count. The last is
+   not bookkeeping: the `company` column is counted out of `byRuleOrigin`, so a rule that is missing
+   there shows up in the report and contributes nothing to the exit status (PRO-298 review N8). The
+   sweep job also checks out with `fetch-depth: 0`; the guard is the net, not the
+   fix.
 - The guard runs **after a red sweep too** (`if: ${{ !cancelled() }}`), because a provenance
   collapse and a genuine policy violation look identical in the log: both print a `company` column
   full of rows. The run that just went red is exactly the run where "is this verdict attributable"
