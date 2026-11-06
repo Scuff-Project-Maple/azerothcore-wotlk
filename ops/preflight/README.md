@@ -19,7 +19,15 @@ hang the installer surfaces as `rc=124` rather than as a wedged test), no `cp` e
 through a symlink (the assertion is that an unrelated file outside the deployed directory is
 byte-unchanged), orphans found recursively and over the whole extension set ALE loads, and the
 negative controls that keep the widened scan honest (`notes.txt`, `README.LUA`, dotfiles are not
-orphans because ALE would not load them).
+orphans because ALE would not load them). Every case labelled `--check` passes `--check` — the
+PRO-293 review found thirteen that were named for check mode but silently ran sync mode, which is
+how a check-mode-blind orphan pass stayed green — so each check/sync pair comes from one
+`for mode in check sync` loop rather than being written twice. It also gates the **whole** deployed
+path, not just its last component: with a tracked `sub/c.lua` in the snapshot and
+`…/lua_scripts/sub -> $T/outside/`, the file outside has to be byte-unchanged and must never be
+reported `ok`. It needs `bash`, coreutils and `python3` — python3 only for the socket case, which
+`mkfifo` cannot produce and `mknod` needs privileges for; device nodes share the `-e && ! -f` gate
+instead of being created.
 
 `PREFLIGHT_CHECK_ONLY=1 ops/deploy/worldserver-up.sh` runs the gate without touching the
 stack — that is the CI / merge-gate rehearsal form. The wrapper **verifies** the single-writer
@@ -211,8 +219,12 @@ dry run. There is no operator-settable scratch prefix.
    (plain `python3 -m unittest discover -s ops/preflight` fails: the directory is not a package).
 5. `bash ops/preflight/test_sync_scripts.sh` before committing any change to `scripts/lua-sync.sh`
    or `scripts/compose-sync.sh`. It is the only thing standing between an edit and the PRO-273
-   failure modes coming back, and it fails loudly on the pre-fix scripts — run it against
-   `git show HEAD:scripts/lua-sync.sh` if you doubt a case is real.
+   failure modes coming back, and it fails loudly on the pre-fix scripts — extract one with
+   `git show origin/Playerbot:scripts/lua-sync.sh` into a throwaway tree (the harness derives
+   both script paths from its own location, so put it at
+   `<tmp>/ops/preflight/test_sync_scripts.sh` next to `<tmp>/scripts/`) if you doubt a case
+   is real. `HEAD` is the wrong reference to name here: on a branch that already carries the
+   fix it re-tests the fix and proves nothing.
 
 ## Out of scope
 

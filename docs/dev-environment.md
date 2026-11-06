@@ -251,11 +251,11 @@ the root copies.
 
 **Run the install as the tree owner.** The build-host checkout is
 `pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
-are not in the `pira` group, so a bare `scripts/compose-sync.sh` exits `1` on
-the first `cp`; prefix it with `sudo -u pira` (as above) or run from a `pira`
-shell. `--check` only reads and is safe as any user. On a fresh clone the tree
-is owned by you, so no sudo is needed there either. The same rule applies
-verbatim to `scripts/lua-sync.sh`.
+are not in the `pira` group, so a bare installer run — `scripts/lua-sync.sh`
+or `scripts/compose-sync.sh` — exits `1` on the first `cp`; prefix it with
+`sudo -u pira` (as shown) or run from a `pira` shell. `--check` only reads and
+is safe as any user. On a fresh clone the tree is owned by you, so no sudo is
+needed there either.
 
 ### Keep the ALE Lua scripts in sync (pre-boot assertion)
 
@@ -285,11 +285,11 @@ sudo -u pira scripts/lua-sync.sh   # install: this WRITES — tree owner only
 
 **Run the install as the tree owner.** The build-host checkout is
 `pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
-are not in the `pira` group, so a bare `scripts/lua-sync.sh` exits `1` on the
-first `cp`; prefix it with `sudo -u pira` (as above) or run from a `pira`
-shell. `--check` only reads and is safe as any user. On a fresh clone the tree
-is owned by you, so no sudo is needed there either. The same rule applies
-verbatim to `scripts/compose-sync.sh`.
+are not in the `pira` group, so a bare installer run — `scripts/lua-sync.sh`
+or `scripts/compose-sync.sh` — exits `1` on the first `cp`; prefix it with
+`sudo -u pira` (as shown) or run from a `pira` shell. `--check` only reads and
+is safe as any user. On a fresh clone the tree is owned by you, so no sudo is
+needed there either.
 
 Run `--check` alongside `scripts/compose-sync.sh --check` before any
 `docker compose up`/`build`. Like compose-sync there is no allowlist: every
@@ -300,7 +300,10 @@ The orphan scan is compared against what ALE actually loads, so it recurses and
 takes the same extension set: `sub/sneaky.lua` and a live `payload.moon` are
 orphans too (PRO-273 finding b). Things ALE would never load are left alone —
 `notes.txt`, `README.LUA` (ALE compares extensions case-sensitively) and
-dotfiles (ALE skips entries starting with `.`, `LuaEngine.cpp:646`).
+dotfiles (ALE skips entries starting with `.`, `LuaEngine.cpp:646`). The same
+prune applies to the snapshot walk, so a tracked file whose name starts with a
+dot — `.debug.lua`, say — is never installed and never reported as missing;
+name scripts accordingly.
 
 A deployed path may only be absent or a **regular file**, and that is decided
 before anything reads or copies it, in both modes. A symlink is never `ok`:
@@ -310,7 +313,14 @@ refused rather than copied through — `cp -p` follows links, so the old
 installer would have overwritten a file outside the deployed directory and
 still printed `wrote`. A FIFO, socket, device or directory there is refused the
 same way; a FIFO used to hang the installer inside `cmp` with no output
-(PRO-273 finding a). Every refusal is one legible line and exit `1`.
+(PRO-273 finding a). The gate covers the whole deployed path, not just its last
+component: with a tracked `sub/c.lua` in the snapshot and a
+`…/lua_scripts/sub -> /somewhere/else` symlink in the deployed tree, `mkdir -p`
+and `cp -p` both follow that link, so every intermediate directory is checked
+before the first byte is written and a symlink or non-directory there is
+refused (PRO-293 blocking 1). In `--check` mode such a path is reported and the
+file outside is never printed as verified `ok`. Every refusal is one legible
+line and exit `1`.
 
 That is the signal that would have caught PRO-269 at boot time. The installer
 never deletes an orphan: a hand-placed script is either committed into the
@@ -323,9 +333,12 @@ asserted from here.
 ### What the boot log does and does not prove
 
 Confirming an install took effect wants a log check, but there is **no
-per-script load line** to grep. These two lines are all `[UNBOUND]` produces at
-the script-loading phase of boot (verified against the live container: lines
-818-819 of a 42k-line log, immediately after `>> Loaded 14495 SmartAI scripts`):
+per-script load line** to grep. These two lines are all `[UNBOUND]` produces,
+verified against the live container, shortly after `>> Loaded 14495 SmartAI
+scripts` in the script-loading phase of boot. Exact line numbers are not worth
+quoting: they drift with every unrelated `PrintInfo` addition and every log
+restart (the pair landed at 818-819 in one sampled boot and 42894-42895 in
+another), so grep for the marker rather than a line number:
 
 ```bash
 ssh -o BatchMode=yes 192.168.1.71 'docker logs ac-worldserver | grep UNBOUND'

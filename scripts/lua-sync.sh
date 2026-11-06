@@ -43,11 +43,20 @@
 # "silently overwrote a file outside the deployed directory" is the failure to
 # refuse outright, not to detect afterwards.
 #
-# Tested by ops/preflight/ops/preflight/test_sync_scripts.sh — run it after any change here.
+# The gate is on the WHOLE deployed path, not just its last component:
+# nested tracked paths are legal here (ALE recurses), so `…/lua_scripts/sub`
+# being a symlink is the same clobber at depth 2, and `mkdir -p` will happily
+# create through it (PRO-293 blocking 1).
+#
+# Tested by ops/preflight/test_sync_scripts.sh — run it after any change here.
 #
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `pwd -P`, not `pwd`: invoking this script through a symlinked checkout
+# (`link -> real`) would otherwise make `root` name the link while every inode
+# it writes lives somewhere else — the tree-root shape of exactly the failure
+# the ancestor gates below exist to prevent (PRO-293 N6).
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 canonical_dir="wrath-unbound/env/dist/etc/modules/lua_scripts"
 installed_dir="env/dist/etc/modules/lua_scripts"
 
@@ -94,6 +103,8 @@ md5_of() {
   local file=$1
   if command -v md5sum >/dev/null 2>&1; then
     md5sum "$file" | cut -d' ' -f1
+  else
+    printf 'unavailable'
   fi
 }
 
@@ -118,6 +129,43 @@ path_kind() {
   else
     printf 'non-regular file'
   fi
+}
+
+# Gate a deployed path and every directory component above it, down from the
+# deployed directory. The leaf check alone is not enough: nested tracked paths
+# are legal here (ALE recurses, `LuaEngine.cpp:653`), so with
+# `…/lua_scripts/sub -> /somewhere/else` the installer would `mkdir -p` through
+# the link, `cp -p` through it, print `wrote …/sub/c.lua`, and leave a file
+# outside the deployed directory changed — while `--check` on the same tree
+# called that outside file verified `ok` (PRO-293 blocking 1). `mkdir -p` and
+# `cp` both follow intermediate links without complaint and every message still
+# names `env/dist/…`, which is the "reported one thing, did another" failure.
+#
+# Prints the refusal and returns 1; returns 0 when the whole chain is safe to
+# read from and write to. Never call it after anything has opened the path.
+gate_deployed_chain() {
+  local rel=$1 prefix="" comp kind
+  local -a parts=()
+  local i last
+  IFS='/' read -r -a parts <<<"$rel"
+  last=$(( ${#parts[@]} - 1 ))
+  for (( i = 0; i < last; i++ )); do
+    comp="${parts[$i]}"
+    prefix="${prefix:+$prefix/}$comp"
+    local p="$inst/$prefix"
+    if [[ -L "$p" ]]; then
+      kind="$(path_kind "$p")"
+      echo "lua-sync: $installed_dir/$prefix is a $kind, not a directory — refusing to write through it" >&2
+      echo "lua-sync: ALE walks it too, so nothing under it can be verified from this tree" >&2
+      return 1
+    fi
+    if [[ -e "$p" && ! -d "$p" ]]; then
+      kind="$(path_kind "$p")"
+      echo "lua-sync: $installed_dir/$prefix is a $kind, not a directory — refusing to write" >&2
+      return 1
+    fi
+  done
+  return 0
 }
 
 # Every ancestor of the deployed directory has to be a real directory too, not
@@ -174,6 +222,17 @@ per_file_drift=0
 for rel in "${tracked[@]}"; do
   canonical="$root/$canonical_dir/$rel"
   installed="$root/$installed_dir/$rel"
+
+  # Gate the directory chain first, then the leaf. Both refuse before any
+  # `cmp`/`diff`/`md5sum`/`cp` touches the path, in both modes, so the
+  # check/sync asymmetry PRO-273 reported cannot come back at either depth.
+  if ! gate_deployed_chain "$rel"; then
+    if [[ $mode == check ]]; then
+      status=1
+      continue
+    fi
+    exit 1
+  fi
 
   # Gate every read and write on this. One message and one verdict in both
   # modes, so the check/sync asymmetry PRO-273 reported cannot come back:

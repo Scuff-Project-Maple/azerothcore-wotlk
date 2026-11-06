@@ -95,12 +95,11 @@ Notes:
 
 **Run the install as the tree owner.** The build-host checkout is
 `pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
-are not in the `pira` group, so a bare `scripts/compose-sync.sh` or
-`scripts/lua-sync.sh` exits `1` on the first `cp`; prefix it with `sudo -u pira`
-(as below) or run from a `pira` shell. `--check` only reads and is safe as any
-user. On a fresh clone the tree is owned by you, so no sudo is needed there
-either. The same rule applies verbatim to both installers — see
-[`docs/dev-environment.md`](../docs/dev-environment.md#keep-the-ale-lua-scripts-in-sync-pre-boot-assertion).
+are not in the `pira` group, so a bare installer run — `scripts/lua-sync.sh`
+or `scripts/compose-sync.sh` — exits `1` on the first `cp`; prefix it with
+`sudo -u pira` (as shown) or run from a `pira` shell. `--check` only reads and
+is safe as any user. On a fresh clone the tree is owned by you, so no sudo is
+needed there either.
 
 ```bash
 cp -r wrath-unbound/modules/mod-unbound modules/

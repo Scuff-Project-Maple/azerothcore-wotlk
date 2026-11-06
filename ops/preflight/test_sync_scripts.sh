@@ -17,13 +17,22 @@
 #       The negative controls matter just as much — ALE compares extensions
 #       case-sensitively and skips hidden entries, so `README.LUA` and
 #       `.hidden.lua` must NOT be reported as orphans.
+#   (c) the gate covers every component of the deployed path, not just the leaf:
+#       a nested tracked script plus `…/lua_scripts/sub -> $T/outside/` used to
+#       `cp -p` straight through the link and print `wrote` (PRO-293 blocking 1).
 #   (e) on an orphan-only tree the sync run must not tell the user to run the
 #       command they just ran.
+#
+# Every `--check` case passes `--check`. Thirteen once did not and ran sync mode
+# instead, which is what let a check-mode-blind orphan pass look green
+# (PRO-293 blocking 2); check/sync cases are therefore generated from one
+# `for mode in check sync` loop so a mode cannot be forgotten.
 #
 # Nothing here touches a real tree: every case builds a throwaway repo root
 # under $TMPDIR and runs a copy of the installer against it. Device nodes are
 # not created (mknod needs privileges) — they share the `-e && ! -f` gate that
-# the FIFO and socket cases exercise.
+# the FIFO and socket cases exercise. `python3` is needed for the one socket
+# case, since `mkfifo` cannot produce one.
 #
 #   bash ops/preflight/test_sync_scripts.sh
 #
@@ -131,7 +140,7 @@ C=scripts/compose-sync.sh
 
 # ── the matrix Review ran on PRO-273 ────────────────────────────────────────
 tree="$(new_tree)"
-t "lua: in-sync --check" "$tree" "$L" 0 "2 tracked script(s) in place"
+t "lua: in-sync --check" "$tree" "$L" 0 "2 tracked script(s) in place" -- --check
 t "lua: in-sync sync" "$tree" "$L" 0 "2 tracked script(s) in place"
 t "lua: bad arg" "$tree" "$L" 2 "usage:" -- --nope
 t "lua: --help" "$tree" "$L" 0 "pre-boot assertion" -- --help
@@ -167,21 +176,19 @@ t "lua: empty snapshot --check" "$tree" "$L" 1 "refusing to call an empty snapsh
 t "lua: empty snapshot sync" "$tree" "$L" 1 "refusing to call an empty snapshot clean"
 
 # orphan: reported, never deleted, in both modes
-tree="$(new_tree)"
-printf -- '-- hand-placed\n' >"$tree/env/dist/etc/modules/lua_scripts/hand.lua"
-t "lua: orphan --check" "$tree" "$L" 1 "ORPHAN" "hand.lua"
-if [[ -f "$tree/env/dist/etc/modules/lua_scripts/hand.lua" ]]; then
-  ok "lua: orphan --check did not delete"
-else
-  bad "lua: orphan --check did not delete" "the orphan was removed"
-fi
-t "lua: orphan sync" "$tree" "$L" 1 "ORPHAN" "hand.lua" \
-  "!install the snapshot with" "!fix with"
-if [[ -f "$tree/env/dist/etc/modules/lua_scripts/hand.lua" ]]; then
-  ok "lua: orphan sync did not delete"
-else
-  bad "lua: orphan sync did not delete" "the orphan was removed"
-fi
+for mode in check sync; do
+  arg=()
+  [[ $mode == check ]] && arg=(--check)
+  tree="$(new_tree)"
+  printf -- '-- hand-placed\n' >"$tree/env/dist/etc/modules/lua_scripts/hand.lua"
+  t "lua: orphan ($mode)" "$tree" "$L" 1 "ORPHAN" "hand.lua" \
+    "!install the snapshot with" "!fix with" -- "${arg[@]}"
+  if [[ -f "$tree/env/dist/etc/modules/lua_scripts/hand.lua" ]]; then
+    ok "lua: orphan ($mode) did not delete"
+  else
+    bad "lua: orphan ($mode) did not delete" "the orphan was removed"
+  fi
+done
 
 # (e) the hint is news to the caller: shown when something is also missing
 tree="$(new_tree)"
@@ -190,13 +197,21 @@ rm "$tree/env/dist/etc/modules/lua_scripts/b.lua"
 t "lua: orphan + drift --check names both actions" "$tree" "$L" 1 "ORPHAN" "install the snapshot with" -- --check
 
 # ── (b) the orphan pass must match what ALE loads ───────────────────────────
-tree="$(new_tree)"
-mkdir -p "$tree/env/dist/etc/modules/lua_scripts/sub"
-printf -- '-- nested\n' >"$tree/env/dist/etc/modules/lua_scripts/sub/sneaky.lua"
-t "lua: nested orphan --check" "$tree" "$L" 1 "ORPHAN" "sub/sneaky.lua"
-t "lua: nested orphan sync" "$tree" "$L" 1 "ORPHAN" "sub/sneaky.lua"
-rm -rf "$tree/env/dist/etc/modules/lua_scripts/sub"
-t "lua: nested orphan removal clears --check" "$tree" "$L" 0
+for mode in check sync; do
+  arg=()
+  [[ $mode == check ]] && arg=(--check)
+  tree="$(new_tree)"
+  mkdir -p "$tree/env/dist/etc/modules/lua_scripts/sub"
+  printf -- '-- nested\n' >"$tree/env/dist/etc/modules/lua_scripts/sub/sneaky.lua"
+  t "lua: nested orphan ($mode)" "$tree" "$L" 1 "ORPHAN" "sub/sneaky.lua" -- "${arg[@]}"
+  if [[ -f "$tree/env/dist/etc/modules/lua_scripts/sub/sneaky.lua" ]]; then
+    ok "lua: nested orphan ($mode) did not delete"
+  else
+    bad "lua: nested orphan ($mode) did not delete" "the nested orphan was removed"
+  fi
+  rm -rf "$tree/env/dist/etc/modules/lua_scripts/sub"
+  t "lua: nested orphan removal clears ($mode)" "$tree" "$L" 0 "nothing untracked under" -- "${arg[@]}"
+done
 
 tree="$(new_tree)"
 mkdir -p "$tree/wrath-unbound/env/dist/etc/modules/lua_scripts/sub"
@@ -206,9 +221,13 @@ t "lua: tracked subdirectory installs" "$tree" "$L" 0 "wrote"
 t "lua: tracked subdirectory then in-sync" "$tree" "$L" 0 "3 tracked script(s) in place" -- --check
 
 for ext in moon ext so out dll lua; do
-  tree="$(new_tree)"
-  printf 'x\n' >"$tree/env/dist/etc/modules/lua_scripts/payload.$ext"
-  t "lua: ALE-loaded .$ext orphan --check" "$tree" "$L" 1 "ORPHAN" "payload.$ext"
+  for mode in check sync; do
+    arg=()
+    [[ $mode == check ]] && arg=(--check)
+    tree="$(new_tree)"
+    printf 'x\n' >"$tree/env/dist/etc/modules/lua_scripts/payload.$ext"
+    t "lua: ALE-loaded .$ext orphan ($mode)" "$tree" "$L" 1 "ORPHAN" "payload.$ext" -- "${arg[@]}"
+  done
 done
 
 # negative controls: ALE would not load any of these, so they are not orphans
@@ -219,19 +238,28 @@ printf 'x\n' >"$tree/env/dist/etc/modules/lua_scripts/.hidden.lua"
 mkdir -p "$tree/env/dist/etc/modules/lua_scripts/.cache"
 printf 'x\n' >"$tree/env/dist/etc/modules/lua_scripts/.cache/loaded.lua"
 printf 'x\n' >"$tree/env/dist/etc/modules/lua_scripts/noext"
-t "lua: non-loaded files are not orphans" "$tree" "$L" 0 "nothing untracked under"
+t "lua: non-loaded files are not orphans (--check)" "$tree" "$L" 0 "nothing untracked under" -- --check
+t "lua: non-loaded files are not orphans (sync)" "$tree" "$L" 0 "nothing untracked under"
 
 # a symlink a live ALE would open is never silently clean
-tree="$(new_tree)"
-ln -s a.lua "$tree/env/dist/etc/modules/lua_scripts/alias.lua"
-t "lua: untracked symlink is an orphan" "$tree" "$L" 1 "ORPHAN" "alias.lua"
+for mode in check sync; do
+  arg=()
+  [[ $mode == check ]] && arg=(--check)
+  tree="$(new_tree)"
+  ln -s a.lua "$tree/env/dist/etc/modules/lua_scripts/alias.lua"
+  t "lua: untracked symlink is an orphan ($mode)" "$tree" "$L" 1 "ORPHAN" "alias.lua" -- "${arg[@]}"
+done
 
 # a symlinked subdirectory cannot be audited from here, so it must not be clean
-tree="$(new_tree)"
-mkdir -p "$tree/elsewhere"
-printf 'x\n' >"$tree/elsewhere/deep.lua"
-ln -s "$tree/elsewhere" "$tree/env/dist/etc/modules/lua_scripts/linked"
-t "lua: symlinked subdirectory is unaudited" "$tree" "$L" 1 "UNAUDITED" "linked"
+for mode in check sync; do
+  arg=()
+  [[ $mode == check ]] && arg=(--check)
+  tree="$(new_tree)"
+  mkdir -p "$tree/elsewhere"
+  printf 'x\n' >"$tree/elsewhere/deep.lua"
+  ln -s "$tree/elsewhere" "$tree/env/dist/etc/modules/lua_scripts/linked"
+  t "lua: symlinked subdirectory is unaudited ($mode)" "$tree" "$L" 1 "UNAUDITED" "linked" -- "${arg[@]}"
+done
 
 # ── (a) non-regular paths are refused before anything reads or writes ───────
 for mode in check sync; do
@@ -281,7 +309,7 @@ else
   bad "lua: symlink target not clobbered" "the file outside the deployed dir was overwritten"
 fi
 t "lua: symlink at a tracked path (--check) is refused" "$tree" "$L" 1 \
-  "not a regular file" "symlink ->"
+  "not a regular file" "symlink ->" -- --check
 
 # a symlink whose target already matches the snapshot must NOT read as ok
 tree="$(new_tree)"
@@ -327,11 +355,53 @@ if [[ "$(md5 "$victim")" == "$victim_md5" ]]; then
 else
   bad "lua: deployed-dir symlink wrote nothing outside" "the file outside the tree changed"
 fi
-t "lua: deployed dir is a symlink (--check)" "$tree" "$L" 1 "not a directory"
+t "lua: deployed dir is a symlink (--check)" "$tree" "$L" 1 "not a directory" -- --check
+
+# a symlinked subdirectory of the deployed dir is the same clobber at depth 2:
+# nested tracked paths are legal, so `sub -> $T/outside/` plus a tracked
+# `sub/c.lua` used to `mkdir -p`/`cp -p` straight through the link and print
+# `wrote` (PRO-293 blocking 1). The victim outside must not move by a byte, in
+# either mode, and the file outside must never be reported as verified `ok`.
+for mode in check sync; do
+  arg=()
+  [[ $mode == check ]] && arg=(--check)
+  tree="$(new_tree)"
+  mkdir -p "$tree/wrath-unbound/env/dist/etc/modules/lua_scripts/sub"
+  printf -- '-- tracked nested\nprint("c")\n' \
+    >"$tree/wrath-unbound/env/dist/etc/modules/lua_scripts/sub/c.lua"
+  mkdir -p "$tree/outside"
+  printf -- '-- unrelated, do not touch\n' >"$tree/outside/c.lua"
+  victim_md5="$(md5 "$tree/outside/c.lua")"
+  ln -s "$tree/outside" "$tree/env/dist/etc/modules/lua_scripts/sub"
+  t "lua: nested tracked path through a symlinked subdir ($mode)" "$tree" "$L" 1 \
+    "is a symlink" "refusing to write through it" "!wrote" -- "${arg[@]}"
+  if [[ "$(md5 "$tree/outside/c.lua")" == "$victim_md5" ]]; then
+    ok "lua: symlinked subdir wrote nothing outside ($mode)"
+  else
+    bad "lua: symlinked subdir wrote nothing outside ($mode)" \
+      "the file outside the deployed directory was overwritten"
+  fi
+  if [[ -L "$tree/env/dist/etc/modules/lua_scripts/sub" ]]; then
+    ok "lua: symlinked subdir is still a symlink ($mode)"
+  else
+    bad "lua: symlinked subdir is still a symlink ($mode)" "it was replaced"
+  fi
+done
+
+# a non-directory where a nested tracked path wants a directory is refused too
+tree="$(new_tree)"
+mkdir -p "$tree/wrath-unbound/env/dist/etc/modules/lua_scripts/sub"
+printf -- '-- tracked nested\nprint("c")\n' \
+  >"$tree/wrath-unbound/env/dist/etc/modules/lua_scripts/sub/c.lua"
+printf 'not a directory\n' >"$tree/env/dist/etc/modules/lua_scripts/sub"
+t "lua: nested tracked path onto a non-directory (sync)" "$tree" "$L" 1 \
+  "not a directory" "!wrote"
+t "lua: nested tracked path onto a non-directory (--check)" "$tree" "$L" 1 \
+  "not a directory" -- --check
 
 # ── compose-sync.sh carries the same weakness ───────────────────────────────
 tree="$(new_tree)"
-t "compose: in-sync --check" "$tree" "$C" 0 "ok    docker-compose.override.yml"
+t "compose: in-sync --check" "$tree" "$C" 0 "ok    docker-compose.override.yml" -- --check
 t "compose: in-sync sync" "$tree" "$C" 0 "ok    docker-compose.override.yml"
 t "compose: bad arg" "$tree" "$C" 2 "usage:" -- --nope
 
@@ -359,8 +429,9 @@ for mode in check sync; do
   t "compose: socket at a root copy ($mode)" "$tree" "$C" 1 \
     "not a regular file" "socket" -- "${arg[@]}"
 
-  tree="$(new_tree)"
-  victim="$tree/outside-victim.txt"
+tree="$(new_tree)"
+victim="$tree/outside-victim.txt"
+
   printf 'do not touch me\n' >"$victim"
   victim_md5="$(md5 "$victim")"
   rm "$tree/docker-compose.override.yml"

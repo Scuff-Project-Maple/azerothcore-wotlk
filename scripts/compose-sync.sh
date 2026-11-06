@@ -24,11 +24,14 @@
 # overwrite a file elsewhere in — or outside — the tree while still printing
 # `wrote`.
 #
-# Tested by ops/preflight/ops/preflight/test_sync_scripts.sh — run it after any change here.
+# Tested by ops/preflight/test_sync_scripts.sh — run it after any change here.
 #
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `pwd -P`, not `pwd`: run through a symlinked checkout (`link -> real`)
+# and `root` would name the link while the inodes it writes live elsewhere
+# (PRO-293 N6).
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 # Name the kind of thing sitting at a root path, so the refusal is legible
 # enough to act on without a second `ls`.
