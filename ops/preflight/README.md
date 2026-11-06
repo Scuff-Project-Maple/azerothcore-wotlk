@@ -127,13 +127,27 @@ Honest limit: an operator with write access to the object database can still
 is a deliberate, loud, non-default act — `git reflog refs/remotes/origin/Playerbot` shows it to a
 reviewer and the next real fetch moves the ref back — where the author forge was a routine commit
 command. It is also no wider a privilege than the ones already in the same file: whoever can
-`update-ref` can edit `preflight-policy.json` outright (`companyEmailDomains`,
-`includedDirs[].origin`, `reservedIdBands`), which is why the policy is pinned by
-`audit_policy_schema.py` rather than by this check. That pin is now run in CI — the
+`update-ref` can edit `preflight-policy.json` outright.
+
+Be precise about what the audit does and does not pin (PRO-295 review B1).
+`audit_policy_schema.py` checks two things, and the CI job runs exactly it: every
+`keyColumns`/`keySets`/`bands`/`refs` **column name** in `baseTables` and `customTables`
+against the real `CREATE TABLE` bodies in `data/sql/base/db_world` and the module SQL, and the
+`upstreamProvenance` block itself — a `verifiedRef` that is present and starts with
+`refs/remotes/`, and a non-empty `refreshCommand`. It is a real pin, and it is now run in CI: the
 `Write policy — engine tests and schema audit` job of
-`.github/workflows/worlddb-preflight.yml` runs `audit_policy_schema.py --include-modules` and
-fails the check on any problem (PRO-285) — and step 3 of "Adding a table to the policy" below is
-what runs it locally before a push. An upstream
+`.github/workflows/worlddb-preflight.yml` runs `audit_policy_schema.py --include-modules` and fails
+the check on any problem (PRO-285), while step 3 of "Adding a table to the policy" below is what
+runs it locally before a push. What it does **not** read is `includedDirs[].origin`,
+`companyEmailDomains` or `reservedIdBands`: no machine in this repository checks those three, so
+they are review material and nothing more. Deleting `data/sql/updates/pending_db_world` from
+`includedDirs`, widening `companyEmailDomains` to `["*"]`, or lowering a reserved band all edit
+check 4 into compliance rather than failing anything. The two partial tripwires are the falsification
+recipes below (each rule is seen to fire on a crafted file, which a widened exemption stops doing)
+and the corpus tallies: the sweep records how many files it attributed to `company`, and
+`ci_provenance_guard.py` refuses a tally in which no scanned file is company-attributed at all, so
+the `includedDirs` edit turns the check red instead of green. The other two edits still need a
+reviewer, and are worth a line in any diff that touches `preflight-policy.json`. An upstream
 file that trips the reserved
 bands stays exempt from check 4, and the corpus `upstream` column records those 444 726 findings as
 review material, not boot failures.

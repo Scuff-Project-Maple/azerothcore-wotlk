@@ -20,7 +20,11 @@ Exit status: 0 the tally is trustworthy, 2 it is not (an operational claim, the 
 meaning 2 has in `corpus_sweep.py`), 1 on a usage error. The guard deliberately does
 not re-litigate the policy verdict: company findings are `corpus_sweep.py`'s to fail
 on, and it does. This script only fails a run that would otherwise pass for the wrong
-reason.
+reason, which means two questions, not one: was the corpus attributable (a shallow
+checkout, a one-commit history, one author across the archive, `unknown` rows), and was
+it measured at all (no files, no statements, no findings, no rule that fired, no company
+file in a corpus whose gated column is supposed to be about company files). A tally that
+fails either question reports zero, and zero from a check that never ran is not a pass.
 """
 
 from __future__ import annotations
@@ -55,6 +59,37 @@ def check(tally: dict) -> list[str]:
             f"findings it reports is the absence of a measurement, not a pass. In CI "
             f"that means data/sql is not in the checkout; locally it means --compose-root "
             f"points somewhere without it.")
+
+    # A tally can also measure its corpus and report nothing about it, which looks
+    # identical to a clean tree from the outside. Every number the gate reads is
+    # downstream of these three, so a dead engine — an emptied `forbiddenStatements`, a
+    # rule registry that failed to load, a parser that stopped matching a whole
+    # statement class — has to be refused here rather than mistaken for a pass
+    # (PRO-295 B2). This tree has measured 444 726 findings at every recording that was
+    # ever checked in, so `findings=0` is not a clean corpus, it is a non-measurement.
+    statements = int(tally.get("statements", 0) or 0)
+    if files and statements <= 0:
+        problems.append(
+            f"statements={statements} over files={files}: the parser read no statement out "
+            f"of anything it was handed, so `findings`, every per-rule count and the "
+            f"`company` column the check gates on are all counts over nothing. That is the "
+            f"same defect as files=0 one level down; it is refused for the same reason.")
+
+    findings = int(tally.get("findings", 0) or 0)
+    if files and findings <= 0:
+        problems.append(
+            f"findings={findings} over files={files} / statements={statements}: the "
+            f"upstream archive in this tree has produced 444 726 findings at every "
+            f"recorded run, so a total of zero is not a clean corpus but an engine that "
+            f"stopped matching rules — an emptied `forbiddenStatements`, a rule registry "
+            f"that failed to load, a parser that no longer recognises a statement class. "
+            f"A red sweep whose tally cannot be attributed and a green sweep that measured "
+            f"nothing must not be the same answer.")
+
+    if files and not (tally.get("byRule") or {}):
+        problems.append(
+            f"byRule is empty while files={files}: no rule is recorded as having fired, "
+            f"which is the per-rule form of findings=0 and fails for the same reason.")
 
     under = int(tally.get("filesUnderPolicy", 0) or 0)
     if files and under < files:
@@ -93,6 +128,23 @@ def check(tally: dict) -> list[str]:
             f"directories are mostly upstream archive and updates: every file was "
             f"given the same origin, which is what a checkout with no real history "
             f"looks like. The `company` column in that tally is not a policy verdict.")
+
+    # The same question about the column that is actually gated (PRO-295 B1). The
+    # symmetric clause above only asks about `upstream`, so a corpus that lost every
+    # company file — `data/sql/updates/pending_db_world` deleted from `includedDirs`,
+    # or simply not present in the checkout — passed: provenanceFiles.company=0 is a
+    # `company` column with nothing behind it, and zero is what it reports whether the
+    # rule is satisfied or the rule was never run.
+    if provenance_files is not None and files and \
+            int(provenance_files.get("company", 0) or 0) == 0:
+        problems.append(
+            f"no scanned file was attributed to `company` even though {files} file(s) "
+            f"were scanned: `data/sql/updates/pending_db_world` and the other company "
+            f"directories contribute nothing, so the `company` column this check gates on "
+            f"is empty rather than clean. Either the checkout is missing them or "
+            f"`includedDirs` lost them — in both cases a zero there is not a policy "
+            f"verdict. ops/preflight/README.md records what a healthy tally for this "
+            f"tree looks like; compare it before reading a green.")
 
     unknown_findings = _unknown_findings(tally)
     if unknown_findings:
@@ -138,7 +190,17 @@ def check(tally: dict) -> list[str]:
 
     company = int(tally.get("companyFindings", 0) or 0)
     listed = tally.get("companyFindingList")
-    if listed is not None:
+    if listed is None:
+        # The one tally key the gate reads that used to be optional: a sweep that
+        # recorded no row list at all could not be checked against its own count, which
+        # made an absent list the quietest way to lose the cross-check (PRO-295 B2). It
+        # is refused on absence like provenanceFiles, shallow/commits and authors.
+        problems.append(
+            "the tally has no `companyFindingList`, so the guard cannot check that the "
+            "rows back the `companyFindings` total the check gates on. It is never "
+            "skipped silently: re-run the sweep with the corpus_sweep.py that ships with "
+            "this guard.")
+    else:
         # The sweep caps the list it writes (COMPANY_JSON_LIMIT) so a run that attributes
         # the whole corpus to the company cannot write a 120 MB tally; the flag is what
         # keeps that cap from becoming a way to hide rows.

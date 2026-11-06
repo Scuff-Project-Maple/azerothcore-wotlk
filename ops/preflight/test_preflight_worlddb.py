@@ -1952,12 +1952,26 @@ class TestCiProvenanceGuard(unittest.TestCase):
 
     def test_the_silent_green_shallow_case_fails_on_history_alone(self):
         # The dangerous shape: an upstream-authored tip puts every finding in `upstream`,
-        # the column the CI check gates on reads 0, and no other rule here complains.
+        # the column the CI check gates on reads 0, and nothing about the provenance
+        # columns themselves looks wrong. History is the only thing left that can see it,
+        # so this tally keeps a healthy provenanceFiles and fails on the history clauses
+        # alone.
+        tally = dict(self.GOOD, shallow=True, commits=1, authors=1)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        for needle in ("shallow", "commits=1", "authors=1", "upstream"):
+            self.assertIn(needle, err)
+
+    def test_the_measured_shallow_collapse_is_also_refused_by_the_company_column(self):
+        # What a `--depth 1` clone of this repo actually produced (PRO-285), now caught
+        # twice over: the history clauses, and since PRO-295 B1, the gated column having
+        # no company file behind it.
         tally = dict(self.GOOD, shallow=True, commits=1, authors=1,
                      provenanceFiles={"company": 0, "upstream": 3060, "unknown": 0})
         code, _, err = self._run(tally)
         self.assertEqual(2, code)
-        for needle in ("shallow", "commits=1", "authors=1", "upstream"):
+        for needle in ("shallow", "commits=1", "authors=1", "upstream",
+                       "attributed to `company`"):
             self.assertIn(needle, err)
 
     def test_a_single_author_across_the_corpus_fails(self):
@@ -1971,6 +1985,57 @@ class TestCiProvenanceGuard(unittest.TestCase):
         code, _, err = self._run(tally)
         self.assertEqual(2, code)
         self.assertIn("attributed to `upstream`", err)
+
+    def test_a_corpus_with_no_company_files_fails(self):
+        # PRO-295 B1. Drop `pending_db_world` from `includedDirs` and the gated column
+        # has nothing behind it: files=3053, provenanceFiles.company=0, companyFindings=0.
+        # That is the same zero a compliant corpus produces, and until this clause the
+        # guard read it as a verdict.
+        tally = dict(self.GOOD, files=3053, filesUnderPolicy=3053,
+                     provenanceFiles={"company": 0, "upstream": 3053, "unknown": 0})
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("attributed to `company`", err)
+        self.assertIn("not a policy", err)
+
+    def test_a_sweep_that_parsed_no_statements_fails(self):
+        # PRO-295 B2. files>0 with statements=0 means the engine was handed the corpus
+        # and read nothing out of it; every count below it, gated column included, is a
+        # count over nothing.
+        code, _, err = self._run(dict(self.GOOD, statements=0))
+        self.assertEqual(2, code)
+        self.assertIn("statements=0", err)
+
+    def test_a_sweep_that_found_nothing_at_all_fails(self):
+        # PRO-295 B2. This tree measures 444 726 findings and always will, so findings=0
+        # over 3 060 files is a dead engine — an emptied `forbiddenStatements`, a rule
+        # registry that failed to load — not a clean corpus.
+        code, _, err = self._run(dict(self.GOOD, findings=0))
+        self.assertEqual(2, code)
+        self.assertIn("findings=0", err)
+        self.assertIn("444 726", err)
+
+    def test_a_sweep_with_no_rule_that_fired_fails(self):
+        # The per-rule form of the same claim: findings>0 but nothing in byRule is the
+        # tally describing its own counts inconsistently, and an empty byRule with
+        # findings=0 is the dead engine again.
+        code, _, err = self._run(dict(self.GOOD, byRule={}, findings=0,
+                                      byRuleOrigin={}))
+        self.assertEqual(2, code)
+        self.assertIn("byRule is empty", err)
+
+    def test_a_tally_without_a_company_row_list_is_never_skipped_silently(self):
+        # PRO-295 B2. `companyFindingList` was the only gated key whose absence the guard
+        # tolerated; provenanceFiles, shallow/commits and authors are all hard refusals
+        # when missing and this had better match them.
+        tally = {k: v for k, v in self.GOOD.items() if k != "companyFindingList"}
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("companyFindingList", err)
+        tally = dict(self.GOOD, companyFindingList=None)
+        code, _, err = self._run(tally)
+        self.assertEqual(2, code)
+        self.assertIn("companyFindingList", err)
 
     def test_history_keys_absent_are_never_skipped_silently(self):
         tally = {k: v for k, v in self.GOOD.items() if k not in ("shallow", "commits")}
