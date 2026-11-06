@@ -91,11 +91,83 @@ lookups only (`git ls-tree`), never a fetch:
 | ref resolved, name absent | `company` | `FAIL` `unverified-upstream-origin` naming `pending_db_world` |
 | git could not answer | `company` | `FAIL` `unverified-upstream-origin`, failing closed, naming `refreshCommand` |
 | ref does not resolve under `refs/remotes/` | `company` | `FAIL` `upstream-ref-not-remote` naming `refreshCommand` |
-| ref unset / not present locally | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
+| ref resolves but is not a commit (tree, blob, null sha) | `company` | `FAIL` `upstream-ref-not-a-commit` naming `refreshCommand` |
+| ref is gone, but this clone still has local history for it | `company` | `FAIL` `upstream-ref-deleted` naming `refreshCommand` and `--allow-missing-upstream-ref` |
+| ref unset | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
+| ref is absent and this clone has no trace of it | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
 
-A ref that is simply missing is deliberately a `WARN` and not a `FAIL`: refusing every clone that
-has not fetched is worse than the pre-PRO-248 status quo, and the report names the command that
-restores the check. Every other answer the ref can give is a `FAIL`.
+#### `missing`, `indeterminate`, `unchecked` (PRO-291, PRO-248 review N1)
+
+"Is the ref there?" is not one question and the gate no longer answers it with one state. The
+distinction matters because `unchecked` is the only ref answer that still grants the exemption on a
+`WARN`, so anything that can be laundered into `missing` has bought back the pre-PRO-248
+directory+author rule.
+
+| state | what git actually said | what the gate does |
+| --- | --- | --- |
+| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
+| `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
+| `indeterminate` / `not-a-commit` | the name resolves to an object that is not a commit — `HEAD^{tree}`, a blob, a mistyped object name, the null sha | `FAIL`, failing closed, naming `refreshCommand`. It is not missing, and calling it `missing` was the false statement that kept the exemption |
+| `indeterminate` / other | git errored, or the ref is not under `refs/remotes/` | `FAIL`, failing closed |
+
+Before PRO-291 both of the last two rows were filed as `missing`, so a `verifiedRef` pointed at a
+tree object booted a forged-author file on a `WARN` — the reason `git rev-parse --verify <ref>^{commit}`
+is no longer the existence test. It is now a two-step question: peel to a commit, and if that fails
+ask separately whether the name resolved to *anything* (`rev-parse --verify --quiet <ref>`, with
+`cat-file -t` naming what came back). Only a name that resolves to nothing at all may be `missing`.
+`git ls-tree` is never asked of a ref the gate does not trust, and none of these probes fetch.
+Every git call the gate makes — the ref probes, the author lookup and the work-tree `git status`
+included — goes through the one `_git()` helper, so "nothing in here reaches the network" is a
+claim about a single call site rather than about most of them (PRO-291 review N5).
+
+The `ref-deleted` discrimination is local history only — three signals, no network. What each one
+tests is *fetching*, so each is a file a fetch writes and `git clone` does not:
+
+- the ref's own reflog, at `git rev-parse --git-path logs/<ref>`;
+- `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not;
+- any sibling ref under the same `refs/remotes/<remote>/` namespace other than `<remote>/HEAD`
+  that **carries its own reflog** (`for-each-ref`, not `show-ref` — `show-ref` matches anchored
+  whole ref names, so a bare namespace prefix answers "no refs").
+
+The reflog is what makes the third signal honest, and it is the reason the probe is not simply
+"any sibling ref" (PRO-291 review B1). `git clone` populates `refs/remotes/<remote>/*` itself, so a
+sibling *ref* says only that the remote had that branch when the clone was made; counting it as
+fetch evidence refused a boot to an untouched clone and told the operator their ref had been
+deleted. Measured on git 2.43.0, a plain clone and a `--single-branch` clone both leave the
+namespace populated and every branch sibling reflog-free; a `git fetch`, a `git pull` or a
+`git update-ref` is what writes one.
+
+That set exists because the ref's own reflog alone is not enough: `git update-ref -d` deletes the
+reflog along with the ref, so the exact command the review named would otherwise be
+indistinguishable from a clone that never fetched. The sibling-reflog probe is what catches it —
+**in a clone where something was ever fetched**, which is a clone that has run `refreshCommand` at
+least once. `origin/HEAD` is excluded from the probe because a clone writes that one reflog without
+anyone ever fetching a branch.
+
+The limit of that sentence belongs in this README rather than left to inference, because what this
+section owes the operator is what the gate actually guarantees. In a clone that has **never**
+fetched, every sibling reflog is absent by construction, so
+`git update-ref -d refs/remotes/origin/Playerbot` there leaves a state identical, in everything the
+gate reads, to an honest clone of a remote that never carried the ref — and that honest clone is the
+case this section promises boots offline. The deletion is invisible in that one case, and no local
+check can separate the two; the same holds for an operator who deletes the ref and then removes
+`FETCH_HEAD` and `logs/refs/remotes/`. Saying otherwise would be the same species of over-claim
+PRO-248 review N3 removed. Telling "no fetch artifacts" apart from "never held the ref" needs a
+durable attestation written by a verified boot and checked by the next one, which is outside this
+gate. What is guaranteed is the flow the policy models: a clone that has fetched and then loses the
+ref fails closed.
+
+The three signals are not equally strong, and the report says which one it used. `ref`'s own reflog
+is a record of *this* ref having been here, so the message says it was deleted rather than never
+fetched. A `FETCH_HEAD` or a sibling reflog only proves somebody fetched, which leaves "the remote
+never had this branch" standing; the gate still fails closed on that, but it says the ref was
+either deleted or never existed here, because a boot refusal must not assert a deletion it did not
+observe.
+
+`--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
+case only. It does not rescue `not-a-commit`, any other `indeterminate` cause, or a ref that was
+genuinely never fetched — the `WARN` for that one is already granted without it, and the flag is not
+a general mute switch.
 
 `verifiedRef` is stored fully qualified, as `refs/remotes/origin/Playerbot`. A short
 `origin/Playerbot` is ambiguous: git expands `refs/heads/` before `refs/remotes/`, so a single
@@ -106,7 +178,11 @@ remote-tracking test is therefore "exit 0 **and** a name starting with `refs/rem
 else is answered as *not remote-tracking* and refuses the boot, because the person whose forged
 `--author` this rule exists to catch can create exactly that shadow branch. `audit_policy_schema.py`
 exits 1 when `verifiedRef` is deleted, empty, or does not start with `refs/remotes/`, so the
-qualifier cannot be dropped silently.
+qualifier cannot be dropped silently. It also exits 1 on a name carrying a revision selector
+(`refs/remotes/origin/Playerbot^{tree}`, `~1`, `@{0}`) or on a bare object name: those pass the
+prefix test but name something the gate cannot peel to a commit, and it refuses the boot on
+exactly that (`not-a-commit`), so an audit that accepted them would exit 0 on a policy the gate
+rejects (PRO-291).
 
 Content **is** consulted. The ref is listed with `git ls-tree -z -r` — NUL-delimited, so a genuine
 upstream filename like `2026_11_04_00_érfar.sql` is compared byte-for-byte instead of against git's

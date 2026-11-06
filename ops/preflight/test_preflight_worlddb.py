@@ -1188,8 +1188,67 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         pf.classify_origin(f)
         self.assertEqual(pf.REF_VERIFIED, f["upstream_ref_state"])
 
+    def _virgin(self, d):
+        """Strip every trace of a fetch, so this really is a never-fetched clone.
+
+        PRO-291 (PRO-248 review N1, opening 2): `missing` now has to tell "this clone
+        has never fetched" from "the ref was here and someone deleted it", so a test
+        that claims the first case has to leave no evidence of the second — no
+        refs/remotes/<remote>/* refs, no reflogs, no FETCH_HEAD.
+        """
+        import subprocess
+        for line in subprocess.run(["git", "for-each-ref", "--format=%(refname)",
+                                    "refs/remotes/"], cwd=str(d),
+                                   stdout=subprocess.PIPE, text=True).stdout.splitlines():
+            name = line.strip()
+            if name:
+                self._git(d, "update-ref", "-d", name)
+        shutil_rmtree = __import__("shutil").rmtree
+        logs = d / ".git" / "logs" / "refs" / "remotes"
+        if logs.exists():
+            shutil_rmtree(logs, ignore_errors=True)
+        (d / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+        return d
+
+    def _write_reflog(self, d, refname):
+        """Leave a reflog file for `refname`, as a fetch or `git update-ref` would."""
+        logs = d / ".git" / "logs" / refname
+        logs.parent.mkdir(parents=True, exist_ok=True)
+        logs.write_text("0" * 40 + " " + "a" * 40 + " Scuff <s@s> 1 +0000\n")
+        return logs
+
+    def _clone(self, single_branch=False):
+        """A real `git clone` — the repository shape PRO-291 review B1 got wrong.
+
+        `git clone` populates `refs/remotes/<remote>/*` itself and writes no reflog for
+        those refs, which is precisely what the sibling probe must not read as a fetch.
+        The seed holds only `master`, so the policy's `refs/remotes/origin/Playerbot`
+        has never existed anywhere, which is the honest case that has to boot.
+        """
+        import shutil
+        import tempfile
+        seed = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, seed, ignore_errors=True)
+        (seed / self.UP_REL).mkdir(parents=True)
+        self._git(seed, "init", "-q", "-b", "master")
+        self._git(seed, "config", "user.email", "bot@paperclip.local")
+        self._git(seed, "config", "user.name", "Scuff Bot")
+        base = seed / self.UP_REL / "2026_01_01_00.sql"
+        base.write_text("DELETE FROM `creature_template` WHERE `entry` = 1;\n")
+        self._git(seed, "add", "-A")
+        self._git(seed, "commit", "-qm", "upstream update")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        argv = ["clone"]
+        if single_branch:
+            argv += ["--single-branch", "--branch", "master"]
+        self._git(seed, *argv, str(seed), str(d))
+        self._git(d, "config", "user.email", "bot@paperclip.local")
+        self._git(d, "config", "user.name", "Scuff Bot")
+        return d
+
     def test_missing_ref_does_not_refuse_an_offline_boot(self):
-        d = self._repo()
+        d = self._virgin(self._repo())
         p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
         pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
         origin, _ = self._run(pf, self._file(d, p))
@@ -1512,6 +1571,476 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertIn("upstream ref refs/remotes/origin/Playerbot", listed)
 
 
+    # --- PRO-291 / PRO-248 review N1: 'missing' is not one answer, it is three ---- #
+
+    def _stub_git_shapes(self, pf, full_name=(0, "refs/remotes/origin/Playerbot", ""),
+                         commit_peel=(0, "0" * 40, ""), obj=(1, "", ""),
+                         obj_type=(1, "", ""), reflog_path=(0, ".git/logs/ABSENT", ""),
+                         reflog_paths=None,
+                         fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+                         namespace=(0, "", "")):
+        """Hand git each shape on its own, and record every argv it was asked (review N4).
+
+        `_stub_git` above pins the remote-tracking question. This pins the *existence*
+        question, whose whole point is that `git rev-parse --verify <ref>^{commit}`
+        collapses "no such ref" and "the ref names a tree" into one exit code, and that
+        a real repository cannot produce both shapes separately.
+
+        `reflog_paths` answers `--git-path logs/<refname>` per ref name, so the ref the
+        policy trusts and a sibling can be given different answers — which is the whole
+        content of the sibling probe (PRO-291 review B1). Anything not listed falls
+        back to `reflog_path`.
+        """
+        calls = []
+
+        def fake(argv, timeout=60, errors="replace"):
+            calls.append(list(argv))
+            if argv[:2] == ["rev-parse", "--symbolic-full-name"]:
+                return full_name
+            if argv[:2] == ["rev-parse", "--verify"]:
+                return commit_peel if argv[-1].endswith("^{commit}") else obj
+            if argv[:1] == ["cat-file"]:
+                return obj_type
+            if argv[:2] == ["rev-parse", "--git-path"]:
+                arg = argv[-1]
+                if not arg.startswith("logs/"):
+                    return fetch_head_path
+                if reflog_paths and arg in reflog_paths:
+                    return reflog_paths[arg]
+                return reflog_path
+            if argv[:1] == ["for-each-ref"]:
+                return namespace
+            if argv[:1] == ["log"]:
+                # The author probe reaches `_git` too since review N5, so the stub has
+                # to answer it: every caller of this helper committed the file with an
+                # upstream author, and a stub that cannot say so would silently turn an
+                # upstream file into an unattributable one.
+                return 0, "Someone <x@azerothcore.org>\tSomeone\tadd file", ""
+            if argv[:1] == ["status"]:
+                return 0, "", ""
+            return 128, "", f"stub refused {argv}"
+
+        pf._git = fake
+        return calls
+
+    # -- opening 1: a ref that is here but is not a commit ------------------------ #
+
+    def test_a_ref_that_resolves_to_a_tree_fails_closed_as_not_a_commit(self):
+        # Rev's POC, end to end against a real repository: point verifiedRef at a tree
+        # object and the forged-author file used to boot on a WARN, because `^{commit}`
+        # failed and the gate filed the ref as `missing`.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        tree = self._git(d, "rev-parse", "HEAD^{tree}")
+        pf = self._pf(d, verified_ref=tree)
+        up = pf.upstream_ref()
+        self.assertEqual("not-a-commit", up["state"],
+                         "a tree object was filed as a ref that does not exist")
+        self.assertEqual("tree", up["objectType"])
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin, "a forged-author file kept the exemption")
+        self.assertIn("upstream-ref-not-a-commit", [r for r, _ in fails])
+        msg = next(m for r, m in fails if r == "upstream-ref-not-a-commit")
+        self.assertIn("git fetch --prune origin Playerbot", msg)
+        self.assertIn("pending_db_world", msg)
+        self.assertTrue(pf.r.failed, "a non-commit verifiedRef must refuse this boot")
+
+    def test_a_ref_that_resolves_to_a_tree_is_not_filed_as_missing(self):
+        # The two shapes `^{commit}` collapses, produced separately. Measured on git
+        # 2.43.0: for a tree, `rev-parse --symbolic-full-name` exits 0 printing nothing
+        # and the peel exits 1, which is the same exit code a missing ref gives.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="abc123")
+        calls = self._stub_git_shapes(
+            pf, full_name=(0, "", ""), commit_peel=(1, "", "error: expected commit type"),
+            obj=(0, "0d8a474fc67971fb3dd7616e26323d3066442555", ""),
+            obj_type=(0, "tree", ""))
+        up = pf.upstream_ref()
+        self.assertEqual("not-a-commit", up["state"])
+        self.assertEqual("tree", up["objectType"])
+        self.assertFalse(up["remoteTracked"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]],
+                         "a ref the gate does not trust was still asked for its tree")
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual(pf.REF_INDETERMINATE, state)
+        self.assertEqual("not-a-commit", cause)
+        self.assertIn("git fetch", pf.upstream_ref()["refresh"])
+
+    def test_only_a_name_that_resolves_to_nothing_at_all_is_missing(self):
+        # The other half of opening 1: `missing` must stay reachable, or the
+        # never-fetched clone loses the boot the acceptance criteria promise it.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        calls = self._stub_git_shapes(
+            pf, commit_peel=(1, "", "fatal: Needed a single revision"),
+            obj=(1, "", ""), reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""))
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        self.assertFalse(up["wasTracked"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+        state, _detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual(pf.REF_UNCHECKED, state)
+        self.assertEqual("missing", cause)
+
+    def test_a_zero_exit_naming_no_object_is_missing_not_not_a_commit(self):
+        # The mirror of the B1 shape, on the existence question: `rev-parse --verify
+        # --quiet <ref>` can exit 0 and print nothing. Treating "exit 0" alone as "the
+        # name resolved" would file a ref that is simply not there as `not-a-commit`
+        # and refuse a clone that has never fetched.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(0, "", ""),
+                              obj_type=(0, "tree", ""),
+                              reflog_path=(0, ".git/logs/ABSENT", ""),
+                              fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+                              namespace=(0, "", ""))
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"],
+                         "an empty answer was read as a resolved object")
+        self.assertEqual(pf.REF_UNCHECKED, pf.upstream_ref_state(p)[0])
+
+    def test_a_zero_object_type_still_fails_closed_as_not_a_commit(self):
+        # `git rev-parse --verify --quiet 0000...0` exits 0 and prints the null sha, but
+        # `cat-file -t` cannot name it. The name resolved, so it is not missing.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="0" * 40)
+        self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(0, "0" * 40, ""),
+                              obj_type=(128, "", "could not get object info"))
+        up = pf.upstream_ref()
+        self.assertEqual("not-a-commit", up["state"])
+        self.assertEqual("non-commit object", up["objectType"])
+        self.assertEqual(pf.REF_INDETERMINATE, pf.upstream_ref_state(p)[0])
+
+    # -- opening 2: deleted vs never fetched -------------------------------------- #
+
+    def test_a_deleted_upstream_ref_fails_closed_as_ref_deleted(self):
+        # The attack the review named: one `git update-ref -d` is all that stands
+        # between the boot gate and the pre-PRO-248 directory+author exemption.
+        d = self._repo()
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/master", head)
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", "-d", "refs/remotes/origin/Playerbot")
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("company", origin, "a deleted ref still bought the exemption")
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
+        self.assertNotIn("upstream-ref-unverified", warns)
+        msg = next(m for r, m in fails if r == "upstream-ref-deleted")
+        self.assertIn("git fetch --prune origin Playerbot", msg)
+        self.assertIn("--allow-missing-upstream-ref", msg)
+        self.assertIn("pending_db_world", msg)
+        self.assertTrue(pf.r.failed)
+
+    def test_a_ref_deleted_by_hand_leaves_its_reflog_as_evidence(self):
+        # `git update-ref -d` deletes the reflog with the ref (measured on git 2.43.0),
+        # so the namespace probe above is what catches that route. A ref removed some
+        # other way — a stray `rm` of the loose ref — leaves the reflog behind, and the
+        # reflog alone has to be enough.
+        d = self._repo()
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        loose = d / ".git" / "refs" / "remotes" / "origin" / "Playerbot"
+        self.assertTrue(loose.exists(), "update-ref did not leave a loose ref to remove")
+        loose.unlink()
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("reflog", up["wasTrackedDetail"])
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed)
+
+    def test_allow_missing_upstream_ref_opts_into_the_exemption(self):
+        # The permissive path stays available, but it has to be typed.
+        d = self._repo()
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/master", head)
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", "-d", "refs/remotes/origin/Playerbot")
+        pf = self._pf(d)
+        pf.a.allow_missing_upstream_ref = True
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("upstream", origin)
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertIn("upstream-ref-unverified", warns)
+        warn = next(x.message for x in pf.r.findings if x.rule == "upstream-ref-unverified")
+        self.assertIn("--allow-missing-upstream-ref", warn)
+        self.assertFalse(pf.r.failed)
+
+    def test_a_fetch_head_is_evidence_the_clone_fetched(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        (d / ".git" / "FETCH_HEAD").write_text("abc123\t\tbranch 'Playerbot' of origin\n")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("FETCH_HEAD", up["wasTrackedDetail"])
+        self.assertEqual(pf.REF_INDETERMINATE, pf.upstream_ref_state(p)[0])
+
+    # -- each of the three history signals, on its own (review N4) ----------------- #
+
+    def test_the_reflog_alone_is_enough_history(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        calls = self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        (d / ".git" / "logs" / "refs" / "remotes" / "origin").mkdir(parents=True,
+                                                                    exist_ok=True)
+        (d / ".git" / "logs" / "refs" / "remotes" / "origin" / "Absent").write_text(
+            "0" * 40 + " " + "a" * 40 + " Scuff <s@s> 1 +0000\n")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("reflog", up["wasTrackedDetail"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+
+    def test_a_sibling_ref_that_carries_a_reflog_is_enough_history(self):
+        # PRO-291 review B1 rewrote this test. What makes a namespace sibling evidence of
+        # a fetch is the *reflog* it carries — the file `git fetch`, `git pull` and
+        # `git update-ref` leave behind — not the ref, which `git clone` writes itself.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        self._write_reflog(d, "refs/remotes/origin/Playerbot")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        calls = self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+            namespace=(0, "refs/remotes/origin/Playerbot\n", ""),
+            reflog_paths={"logs/refs/remotes/origin/Playerbot":
+                          (0, ".git/logs/refs/remotes/origin/Playerbot", "")})
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("refs/remotes/origin/Playerbot", up["wasTrackedDetail"])
+        self.assertEqual("fetched", up["wasTrackedCertainty"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+
+    def test_a_sibling_ref_without_a_reflog_is_clone_output_not_history(self):
+        # The twin the review measured on git 2.43.0: a clone leaves branch siblings
+        # with no reflog at all. That is an untouched clone, and it used to be refused a
+        # boot while the gate told the operator the tracked ref had been deleted.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+            namespace=(0, "refs/remotes/origin/Playerbot\n"
+                          "refs/remotes/origin/master\n", ""))
+        up = pf.upstream_ref()
+        self.assertFalse(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual("", up["wasTrackedCertainty"])
+        state, _detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_UNCHECKED, "missing"), (state, cause))
+        self._run(pf, self._file(d, p))
+        self.assertFalse(pf.r.failed, "a clone nobody ever fetched was refused a boot")
+
+    def test_origin_head_alone_is_not_enough_history(self):
+        # A clone writes refs/remotes/<remote>/HEAD and its reflog without anyone ever
+        # fetching a branch, so the namespace probe must not read it as evidence.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+            namespace=(0, "refs/remotes/origin/HEAD\n", ""))
+        up = pf.upstream_ref()
+        self.assertFalse(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual(pf.REF_UNCHECKED, pf.upstream_ref_state(p)[0])
+        self._run(pf, self._file(d, p))
+        self.assertFalse(pf.r.failed, "a never-fetched clone must still boot")
+
+    def test_no_local_history_at_all_is_a_genuine_never_fetched_clone(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        calls = self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        self.assertFalse(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_UNCHECKED, "missing"), (state, cause))
+        self.assertIn("git fetch --prune origin Playerbot", detail)
+
+    def test_an_untouched_clone_of_a_remote_without_the_ref_still_boots(self):
+        # AC 6 against the repository shape `git clone` really produces, rather than the
+        # stripped one `_virgin()` builds. Both clone modes carry a populated
+        # refs/remotes/origin/* namespace, and before B1 that was read as a deletion.
+        for single_branch in (False, True):
+            with self.subTest(single_branch=single_branch):
+                d = self._clone(single_branch=single_branch)
+                p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+                pf = self._pf(d, verified_ref="refs/remotes/origin/Playerbot")
+                up = pf.upstream_ref()
+                self.assertEqual("missing", up["state"])
+                self.assertFalse(up["wasTracked"], up["wasTrackedDetail"])
+                origin, _ = self._run(pf, self._file(d, p))
+                fails, warns = self._outcomes(pf)
+                self.assertEqual("upstream", origin,
+                                 "an honest clone lost the upstream exemption")
+                self.assertEqual([], [r for r, _ in fails])
+                self.assertIn("upstream-ref-unverified", warns)
+                self.assertFalse(pf.r.failed,
+                                 "a clone that has never fetched was refused a boot")
+
+    def test_it_is_the_reflog_and_not_the_sibling_ref_that_decides(self):
+        # The B1 discriminator, on real git and in one repository: the same untouched
+        # clone answers 'never fetched' while its siblings are clone output, and flips to
+        # 'ref-deleted' the moment a sibling acquires a reflog the way a fetch leaves it.
+        d = self._clone()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Playerbot")
+        self.assertFalse(pf.upstream_ref()["wasTracked"],
+                         "a cloned sibling ref was read as fetch evidence")
+        self._git(d, "update-ref", "refs/remotes/origin/Other", "HEAD")
+        pf2 = self._pf(d, verified_ref="refs/remotes/origin/Playerbot")
+        up = pf2.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("refs/remotes/origin/Other", up["wasTrackedDetail"])
+        self.assertEqual("fetched", up["wasTrackedCertainty"])
+        self.assertEqual("ref-deleted", pf2.upstream_ref_state(p)[2])
+
+    def test_the_ref_deleted_message_matches_the_evidence_behind_it(self):
+        # Review N4: failing closed is correct, but the operator must not be told about a
+        # deletion the gate did not observe. Sibling-reflog evidence says "somebody
+        # fetched"; only the ref's own reflog says it was here.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        self._write_reflog(d, "refs/remotes/origin/Playerbot")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+            namespace=(0, "refs/remotes/origin/Playerbot\n", ""),
+            reflog_paths={"logs/refs/remotes/origin/Playerbot":
+                          (0, ".git/logs/refs/remotes/origin/Playerbot", "")})
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
+        inferred = next(m for r, m in fails if r == "upstream-ref-deleted")
+        self.assertIn("never existed", inferred)
+        self.assertNotIn("so it was deleted rather than never fetched", inferred)
+
+        d2 = self._repo()
+        p2 = self._commit(d2, f"{self.UP_REL}/2026_11_04_01_00.sql", self.IN_BAND)
+        self._git(d2, "update-ref", "refs/remotes/origin/Playerbot", "HEAD")
+        loose = d2 / ".git" / "refs" / "remotes" / "origin" / "Playerbot"
+        loose.unlink()
+        pf2 = self._pf(d2)
+        self.assertEqual("held", pf2.upstream_ref()["wasTrackedCertainty"])
+        self._run(pf2, self._file(d2, p2))
+        fails2, _ = self._outcomes(pf2)
+        direct = next(m for r, m in fails2 if r == "upstream-ref-deleted")
+        self.assertIn("deleted rather than never fetched", direct)
+
+    def _watch_git_verbs(self, pf):
+        """Record every git verb the gate runs, while delegating to real git."""
+        real = pf._git
+        seen = []
+
+        def spy(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return real(argv, *args, **kwargs)
+
+        pf._git = spy
+        return seen
+
+    def test_the_gate_never_fetches_on_any_ref_answer(self):
+        # "The genuine `git pull` case still boots offline: no fetching from inside the
+        # gate" is a claim about the argv the gate passes git, so it is checked at the
+        # argv boundary — and it has to cover the three PRO-291 local-history probes,
+        # which are the newest way to hand the boot gate a network command by accident.
+        network = {"fetch", "pull", "push", "clone", "ls-remote", "fetch-pack",
+                   "http-fetch", "http-pull", "archive", "upload-pack"}
+        for label, ref, prep, build in (
+                ("verified", "refs/remotes/origin/Playerbot",
+                 lambda d: self._git(d, "update-ref", "refs/remotes/origin/Playerbot",
+                                     "HEAD"),
+                 self._repo),
+                ("never-fetched", "refs/remotes/origin/Absent", self._virgin,
+                 self._repo),
+                ("untouched-clone", "refs/remotes/origin/Playerbot",
+                 lambda d: None, lambda: self._clone()),
+                ("ref-deleted", "refs/remotes/origin/Playerbot",
+                 lambda d: (self._git(d, "update-ref", "refs/remotes/origin/master",
+                                      "HEAD"),
+                            self._git(d, "update-ref", "-d",
+                                      "refs/remotes/origin/Playerbot")),
+                 self._repo),
+                ("not-a-commit", None, lambda d: None, self._repo),
+        ):
+            with self.subTest(label):
+                d = build()
+                p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+                prep(d)
+                pf = self._pf(d, verified_ref=(self._git(d, "rev-parse", "HEAD^{tree}")
+                                               if ref is None else ref))
+                seen = self._watch_git_verbs(pf)
+                self._run(pf, self._file(d, p))
+                self.assertEqual(
+                    [], [c for c in seen if c and c[0] in network],
+                    f"the gate reached the network while deciding {label}")
+                self.assertTrue(any(c[:1] == ["rev-parse"] for c in seen),
+                                "the probes never ran, so this checked nothing")
+                if label == "verified":
+                    self.assertFalse(pf.r.failed,
+                                     "a genuine upstream pull was refused offline")
+
+    def test_a_missing_ref_is_not_rescued_by_the_flag_when_it_never_existed(self):
+        # The flag widens the deleted-ref case only; it must not become a way to silence
+        # the WARN for a ref that was simply never fetched, and it must never turn a
+        # FAIL from another cause into a WARN.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        pf.a.allow_missing_upstream_ref = True
+        self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+                              reflog_path=(0, ".git/logs/ABSENT", ""),
+                              fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+                              namespace=(0, "", ""))
+        self.assertEqual((pf.REF_UNCHECKED, "missing"),
+                         pf.upstream_ref_state(p)[0::2])
+
+    def test_the_flag_does_not_rescue_a_non_commit_ref(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="abc123")
+        pf.a.allow_missing_upstream_ref = True
+        self._stub_git_shapes(pf, full_name=(0, "", ""), commit_peel=(1, "", ""),
+                              obj=(0, "0d8a474fc67971fb3dd7616e26323d3066442555", ""),
+                              obj_type=(0, "tree", ""))
+        self.assertEqual(pf.REF_INDETERMINATE, pf.upstream_ref_state(p)[0])
+        self._run(pf, self._file(d, p))
+        self.assertTrue(pf.r.failed,
+                        "--allow-missing-upstream-ref widened past the missing case")
+
+
 class TestPolicyAuditPinsProvenance(unittest.TestCase):
     """PRO-248 review N3: the ref the exemption rests on is a policy invariant too.
 
@@ -1554,6 +2083,34 @@ class TestPolicyAuditPinsProvenance(unittest.TestCase):
         policy = json.loads(json.dumps(POLICY))
         policy["upstreamProvenance"]["refreshCommand"] = ""
         self.assertIn("refreshCommand", " ".join(self._problems(policy)))
+
+    def test_a_peeled_verified_ref_is_a_problem(self):
+        # PRO-291 (PRO-248 review N1, opening 1). The gate refuses a verifiedRef that
+        # resolves to a tree/blob instead of a commit, so a policy that names one must
+        # not audit clean: an audit that exits 0 while the boot refuses is exactly the
+        # audit/gate divergence review N5 was about. These all pass the old
+        # `startswith("refs/remotes/")` test, which is why they needed their own.
+        for ref in ("refs/remotes/origin/Playerbot^{tree}",
+                    "refs/remotes/origin/Playerbot^{blob}",
+                    "refs/remotes/origin/Playerbot~1",
+                    "refs/remotes/origin/Playerbot@{0}"):
+            policy = json.loads(json.dumps(POLICY))
+            policy["upstreamProvenance"]["verifiedRef"] = ref
+            problems = self._problems(policy)
+            self.assertEqual(1, len(problems), ref)
+            self.assertIn("verifiedRef", problems[0])
+            self.assertIn("not-a-commit", problems[0])
+
+    def test_an_object_name_verified_ref_is_a_problem(self):
+        # A mistyped object name is the other way `^{commit}` comes back empty without
+        # the ref being absent (review N1). It is not a ref, so no fetch maintains it.
+        for ref in ("0d8a474fc67971fb3dd7616e26323d3066442555", "abc123"):
+            policy = json.loads(json.dumps(POLICY))
+            policy["upstreamProvenance"]["verifiedRef"] = ref
+            problems = self._problems(policy)
+            self.assertEqual(1, len(problems), ref)
+            self.assertIn("verifiedRef", problems[0])
+            self.assertIn("object name", problems[0])
 
     def test_a_non_dict_block_is_a_problem(self):
         policy = json.loads(json.dumps(POLICY))
