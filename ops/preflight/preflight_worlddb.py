@@ -1223,15 +1223,16 @@ class Preflight:
         classify_origin(), which combines it with the directory tag from policy.
         """
         rel = os.path.relpath(path, self.git_root)
-        try:
-            proc = subprocess.run(
-                ["git", "log", "-1", "--format=%ae\t%an\t%s", "--", rel],
-                cwd=str(self.git_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Through `_git`, not a bare `subprocess.run`: the gate's "nothing in here ever
+        # reaches the network" claim is only as wide as the single place git is invoked
+        # (PRO-291 review N5).
+        rc, out, _err = self._git(["log", "-1", "--format=%ae\t%an\t%s", "--", rel],
+                                  timeout=30)
+        if rc is None:
             return "unknown", "git unavailable"
-        if proc.returncode != 0:
+        if rc != 0:
             return "unknown", "not a git tree"
-        line = proc.stdout.decode("utf-8", "replace").strip()
+        line = out.strip()
         if not line:
             return "unknown", "untracked"
         email = line.split("\t", 1)[0].lower()
@@ -1265,6 +1266,25 @@ class Preflight:
                 proc.stdout.decode("utf-8", errors),
                 proc.stderr.decode("utf-8", "replace").strip())
 
+    def _reflog_path(self, refname: str) -> str:
+        """The path of `refname`'s reflog in this clone, or '' when it holds none.
+
+        The reflog file — not the ref — is the fetch fingerprint. Measured on git
+        2.43.0: `git clone` creates `refs/remotes/<remote>/*` refs itself and writes
+        no reflog for them, while `git fetch`, `git pull` and `git update-ref` all
+        leave one behind (PRO-291 review B1).
+        """
+        rc, gp, _err = self._git(["rev-parse", "--git-path", f"logs/{refname}"])
+        if rc != 0 or not gp.strip():
+            return ""
+        declared = gp.strip()
+        p = Path(declared)
+        resolved = p if p.is_absolute() else self.git_root / p
+        return declared if resolved.exists() else ""
+
+    def _reflog_present(self, refname: str) -> bool:
+        return bool(self._reflog_path(refname))
+
     def upstream_ref_setting(self) -> tuple[str | None, str]:
         """(verifiedRef, refreshCommand) from policy, with a derived fetch hint."""
         cfg = self.p.get("upstreamProvenance")
@@ -1292,8 +1312,8 @@ class Preflight:
         """
         return bool(getattr(self.a, "allow_missing_upstream_ref", False))
 
-    def missing_ref_evidence(self, ref: str) -> tuple[bool, str]:
-        """Has this clone ever held `ref`? (evidence, what was found) — local only.
+    def missing_ref_evidence(self, ref: str) -> tuple[bool, str, str]:
+        """Has this clone ever held `ref`? (evidence, what was found, certainty) — local only.
 
         `missing` is the one ref answer that keeps the upstream exemption, so the
         gate has to tell "this clone has never fetched" from "the ref was here and
@@ -1303,7 +1323,8 @@ class Preflight:
         forger can satisfy (PRO-248 review N1, opening 2; the same class of hole B1
         closed for the ambiguous-name case).
 
-        Three local signals, none of which touch the network:
+        Three local signals, none of which touch the network. What they test is
+        *fetching*, so each one is a file a fetch writes and `git clone` does not:
 
         - the ref's own reflog, at `git rev-parse --git-path logs/<ref>`. Measured on
           git 2.43.0: `git update-ref` *creates* that file and `git update-ref -d`
@@ -1312,21 +1333,26 @@ class Preflight:
           is checked; it is not sufficient, which is why the other two are here.
         - `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not.
         - any sibling ref under the same `refs/remotes/<remote>/` namespace other
-          than `<remote>/HEAD`, which a fetch created. If the namespace is populated
-          but the one ref the policy is configured to trust is gone, the ref was
-          deleted or never fetched into this clone — either way the exemption is not
-          owed to it.
+          than `<remote>/HEAD` that carries **its own reflog**. The reflog is the
+          point: `git clone` populates `refs/remotes/<remote>/*` itself, so a sibling
+          *ref* says only that the remote had that branch when the clone was made —
+          it is not evidence that anyone ever fetched, and counting it as such
+          refused a boot to an untouched clone (PRO-291 review B1).
 
-        A genuinely never-fetched clone has none of the three and keeps its WARN.
+        A genuinely never-fetched clone has none of the three and keeps its `WARN`.
+
+        `certainty` says how far the evidence actually reaches: 'held' when this
+        clone holds `ref`'s own reflog, which is a record of *this* ref having been
+        here; 'fetched' when the strongest signal is someone else's — a FETCH_HEAD
+        or a sibling reflog — which proves the clone has fetched but not that the
+        configured ref ever arrived. Callers must not assert a deletion on 'fetched'.
         """
         found: list[str] = []
-        rc, gp, _err = self._git(["rev-parse", "--git-path", f"logs/{ref}"])
-        if rc == 0 and gp.strip():
-            lp = Path(gp.strip())
-            if not lp.is_absolute():
-                lp = self.git_root / lp
-            if lp.exists():
-                found.append(f"its reflog ({gp.strip()}) is still in this clone")
+        certainty = ""
+        own = self._reflog_path(ref)
+        if own:
+            found.append(f"its reflog ({own}) is still in this clone")
+            certainty = "held"
         rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
         if rc == 0 and fp.strip():
             fhp = Path(fp.strip())
@@ -1345,16 +1371,22 @@ class Preflight:
             if rc == 0:
                 sibs = [ln.strip() for ln in body.splitlines() if ln.strip()]
                 sibs = [s for s in sibs if s != f"{ns}HEAD" and s != ref]
+                # B1: a cloned sibling is not fetch evidence. Keep only siblings whose
+                # own reflog survives — the file clone leaves absent and fetch leaves.
+                sibs = [s for s in sibs if self._reflog_present(s)]
                 if sibs:
-                    found.append(f"{len(sibs)} other {ns}* refs are still in this "
+                    found.append(f"{len(sibs)} other {ns}* refs carry a reflog in this "
                                  f"clone, including {sibs[0]}")
-        return (bool(found), "; ".join(found))
+        if found and not certainty:
+            certainty = "fetched"
+        return (bool(found), "; ".join(found), certainty if found else "")
 
     def upstream_ref(self) -> dict:
         """Resolve the tracked upstream ref once per run.
 
         Returns {state, ref, refresh, paths, blobs, pathsLower, pathsByLower, detail,
-        remoteTracked, remoteDetail, wasTracked, wasTrackedDetail} where state is 'ok'
+        remoteTracked, remoteDetail, wasTracked, wasTrackedDetail,
+        wasTrackedCertainty, objectType} where state is 'ok'
         (`paths` is the set of tree paths, `blobs` maps a tree path to its blob id),
         'unconfigured', 'missing', 'not-a-commit' or 'error'. A missing ref is not an
         error: this must never need the network, and a clone that has not fetched yet
@@ -1363,7 +1395,10 @@ class Preflight:
 
         `wasTracked` answers "did this clone ever have the ref?" for a 'missing' ref:
         local history only, no network — see `missing_ref_evidence()` (review N1
-        opening 2).
+        opening 2). `wasTrackedCertainty` says how far that history reaches: 'held' is
+        a record of this very ref having been here, 'fetched' is proof of fetching
+        only, and the two must not be reported to the operator as the same sentence
+        (review B1/N4).
 
         `remoteTracked` answers "is verifiedRef under refs/remotes/?" and it fails
         closed (PRO-248 review B1). `git rev-parse --symbolic-full-name` prints nothing
@@ -1381,7 +1416,7 @@ class Preflight:
                "blobs": None, "pathsLower": None, "pathsByLower": None,
                "detail": "", "remoteTracked": True, "remoteDetail": "",
                "wasTracked": False, "wasTrackedDetail": "",
-               "objectId": "", "objectType": ""}
+               "wasTrackedCertainty": "", "objectType": ""}
         if not ref:
             out.update(state="unconfigured",
                        detail="policy has no upstreamProvenance.verifiedRef")
@@ -1421,8 +1456,12 @@ class Preflight:
                         out.update(state="error", detail=f"git unavailable: {err2}",
                                    paths=None)
                     elif rc2 == 0 and oid.strip():
-                        out.update(state="not-a-commit", objectId=oid.strip())
-                        rc3, otype, _e3 = self._git(["cat-file", "-t", ref])
+                        out.update(state="not-a-commit")
+                        # Ask the type of the object the existence probe actually
+                        # resolved rather than re-resolving the name: the oid is what
+                        # the gate decided on, and naming it also removes a second
+                        # resolution of an untrusted name (review N3).
+                        rc3, otype, _e3 = self._git(["cat-file", "-t", oid.strip()])
                         out["objectType"] = (otype.strip().lower()
                                              if rc3 == 0 and otype.strip()
                                              else "non-commit object")
@@ -1435,8 +1474,9 @@ class Preflight:
             if out["state"] == "missing":
                 # Review N1, opening 2: 'missing' is a WARN that keeps the exemption, so
                 # "never fetched" and "was here and got deleted" must not share it.
-                existed, why = self.missing_ref_evidence(ref)
-                out.update(wasTracked=existed, wasTrackedDetail=why)
+                existed, why, certainty = self.missing_ref_evidence(ref)
+                out.update(wasTracked=existed, wasTrackedDetail=why,
+                           wasTrackedCertainty=certainty if existed else "")
             if out["state"] == "ok" and out["remoteTracked"]:
                 # `-z` is not cosmetic: without it git quotes every path that is not
                 # plain ASCII, so `2026_01_01_01_érfar.sql` comes back as
@@ -1485,9 +1525,12 @@ class Preflight:
         - 'missing' / REF_UNCHECKED: git cannot find the name at all and this clone has
           no local history for it. A clone that has genuinely never fetched still
           boots, on a WARN that names `refreshCommand`.
-        - 'ref-deleted' / REF_INDETERMINATE: git cannot find the ref but local history
-          says it was here. Fail closed; `--allow-missing-upstream-ref` is the only way
-          back to the WARN, and it is a decision someone has to type.
+        - 'ref-deleted' / REF_INDETERMINATE: git cannot find the ref but this clone has
+          fetch history — `ref`'s own reflog, or a FETCH_HEAD or a sibling reflog that
+          only proves somebody fetched. Fail closed; `--allow-missing-upstream-ref` is
+          the only way back to the WARN, and it is a decision someone has to type. A
+          plain `git clone` leaves none of the three, so a clone that has never fetched
+          still lands on 'missing' (review B1).
         - 'not-a-commit' / REF_INDETERMINATE: the name resolves to a tree, blob or other
           non-commit object. Fail closed. It is not missing, and calling it missing was
           the false statement that kept the exemption.
@@ -1500,19 +1543,27 @@ class Preflight:
                                         f"{up['refresh']}"), "unconfigured"
         if up["state"] == "missing":
             if up.get("wasTracked"):
+                # Review B1/N4: only `ref`'s own reflog records *this* ref having been
+                # here. FETCH_HEAD and a sibling reflog prove the clone fetched, which
+                # is enough to fail closed but not enough to accuse anyone of deleting
+                # something — the alternative is that the remote never had the branch.
+                certainty = up.get("wasTrackedCertainty") or "fetched"
+                why = up.get("wasTrackedDetail", "")
+                if certainty == "held":
+                    verdict = (f"{ref} is not present locally, but this clone holds "
+                               f"{ref}'s own reflog ({why}), so it was deleted rather "
+                               f"than never fetched")
+                else:
+                    verdict = (f"{ref} is not present locally and has no reflog of its "
+                               f"own, while this clone does have fetch history ({why}), "
+                               f"so the ref was either deleted after it arrived or "
+                               f"never existed in this clone")
                 if self.allow_missing_upstream_ref():
                     return (self.REF_UNCHECKED,
-                            f"{ref} is not present locally, but this clone has local "
-                            f"history for it ({up.get('wasTrackedDetail', '')}), so it was "
-                            f"deleted rather than never fetched; --"
-                            f"allow-missing-upstream-ref was passed, which opts into the "
-                            f"pre-PRO-248 exemption on that answer",
+                            f"{verdict}; --allow-missing-upstream-ref was passed, which "
+                            f"opts into the pre-PRO-248 exemption on that answer",
                             "missing-allowed")
-                return (self.REF_INDETERMINATE,
-                        f"{ref} is not present locally, but this clone has local history "
-                        f"for it ({up.get('wasTrackedDetail', '')}), so it was deleted "
-                        f"rather than never fetched",
-                        "ref-deleted")
+                return (self.REF_INDETERMINATE, verdict, "ref-deleted")
             return (self.REF_UNCHECKED,
                     f"{ref} is not present locally; run {up['refresh']}", "missing")
         if up["state"] == "not-a-commit":
@@ -1675,13 +1726,23 @@ class Preflight:
         elif state == self.REF_INDETERMINATE and cause == "ref-deleted":
             # Review N1, opening 2. Without this branch the file keeps the exemption on
             # the word of a ref that is one `git update-ref -d` away from being gone.
+            # Review B1/N4: the sentence has to match the evidence. `ref`'s own reflog is
+            # a record of *this* ref having been here; a FETCH_HEAD or a sibling reflog
+            # only proves somebody fetched, which leaves "the remote never had this
+            # branch" standing. The gate must not report a deletion it did not observe.
+            if up.get("wasTrackedCertainty") == "held":
+                evidence = "a ref that this clone demonstrably had and no longer does " \
+                           "is not that"
+            else:
+                evidence = "this clone has fetched, so the ref either arrived and was " \
+                           "deleted or never existed here, and the gate will not grant " \
+                           "the exemption on the difference"
             bad("upstream-ref-deleted",
                 f"{f['rel']} is new in the upstream-tagged directory "
                 f"{db_path} and the upstream exemption was about to be "
                 f"granted on {ref}, which is not present in this clone: {detail}. "
                 f"A clone that has genuinely never fetched still boots on a "
-                f"WARN; a ref that this clone demonstrably had and no longer "
-                f"does is not that. Restore it with `{up['refresh']}` and "
+                f"WARN; {evidence}. Restore it with `{up['refresh']}` and "
                 f"re-run; if you are deliberately running without the ref, "
                 f"pass --allow-missing-upstream-ref so the exemption is "
                 f"opted into rather than inherited. If this file is company "
@@ -1790,25 +1851,21 @@ class Preflight:
         if cached is not _UNSET:
             return cached
         paths: set | None = set()
-        try:
-            proc = subprocess.run(
-                ["git", "status", "--porcelain", "--ignore-submodules=none"],
-                cwd=str(self.git_root), stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=60)
-        except (OSError, subprocess.TimeoutExpired):
+        # Through `_git` so the "nothing in the gate reaches the network" assertion
+        # actually covers this call too (review N5).
+        rc, out, _err = self._git(["status", "--porcelain",
+                                   "--ignore-submodules=none"], timeout=60)
+        if rc is None or rc != 0:
             paths = None
         else:
-            if proc.returncode != 0:
-                paths = None
-            else:
-                for entry in proc.stdout.decode("utf-8", "replace").splitlines():
-                    if len(entry) < 4 or entry[:2] == "!!":
-                        continue
-                    # R/C entries carry "old -> new"; both sides count as touched.
-                    for part in entry[3:].split(" -> "):
-                        part = part.strip().strip('"')
-                        if part:
-                            paths.add(Path(part).as_posix().lower())
+            for entry in out.splitlines():
+                if len(entry) < 4 or entry[:2] == "!!":
+                    continue
+                # R/C entries carry "old -> new"; both sides count as touched.
+                for part in entry[3:].split(" -> "):
+                    part = part.strip().strip('"')
+                    if part:
+                        paths.add(Path(part).as_posix().lower())
         self._dirty_cache = paths
         return paths
 

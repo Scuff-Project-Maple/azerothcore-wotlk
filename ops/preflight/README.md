@@ -105,8 +105,8 @@ directory+author rule.
 
 | state | what git actually said | what the gate does |
 | --- | --- | --- |
-| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand` |
-| `indeterminate` / `ref-deleted` | the ref is gone **but** local history says it was here | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
+| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
+| `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
 | `indeterminate` / `not-a-commit` | the name resolves to an object that is not a commit — `HEAD^{tree}`, a blob, a mistyped object name, the null sha | `FAIL`, failing closed, naming `refreshCommand`. It is not missing, and calling it `missing` was the false statement that kept the exemption |
 | `indeterminate` / other | git errored, or the ref is not under `refs/remotes/` | `FAIL`, failing closed |
 
@@ -116,19 +116,39 @@ is no longer the existence test. It is now a two-step question: peel to a commit
 ask separately whether the name resolved to *anything* (`rev-parse --verify --quiet <ref>`, with
 `cat-file -t` naming what came back). Only a name that resolves to nothing at all may be `missing`.
 `git ls-tree` is never asked of a ref the gate does not trust, and none of these probes fetch.
+Every git call the gate makes — the ref probes, the author lookup and the work-tree `git status`
+included — goes through the one `_git()` helper, so "nothing in here reaches the network" is a
+claim about a single call site rather than about most of them (PRO-291 review N5).
 
-The `ref-deleted` discrimination is local history only — three signals, no network:
+The `ref-deleted` discrimination is local history only — three signals, no network. What each one
+tests is *fetching*, so each is a file a fetch writes and `git clone` does not:
 
 - the ref's own reflog, at `git rev-parse --git-path logs/<ref>`;
 - `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not;
-- any sibling ref under the same `refs/remotes/<remote>/` namespace other than `<remote>/HEAD`,
-  which a fetch created (`for-each-ref`, not `show-ref` — `show-ref` matches anchored whole ref
-  names, so a bare namespace prefix answers "no refs").
+- any sibling ref under the same `refs/remotes/<remote>/` namespace other than `<remote>/HEAD`
+  that **carries its own reflog** (`for-each-ref`, not `show-ref` — `show-ref` matches anchored
+  whole ref names, so a bare namespace prefix answers "no refs").
 
-That set exists because the reflog alone is not enough: measured on git 2.43.0, `git update-ref -d`
-deletes the reflog along with the ref, so the exact command the review named would otherwise be
-indistinguishable from a clone that never fetched. The sibling-namespace probe is what catches it.
-A clone that has none of the three is treated as never having fetched and keeps its `WARN`.
+The reflog is what makes the third signal honest, and it is the reason the probe is not simply
+"any sibling ref" (PRO-291 review B1). `git clone` populates `refs/remotes/<remote>/*` itself, so a
+sibling *ref* says only that the remote had that branch when the clone was made; counting it as
+fetch evidence refused a boot to an untouched clone and told the operator their ref had been
+deleted. Measured on git 2.43.0, a plain clone and a `--single-branch` clone both leave the
+namespace populated and every branch sibling reflog-free; a `git fetch`, a `git pull` or a
+`git update-ref` is what writes one.
+
+That set exists because the ref's own reflog alone is not enough: `git update-ref -d` deletes the
+reflog along with the ref, so the exact command the review named would otherwise be
+indistinguishable from a clone that never fetched. The sibling-reflog probe is what catches it, and
+`origin/HEAD` is excluded from it because a clone writes that one reflog without anyone ever
+fetching a branch.
+
+The three signals are not equally strong, and the report says which one it used. `ref`'s own reflog
+is a record of *this* ref having been here, so the message says it was deleted rather than never
+fetched. A `FETCH_HEAD` or a sibling reflog only proves somebody fetched, which leaves "the remote
+never had this branch" standing; the gate still fails closed on that, but it says the ref was
+either deleted or never existed here, because a boot refusal must not assert a deletion it did not
+observe.
 
 `--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
 case only. It does not rescue `not-a-commit`, any other `indeterminate` cause, or a ref that was
