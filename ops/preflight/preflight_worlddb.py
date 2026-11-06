@@ -1400,13 +1400,14 @@ class Preflight:
             bad("upstream-ref-not-remote",
                 f"{f['rel']} is new in the upstream-tagged directory "
                 f"{db_path} and the upstream exemption was about to be "
-                f"granted on {ref}, which is not a remote-tracking ref "
-                f"({detail}). A ref outside refs/remotes/ is a branch, and "
+                f"granted on {ref}: {detail}. A ref outside refs/remotes/ is a branch, and "
                 f"a branch is rewritten by the same `git commit` / "
                 f"`git update-ref` this rule constrains, so it cannot vouch "
                 f"for anything. Point upstreamProvenance.verifiedRef at "
-                f"refs/remotes/<remote>/<branch> and re-run; if this file is "
-                f"company content it belongs in {pending}.",
+                f"refs/remotes/<remote>/<branch> and re-run; if that ref is "
+                f"the right one and is merely behind, refresh it with "
+                f"`{up['refresh']}` first. If this file is company content it "
+                f"belongs in {pending}.",
                 )
         elif state == self.REF_INDETERMINATE:
             bad("unverified-upstream-origin",

@@ -1220,6 +1220,71 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertIn("policy-exempt-origin", warns)
         self.assertFalse(pf.r.failed)
 
+    # --- B1/N4: the two halves of the remote-tracking test, pinned separately ----- #
+
+    def _stub_git(self, pf, named, rc=0, err=""):
+        """Answer only the ref-name question; record every argv git is asked.
+
+        Review N4: one `elif` covers both "exit 0 with no name" and "non-zero exit", and
+        every real-git test in this file reaches both through the same branch. Only a
+        stub can hand git the first shape on its own, which is the shape a shadow branch
+        really produces — so a future edit that drops `or not full.strip()` would
+        otherwise still pass the whole suite.
+        """
+        calls = []
+
+        def fake(argv, timeout=60, errors="replace"):
+            calls.append(list(argv))
+            if argv[:2] == ["rev-parse", "--symbolic-full-name"]:
+                return rc, named, err
+            if argv[:2] == ["rev-parse", "--verify"]:
+                return 0, "0" * 40, ""
+            return 128, "", f"stub refused {argv}"
+
+        pf._git = fake
+        return calls
+
+    def test_a_zero_exit_naming_no_ref_is_not_remote_tracking(self):
+        # Measured on git 2.43.0: with `git branch origin/Playerbot HEAD` present,
+        # `rev-parse --symbolic-full-name origin/Playerbot` exits 0 and prints nothing,
+        # with the ambiguity on stderr. The name never came back, so the ref may not
+        # vouch for anything (PRO-248 review B1).
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="origin/Playerbot")
+        calls = self._stub_git(pf, "", rc=0,
+                               err="warning: refname 'origin/Playerbot' is ambiguous.")
+        up = pf.upstream_ref()
+        self.assertEqual("ok", up["state"])
+        self.assertFalse(up["remoteTracked"],
+                         "an unanswered question defaulted to remote-tracking")
+        self.assertIn("ambiguous", up["remoteDetail"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]],
+                         "an untrusted ref was still asked for its tree")
+
+    def test_a_nonzero_exit_is_not_remote_tracking_either(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="origin/Playerbot")
+        calls = self._stub_git(pf, "", rc=1,
+                               err="error: unknown revision 'origin/Playerbot'")
+        up = pf.upstream_ref()
+        self.assertFalse(up["remoteTracked"])
+        self.assertIn("unknown revision", up["remoteDetail"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+
+    def test_a_non_remote_ref_refusal_names_the_refresh_command(self):
+        # Review N2: the README table promises this FAIL names `refreshCommand`, so the
+        # author of a gutted policy gets the command that would have fixed the ref.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="master")
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        msg = next(m for r, m in fails if r == "upstream-ref-not-remote")
+        self.assertIn("git fetch --prune origin Playerbot", msg)
+        self.assertIn("pending_db_world", msg)
+
     # --- B2: a filename git would quote must not look like a forgery ------------ #
 
     NON_ASCII = "2026_11_04_00_érfar.sql"
