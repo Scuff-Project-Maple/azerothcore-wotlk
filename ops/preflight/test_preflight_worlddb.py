@@ -12,13 +12,14 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 
 from preflight_worlddb import (
-    MySQL, Preflight, Report, mask_sql, parse_statement, split_statements,
-    build_arg_parser,
+    MySQL, Preflight, REGION_NAME_STOPWORDS, Report, _ident_parts, _schema_of, mask_sql,
+    parse_statement, split_qualified, split_statements, build_arg_parser, write_targets,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -883,6 +884,7 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         "byRule": {"unbounded-write": 2},
         "byRuleOrigin": {"unbounded-write": {"upstream": 2}},
         "byDir": {}, "perFile": {},
+        "regionScanConsultations": 0, "scanConsultationsWithoutRefusal": 0,
     }
     # Identical totals, one finding migrated upstream -> company.
     RESULT_DIRTY = {
@@ -890,12 +892,19 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         "byRule": {"unbounded-write": 2},
         "byRuleOrigin": {"unbounded-write": {"upstream": 1, "company": 1}},
         "byDir": {}, "perFile": {},
+        "regionScanConsultations": 0, "scanConsultationsWithoutRefusal": 0,
+    }
+    # Same findings, but the write-region name scan was consulted twice with no
+    # `multi-table-write` to account for it.
+    RESULT_SCAN_ORPHAN = {
+        "files": 3, "filesUnderPolicy": 3, "statements": 3, "findings": 2,
+        "byRule": {"unbounded-write": 2},
+        "byRuleOrigin": {"unbounded-write": {"upstream": 2}},
+        "byDir": {}, "perFile": {},
+        "regionScanConsultations": 2, "scanConsultationsWithoutRefusal": 2,
     }
 
     def _sweep(self, result, argv):
-        import contextlib
-        import io
-        import tempfile
         import corpus_sweep as cs
         saved = cs.build_files, cs.tally
         cs.build_files = lambda engine, policy, workers: []
@@ -905,11 +914,22 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp) / "baseline.json"
                 base.write_text(json.dumps(self.RESULT_CLEAN))
+                self._give_it_a_tree(tmp)
                 with contextlib.redirect_stdout(out):
-                    code = cs.main(["--diff", str(base), *argv])
+                    code = cs.main(["--diff", str(base), "--compose-root", tmp, *argv])
         finally:
             cs.build_files, cs.tally = saved
         return code, out.getvalue()
+
+    @staticmethod
+    def _give_it_a_tree(tmp: str) -> None:
+        """cs.main() refuses a tree with no data/sql, so give the temp tree one.
+
+        Without this the suite only passes when the test file happens to sit in a real
+        repo checkout: default_root is corpus_sweep.py's parents[2], so an installed
+        ops/preflight/ directory outside a checkout exits 2 on every sweep test.
+        """
+        (Path(tmp) / "data" / "sql").mkdir(parents=True, exist_ok=True)
 
     def test_company_findings_drive_the_exit_status(self):
         clean, _ = self._sweep(self.RESULT_CLEAN, [])
@@ -929,6 +949,57 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         self.assertIn("new company finding", text)
         self.assertNotIn("(no rule changed)", text,
                          "a company finding appeared while the diff said nothing changed")
+
+    def test_an_orphan_region_scan_consultation_fails_the_sweep(self):
+        # PRO-179 review rank 3, corpus form: the name scan is report text for a
+        # refusal. A consultation no `multi-table-write` accounts for is a policy change
+        # wearing a report fix, and the tool must not print a clean sheet for it.
+        code, text = self._sweep(self.RESULT_SCAN_ORPHAN, [])
+        self.assertEqual(1, code)
+        self.assertIn("REGION SCAN", text)
+        muted, text2 = self._sweep(self.RESULT_SCAN_ORPHAN, ["--measure-only"])
+        self.assertEqual(0, muted)
+        self.assertIn("REGION SCAN", text2)
+
+    def _tally_over(self, sqls):
+        """Run the real sweep tally over literal files, for the scan-consultation property."""
+        import corpus_sweep as cs
+        real = cs.pf._region_tables
+        engine = cs.pf.Preflight(
+            cs.Args(Path("."), Path("policy.json"), True, False, POLICY["liveDatabase"]),
+            POLICY, cs.pf.Report())
+        files = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, sql in enumerate(sqls):
+                path = Path(tmp) / f"f{i}.sql"
+                path.write_text(sql)
+                files.append({"rel": f"f{i}.sql", "path": path, "origin": "company",
+                              "provenance": "company", "dir": {"db_path": "$/x"}})
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = cs.tally(engine, files)
+        self.assertIs(real, cs.pf._region_tables, "the sweep spy leaked into the module")
+        return result
+
+    def test_the_sweep_counts_one_consultation_per_multi_table_refusal(self):
+        result = self._tally_over([
+            "UPDATE `creature_template` SET `npcflag` = 3 WHERE `entry` = 900200;",
+            "UPDATE `creature` c JOIN `updates` u SET u.hash = 'x' WHERE c.guid = 9002020;",
+            "DELETE `u`, `c` FROM `updates` `u` JOIN `creature` `c`;",
+            "DELETE FROM `creature` WHERE `guid` = 9002020;",
+        ])
+        self.assertEqual(2, result["byRule"].get("multi-table-write"))
+        self.assertEqual(2, result["regionScanConsultations"])
+        self.assertEqual(0, result["scanConsultationsWithoutRefusal"])
+
+    def test_the_sweep_property_is_not_trivially_satisfied_by_no_refusals(self):
+        # A corpus with nothing to refuse must also report zero consultations, so the
+        # property cannot be satisfied by both sides being empty after the scan stops
+        # running at all.
+        result = self._tally_over([
+            "UPDATE `creature_template` SET `npcflag` = 3 WHERE `entry` = 900200;",
+        ])
+        self.assertEqual(0, result["byRule"].get("multi-table-write", 0))
+        self.assertEqual(0, result["regionScanConsultations"])
 
     def test_args_take_the_live_schema_from_the_policy(self):
         import corpus_sweep as cs
@@ -950,8 +1021,10 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         cs.tally = lambda engine, files: dict(self.RESULT_CLEAN)
         cs.pf.Preflight = Spy
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                code = cs.main([])
+            with tempfile.TemporaryDirectory() as tmp:
+                self._give_it_a_tree(tmp)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = cs.main(["--compose-root", tmp])
         finally:
             cs.build_files, cs.tally, cs.pf.Preflight = saved
         self.assertEqual(0, code)
@@ -1486,6 +1559,233 @@ class TestPolicyAuditPinsProvenance(unittest.TestCase):
         policy = json.loads(json.dumps(POLICY))
         policy["upstreamProvenance"] = "origin/Playerbot"
         self.assertEqual(1, len(self._problems(policy)))
+
+def targets_for(sql: str, known_names: set[str] | None = None) -> list[tuple[str | None, str]]:
+    """The write targets a rejected region names, for assertions on the name scan."""
+    text, offset = split_statements(sql)[0]
+    masked = mask_sql(text)
+    return write_targets(parse_statement(text, masked, offset), known_names)[0]
+
+
+class TestRev5RegionCoordinates(unittest.TestCase):
+    """PRO-179 rev-5/rev-6: the name scan and the text it slices must agree.
+
+    NB-1 (a PARTITION clause blanked to a shorter string) and NB-2 (clause keywords
+    located in text that still contains backticked content) are one defect seen twice:
+    the fragment bounds `_region_tables()` works in have to be offsets into the same
+    text it slices. So the headline POC below is a single statement carrying both, and
+    it only passes if neither defect comes back.
+
+    Read the direction of these changes correctly. Nothing here can turn a *passing*
+    file into a failing one — `multi-table-write` is raised before the scan is ever
+    consulted. What rank 2 changed runs the other way: locating the clause keywords in
+    backtick-blanked text moved statements that the parent commit refused into the
+    accepted set, because a backticked alias spelled `set` or `where` used to be read as
+    the clause keyword and truncated the write region. `test_a_backticked_alias_...`
+    below is written to fail against the parent commit for exactly that reason; the
+    `DELETE `from` FROM ...` form is not, since it earns the same two rules either way,
+    and is kept only as the report-fidelity half of the change.
+    """
+
+    COMBINED_POC = ("DELETE `from`, `c` FROM `updates` PARTITION (p1,p2,p3) `from` "
+                    "JOIN `creature` `c` WHERE `from`.`hash` = 'x';")
+
+    def test_partition_blank_and_backticked_keyword_together(self):
+        # NB-1 + NB-2 in one statement: the PARTITION blank must not move the text
+        # under the offsets, and `from` must not be read as the FROM keyword.
+        self.assertEqual([(None, "updates"), (None, "creature")], targets_for(self.COMBINED_POC))
+        found = findings_for(self.COMBINED_POC)
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules, "`updates` was not named as a write target")
+        self.assertEqual([], [m for r, m in found if r == "table-not-allowed"],
+                          "partition names were blamed as write targets")
+        msg = next(m for r, m in found if r == "multi-table-write")
+        self.assertIn("before FROM", msg, "the delete-target list was not recognised as such")
+        # Every name in the table list is quoted, so the bare-scan label does not
+        # belong on it even though the partition names are in the noise list.
+        self.assertIn("tables named: creature, updates", msg)
+        self.assertNotIn("heuristic", msg)
+
+    def test_partition_clause_alone_keeps_the_ledger_in_the_table_position(self):
+        sql = ("DELETE `u`, `c` FROM `updates` PARTITION (p1,p2,p3) `u` JOIN `creature` `c` "
+               "WHERE `u`.`hash` = 'x';")
+        self.assertEqual([(None, "updates"), (None, "creature")], targets_for(sql))
+        self.assertIn("ledger-table", rules_for(sql))
+
+    def test_a_backticked_alias_spelled_like_a_clause_keyword_is_accepted(self):
+        # NB-2, and the case that actually pins it: the parent commit located FROM/WHERE
+        # in text that still held the backticked name, so the alias `where` became the
+        # WHERE keyword, the region was truncated to `creature` ``, and a legal
+        # single-table DELETE was refused as malformed. Against that commit this
+        # assertion fails with `multi-table-write`; the `DELETE `from` FROM ...` form
+        # above does not distinguish the two, so it is not the regression test.
+        self.assertEqual([], rules_for("DELETE FROM `creature` `where` WHERE `guid` = 9002020;"))
+        self.assertEqual([], rules_for(
+            "DELETE FROM `acore_world`.`creature_template` `from` WHERE `entry` = 900200;"))
+        # The sibling forms: still refused, but for the real reason now.
+        self.assertIn("unbounded-write", rules_for(
+            "UPDATE `creature` `set` SET `npcflag` = 3 WHERE `entry` = 900200;"))
+        self.assertIn("table-not-allowed", rules_for(
+            "DELETE FROM `where` WHERE `guid` = 9002020;"),
+            "a table really named `where` must still be named, not skipped as a keyword")
+
+    def test_a_backticked_keyword_is_never_read_as_a_clause_keyword(self):
+        # Report fidelity for the same location fix: the delete-target list is still
+        # recognised as one, and the ledger is still named out of it.
+        found = findings_for("DELETE `from` FROM `updates` `from`;")
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("ledger-table", rules)
+        self.assertIn("before FROM", next(m for r, m in found if r == "multi-table-write"))
+        self.assertEqual([(None, "updates")], targets_for("DELETE `from` FROM `updates` `from`;"))
+
+    def test_a_bare_qualified_name_does_not_invent_a_schema(self):
+        # NB-3: `a.b.c` is three bare tokens to the scan. Believing the first half was
+        # a schema accused a file that never names a schema of writing outside it.
+        sql = "UPDATE a.b.c JOIN creature c SET c.guid = 1 WHERE c.guid = 2;"
+        rules = rules_for(sql)
+        self.assertIn("multi-table-write", rules)
+        self.assertIn("table-not-allowed", rules, "the table the region names was not checked")
+        self.assertNotIn("cross-schema-write", rules)
+        msg = next(m for r, m in findings_for(sql) if r == "multi-table-write")
+        self.assertIn("tables named (heuristic — unquoted region)", msg)
+
+    def test_a_quoted_qualified_name_is_still_believed(self):
+        self.assertIn("cross-schema-write", rules_for(
+            "UPDATE `other`.`updates` u JOIN `creature` c SET u.hash = 'x' "
+            "WHERE c.guid = 9002020;"))
+
+    def test_a_name_containing_a_dot_is_one_component(self):
+        # PRO-179 review rank 1: `str.split(".")` cut `` `acore_world`.`my.table` `` into
+        # three pieces, so the last one was not quote-balanced and a fully quoted name
+        # was reported as a bare-scan guess under a mangled table name.
+        self.assertEqual(["`acore_world`", "`my.table`"], _ident_parts("`acore_world`.`my.table`"))
+        self.assertEqual(("acore_world", "my.table"), split_qualified("`acore_world`.`my.table`"))
+        self.assertEqual("acore_world", _schema_of(_ident_parts("`acore_world`.`my.table`")))
+        found = findings_for("UPDATE `acore_world`.`my.table` SET x = 1 WHERE entry = 900200;")
+        rules = [r for r, _ in found]
+        self.assertIn("multi-table-write", rules, "an unparsable region must still be refused")
+        self.assertIn("table-not-allowed", rules)
+        msg = next(m for r, m in found if r == "table-not-allowed")
+        self.assertIn("'my.table'", msg, "the table name was mangled by the dot split")
+        self.assertNotIn("heuristic", next(m for r, m in found if r == "multi-table-write"),
+                         "a fully quoted name must not be labelled a bare-scan guess")
+
+    def test_a_quoted_schema_is_believed_even_when_the_table_half_is_bare(self):
+        # rank 1, other direction: the all-quoted test dropped `other` from
+        # ``UPDATE `other`.updates u JOIN ...`` , losing the `cross-schema-write` the
+        # parent commit reported. Belief is per component: quoted is believed, bare is
+        # never read as a schema.
+        self.assertIn("cross-schema-write", rules_for(
+            "UPDATE `other`.updates u JOIN `creature` c SET u.hash = 'x' WHERE c.guid = 9002020;"))
+        sql = "UPDATE `other`.updates u JOIN `creature` c SET u.hash = 'x' WHERE c.guid = 9002020;"
+        self.assertEqual(("other", "updates"), targets_for(sql)[0],
+                         "the quoted half of the name is the schema the file wrote")
+        self.assertIsNone(_schema_of(["other", "`updates`"]),
+                          "a bare qualifier is never believed")
+
+    def test_both_name_lists_carry_the_heuristic_label_together(self):
+        # PRO-179 review rank 4: the table list and `other names in region` come out of
+        # the same bare scan, so labelling only the first let the second read as fact.
+        sql = "UPDATE a.b.c JOIN creature c SET c.guid = 1 WHERE c.guid = 2;"
+        msg = next(m for r, m in findings_for(sql) if r == "multi-table-write")
+        self.assertIn("tables named (heuristic — unquoted region):", msg)
+        self.assertIn("other names in region (heuristic — unquoted region):", msg)
+        # And neither carries it when every name was quoted.
+        quoted = next(m for r, m in findings_for(
+            "DELETE `u`, `c` FROM `updates` PARTITION (p1,p2,p3) `u` JOIN `creature` `c` "
+            "WHERE `u`.`hash` = 'x';") if r == "multi-table-write")
+        self.assertNotIn("heuristic", quoted)
+        self.assertIn("other names in region:", quoted)
+
+    def test_a_policy_table_named_like_a_keyword_is_still_named(self):
+        # NB-4: the stopword list removes syntax noise where a bare name is expected,
+        # so a real table called `duplicate` used to disappear from the report. The
+        # caller hands the scan the policy and ledger names, which are never noise.
+        sql = "UPDATE duplicate JOIN creature c SET c.guid = 1 WHERE c.guid = 2;"
+        self.assertEqual([(None, "creature")], targets_for(sql))
+        self.assertEqual([(None, "duplicate"), (None, "creature")],
+                         targets_for(sql, {"duplicate"}))
+
+    def test_no_current_policy_table_collides_with_a_stopword(self):
+        # The escape hatch above should stay unused: a name collision is tolerable
+        # because it is handled, but it should not be invisible either.
+        names = {k.lower() for k in POLICY["baseTables"]} | {
+            k.lower() for k in POLICY["customTables"] if not k.startswith("_")}
+        self.assertEqual(set(), names & set(REGION_NAME_STOPWORDS),
+                         "a policy table spells a keyword; the region scan now depends on "
+                         "known_names to keep it visible")
+
+    def test_targets_come_back_in_order_of_first_appearance(self):
+        # NB-5: the docstring promises first-appearance order, and pre-FROM delete
+        # targets used to be appended after every FROM-list table.
+        self.assertEqual([(None, "creature"), (None, "updates")],
+                         targets_for("DELETE creature FROM updates u JOIN creature c;"))
+
+
+class TestRev5RegionScanImpliesRefusal(unittest.TestCase):
+    """PRO-179 rev-5 NB-6: the name scan exists only because multi-table writes are refused.
+
+    `_region_tables()` is the report text for a statement `_policy_multi_table()` has
+    already rejected — it is not a second way to pass, and it is never consulted for a
+    write the gate accepts. If a future change lets a multi-table write through while
+    still consulting the heuristic, that is a policy change and this test names it as
+    one instead of letting the path quietly acquire a second meaning.
+    """
+
+    REJECTED = [
+        "UPDATE `creature` c JOIN `updates` u SET u.hash = 'x' WHERE c.guid = 9002020;",
+        "UPDATE `creature` c, `creature_template` d SET c.npcflag = 3 WHERE c.guid = 9002020;",
+        "UPDATE (SELECT 1) SET `npcflag` = 3 WHERE `entry` = 900200;",
+        "UPDATE `creature_template` USE INDEX (PRIMARY) SET `npcflag` = 3 WHERE `entry` = 900200;",
+        "DELETE c, s FROM `creature` c JOIN `smart_scripts` s WHERE c.guid = 9002020;",
+        "DELETE updates, creature FROM updates u JOIN creature c;",
+        "DELETE `u`, `c` FROM `updates` `u` JOIN `creature` `c`;",
+        "DELETE `from`, `c` FROM `updates` PARTITION (p1,p2,p3) `from` JOIN `creature` `c` "
+        "WHERE `from`.`hash` = 'x';",
+        "UPDATE a.b.c JOIN creature c SET c.guid = 1 WHERE c.guid = 2;",
+        "UPDATE `acore_world`.`updates` `u` JOIN `creature` `c` SET u.hash = 'x' "
+        "WHERE c.guid = 9002020;",
+        # Both tables are allow-listed custom tables, so this is the entry that used to be
+        # missing: a change that stopped refusing a multi-table write once every table it
+        # names is company-approved — the plausible "custom tables are ours, let them
+        # through" edit — would have left every other literal here still green.
+        "UPDATE `custom_class_template` a JOIN `unbound_class_catalog` b "
+        "SET a.label = b.name;",
+    ]
+    ACCEPTED = [
+        "UPDATE `creature_template` c SET c.npcflag = 3 WHERE c.entry = 900200;",
+        "UPDATE`smart_scripts` SET `action_param2` = 2 WHERE `source_type` = 0 AND `id` = 0 "
+        "AND `entryorguid` IN (9002020, 9002021);",
+        "DELETE FROM `creature` PARTITION (p1) WHERE `guid` = 9002020;",
+        "DELETE FROM `acore_world`.`creature_template` WHERE `entry` = 900200;",
+        "DELETE FROM `creature` WHERE `guid` = 9002020 ORDER BY `guid` LIMIT 1;",
+    ]
+
+    def test_the_heuristic_is_only_ever_reached_on_a_refusal(self):
+        import preflight_worlddb as pw
+        seen: list[str] = []
+        real = pw._region_tables
+
+        def spy(masked, lo, hi, from_end=None, known_names=None):
+            seen.append(masked[lo:hi])
+            return real(masked, lo, hi, from_end, known_names)
+
+        pw._region_tables = spy
+        try:
+            for sql in self.REJECTED:
+                seen.clear()
+                rules = rules_for(sql)
+                self.assertTrue(seen, f"{sql!r} was expected to consult the region scan")
+                self.assertIn("multi-table-write", rules,
+                              f"{sql!r} consulted the region scan but was never refused")
+            for sql in self.ACCEPTED:
+                seen.clear()
+                self.assertEqual([], rules_for(sql), f"{sql!r} should pass")
+                self.assertEqual([], seen, f"{sql!r} passed but consulted the region scan")
+        finally:
+            pw._region_tables = real
 
 
 if __name__ == "__main__":
