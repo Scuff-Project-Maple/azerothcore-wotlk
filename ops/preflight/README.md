@@ -93,8 +93,11 @@ lookups only (`git ls-tree`), never a fetch:
 | ref does not resolve under `refs/remotes/` | `company` | `FAIL` `upstream-ref-not-remote` naming `refreshCommand` |
 | ref resolves but is not a commit (tree, blob, null sha) | `company` | `FAIL` `upstream-ref-not-a-commit` naming `refreshCommand` |
 | ref is gone, but this clone still has local history for it | `company` | `FAIL` `upstream-ref-deleted` naming `refreshCommand` and `--allow-missing-upstream-ref` |
+| ref is gone with no local trace, **but** this clone's `last-verified` record says a satisfied run verified it at a named commit | `company` | `FAIL` `upstream-ref-attested-missing` naming the attested oid, the timestamp it was verified at, the record path, `refreshCommand` and `pending_db_world` |
+| ref is gone and the `last-verified` record for it is not one this gate can trust | `company` | `FAIL` `upstream-ref-attestation-untrusted`, failing closed, naming the record path and why |
+| ref resolves, but not to a commit that contains the one recorded for it, and no reflog explains the move | `company` | `FAIL` `upstream-ref-oid-mismatch` naming both oids, the recorded timestamp and `refreshCommand` |
 | ref unset | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
-| ref is absent and this clone has no trace of it | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
+| ref is absent, this clone has no trace of it, **and** no `last-verified` record names it | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
 
 #### `missing`, `indeterminate`, `unchecked` (PRO-291, PRO-248 review N1)
 
@@ -105,8 +108,11 @@ directory+author rule.
 
 | state | what git actually said | what the gate does |
 | --- | --- | --- |
-| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
+| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref — no reflog, no `FETCH_HEAD`, no sibling reflog and no `last-verified` record naming it | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
 | `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
+| `indeterminate` / `attested-missing` | the ref is gone and none of those three signals is present, **but** this clone's `last-verified` record says a satisfied run of this gate read this very ref at a named commit at a named time | `FAIL`, failing closed, naming the attested oid, the timestamp, the record path and `refreshCommand`. A clone that genuinely never fetched has no attestation to lose, so this is one whose fetch fingerprints were removed after the fact; `--allow-missing-upstream-ref` walks it back to the `WARN` exactly as it does `ref-deleted`, because it is the same claim with a different witness |
+| `indeterminate` / `attestation-untrusted` | the ref is gone and a record for it exists that this gate cannot vouch for — unreadable, holding a line it cannot parse, unversioned or of a version it does not read, or written for another repo or another remote url | `FAIL`, failing closed, naming the record path and the reason. "The record is unreadable" must not be the same sentence as "there is no record", or truncating a file is all it takes to buy back the exemption the record was blocking |
+| `indeterminate` / `oid-mismatch` | the ref resolves to a commit, and the commit recorded for it is neither that commit nor an ancestor of it, and the ref carries no reflog of its own | `FAIL`, failing closed, naming both oids. A fetch fast-forwards a remote-tracking ref and a real force-push leaves a reflog, so this is the shape of `git update-ref` pointing the tracked ref at commits of the operator's choosing — and `ls-tree` is never asked of it |
 | `indeterminate` / `not-a-commit` | the name resolves to an object that is not a commit — `HEAD^{tree}`, a blob, a mistyped object name, the null sha | `FAIL`, failing closed, naming `refreshCommand`. It is not missing, and calling it `missing` was the false statement that kept the exemption |
 | `indeterminate` / other | git errored, or the ref is not under `refs/remotes/` | `FAIL`, failing closed |
 
@@ -115,10 +121,13 @@ tree object booted a forged-author file on a `WARN` — the reason `git rev-pars
 is no longer the existence test. It is now a two-step question: peel to a commit, and if that fails
 ask separately whether the name resolved to *anything* (`rev-parse --verify --quiet <ref>`, with
 `cat-file -t` naming what came back). Only a name that resolves to nothing at all may be `missing`.
-`git ls-tree` is never asked of a ref the gate does not trust, and none of these probes fetch.
-Every git call the gate makes — the ref probes, the author lookup and the work-tree `git status`
-included — goes through the one `_git()` helper, so "nothing in here reaches the network" is a
-claim about a single call site rather than about most of them (PRO-291 review N5).
+`git ls-tree` is never asked of a ref the gate does not trust — including one whose recorded commit
+git cannot place (PRO-300) — and none of these probes fetch.
+Every git call the gate makes — the ref probes, the author lookup, the work-tree `git status`, and
+the attestation's `rev-parse --git-common-dir`, `config --get remote.<r>.url` and
+`merge-base --is-ancestor` (PRO-300) — goes through the one `_git()` helper, so "nothing in here
+reaches the network" is a claim about a single call site rather than about most of them (PRO-291
+review N5).
 
 The `ref-deleted` discrimination is local history only — three signals, no network. What each one
 tests is *fetching*, so each is a file a fetch writes and `git clone` does not:
@@ -148,14 +157,82 @@ The limit of that sentence belongs in this README rather than left to inference,
 section owes the operator is what the gate actually guarantees. In a clone that has **never**
 fetched, every sibling reflog is absent by construction, so
 `git update-ref -d refs/remotes/origin/Playerbot` there leaves a state identical, in everything the
-gate reads, to an honest clone of a remote that never carried the ref — and that honest clone is the
-case this section promises boots offline. The deletion is invisible in that one case, and no local
-check can separate the two; the same holds for an operator who deletes the ref and then removes
-`FETCH_HEAD` and `logs/refs/remotes/`. Saying otherwise would be the same species of over-claim
-PRO-248 review N3 removed. Telling "no fetch artifacts" apart from "never held the ref" needs a
-durable attestation written by a verified boot and checked by the next one, which is outside this
-gate. What is guaranteed is the flow the policy models: a clone that has fetched and then loses the
-ref fails closed.
+three signals read, to an honest clone of a remote that never carried the ref — and that honest
+clone is the case this section promises boots offline. The three signals cannot separate the two,
+and the same holds for an operator who deletes the ref and then removes `FETCH_HEAD` and
+`logs/refs/remotes/`. Saying the signals could was the same species of over-claim PRO-248 review N3
+removed.
+
+PRO-300 closes that gap by adding a fourth thing for the deletions to have to reach: when the ref
+answers the way the exemption is built on — it resolves under `refs/remotes/`, it peels to a commit,
+and the gate can list that commit's tree — the run writes down that it did:
+
+```
+<git common dir>/paperclip-preflight/last-verified
+
+    version 1
+    repo /home/you/azerothcore-wotlk/.git
+    remote url https://github.com/azerothcore/azerothcore-wotlk.git
+    last-verified refs/remotes/origin/Playerbot = 3f2a91c0d4e51b7c… @ 2026-11-06T09:12:03+00:00
+```
+
+Three properties are what make it the missing witness. It lives in the **common dir**, which
+`update-ref -d`, `rm FETCH_HEAD` and `rm -rf .git/logs/refs/remotes` all leave alone, and which a
+linked worktree shares with its siblings. It is written **only by the path that earned it** —
+`missing`, `not-a-commit`, `not-remote` and an untrusted record all refuse before the write, so a
+ref that is not there can never fabricate a record of having been verified. And a fresh `git clone`
+gets a common dir with **no record in it**, which is the part AC 6 rests on: an untouched clone of a
+remote that never carried the ref has nothing to find, so its answer is still `absent` and it still
+boots offline on the `WARN`. The location is asked from git (`rev-parse --git-common-dir`) rather
+than hardcoded as `.git` for the same reason `_reflog_path()` asks `--git-path` — in a worktree the
+admin dir is not `.git` — and when git will not answer there is no state directory at all, never a
+guessed one: a probe nobody answers must not become a finding, and an attestation written somewhere
+untrustworthy is worse than none. `--preflight-state-dir` relocates it for a test or for someone
+running the gate over a tree they do not want written inside. The write is a temp file plus
+`os.replace`, because a record truncated by a crash mid-write would then fail closed every later
+boot, and a failure to write is an informational note rather than a finding: the record is evidence
+*for* a later deletion check and must never become a precondition for booting.
+
+From then on `missing` is not one answer. A ref with a record that has gone is
+`indeterminate`/`attested-missing`, not `unchecked`. An ordinary `git pull` between boots is not
+suspected: the recorded commit is an ancestor of the one the ref names now, `git merge-base
+--is-ancestor` says so, and the record moves forward with the run. A ref whose recorded commit git
+cannot place, with no reflog to explain the move, is not the history this gate verified, so
+`ls-tree` is never asked of it and the boot is refused (`oid-mismatch`); a genuine force-push is
+cleared by the reflog it leaves behind. And an attestation the gate cannot trust is never a pass —
+an unparsable line, a missing or unknown `version`, a `repo` line naming some other common dir, or a
+`remote url` that is not this tree's each refuse the boot with the reason named, because copying a
+record in from a clone that really did fetch is the obvious way to fake a satisfied past and those
+two lines exist to catch it. A record that simply holds no `last-verified` line for *this* ref is
+`absent`, not untrusted: pointing `verifiedRef` at a new name starts a fresh history instead of
+failing on a record earned for the old one. Section 4 says which of these it used — the summary line
+carries `last-verified <oid>@<when>` for the record a satisfied boot relied on, and a separate
+`upstream-ref-attestation` INFO line names the record file.
+
+What the attestation does **not** guarantee, since a half-told guarantee is worse than none:
+
+- It is a file. Anyone who can `rm` it has deleted the gate's memory of verifying the ref, and the
+  next `missing` answer looks like the honest `absent` again. What the record changes is the shape
+  of the forgery: `update-ref -d` alone now trips a rule, and getting back to a quiet `WARN` means
+  deleting the ref, its fingerprints and this file — inside a checkout whose owner can equally edit
+  `preflight-policy.json` outright. Against someone who owns the working tree this is friction, not
+  a defense, and it is no wider a privilege than the `update-ref` described under "Honest limit"
+  below.
+- It refuses a **silent** move, not a move. `git update-ref` writes a reflog entry by default, and a
+  reflog is exactly what the `oid-mismatch` branch treats as an innocent explanation — it is what a
+  real force-push leaves behind too. So the attestation catches the `update-ref` whose reflog was
+  then removed; the one that leaves its reflog in place stays the deliberate, loud act described
+  under "Honest limit" below, where a reviewer running `git reflog refs/remotes/origin/Playerbot`
+  sees it and the next real fetch undoes it. Anything stronger would refuse an ordinary
+  force-push-based upstream workflow, which is not this gate's job.
+- It signs nothing and authenticates no clock. `attestedWhen` is this host's UTC time at the moment
+  a satisfied run wrote the line; the claim it supports is "this gate read this commit through this
+  ref here", not "upstream published this then".
+- Nothing outside this checkout reads it, and nothing schedules it. There is still no CI job for
+  `ops/preflight` — nothing under `.github/workflows/` references it — so a record exists only where
+  the boot path in `ops/deploy/worldserver-up.sh` has actually run the gate and passed. A clone that
+  has never run the gate has no record, and looks exactly like a clone of a remote that never carried
+  the ref. That is the honest state, and it is a `WARN`, not a failure.
 
 The three signals are not equally strong, and the report says which one it used. `ref`'s own reflog
 is a record of *this* ref having been here, so the message says it was deleted rather than never
@@ -165,9 +242,13 @@ either deleted or never existed here, because a boot refusal must not assert a d
 observe.
 
 `--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
-case only. It does not rescue `not-a-commit`, any other `indeterminate` cause, or a ref that was
-genuinely never fetched — the `WARN` for that one is already granted without it, and the flag is not
-a general mute switch.
+and `attested-missing` cases only — both answer the same question, "the ref is simply not here",
+which is the question the flag exists to waive. It does not rescue `attestation-untrusted`,
+`oid-mismatch`, `not-a-commit`, any other `indeterminate` cause, or a ref that was genuinely never
+fetched — the `WARN` for that one is already granted without it, and the flag is not a general mute
+switch. The two PRO-300 cases it does not reach are not missing-ref problems the operator can waive:
+one is the gate refusing to read a record it cannot check, the other a ref that is here but is no
+longer the commit the gate verified.
 
 `verifiedRef` is stored fully qualified, as `refs/remotes/origin/Playerbot`. A short
 `origin/Playerbot` is ambiguous: git expands `refs/heads/` before `refs/remotes/`, so a single
