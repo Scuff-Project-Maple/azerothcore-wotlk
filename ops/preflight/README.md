@@ -7,6 +7,19 @@ It refuses the boot unless the four `db_world` directories that
     ops/deploy/worldserver-up.sh              # lease check + gate, then compose up
     python3 ops/preflight/preflight_worlddb.py  # gate only (exit 0 pass, 1 fail, 2 operational error)
     PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py  # policy-engine tests, no DB needed
+    bash ops/preflight/test_sync_scripts.sh                 # installer matrix: scripts/lua-sync.sh + scripts/compose-sync.sh
+
+`test_sync_scripts.sh` is the sibling pre-boot assertion's own test, not this gate's. It builds
+throwaway repo roots under `$TMPDIR` and runs a copy of each installer against them — never a
+real tree, never the stack — covering the matrix PRO-273 review measured (in-sync `0`, orphan `1`
+in both modes and never deleted, drift `1` with both md5s plus `diff -u`, missing, empty snapshot
+`1`, bad arg `2`) and the cases PRO-282 added: FIFO/socket/symlink/directory at a deployed path
+refused with `1` in **both** modes (every run is under `timeout 10`, so the FIFO that used to
+hang the installer surfaces as `rc=124` rather than as a wedged test), no `cp` ever attempted
+through a symlink (the assertion is that an unrelated file outside the deployed directory is
+byte-unchanged), orphans found recursively and over the whole extension set ALE loads, and the
+negative controls that keep the widened scan honest (`notes.txt`, `README.LUA`, dotfiles are not
+orphans because ALE would not load them).
 
 `PREFLIGHT_CHECK_ONLY=1 ops/deploy/worldserver-up.sh` runs the gate without touching the
 stack — that is the CI / merge-gate rehearsal form. The wrapper **verifies** the single-writer
@@ -196,6 +209,10 @@ dry run. There is no operator-settable scratch prefix.
    table; it never skips silently.
 4. `PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py` before committing
    (plain `python3 -m unittest discover -s ops/preflight` fails: the directory is not a package).
+5. `bash ops/preflight/test_sync_scripts.sh` before committing any change to `scripts/lua-sync.sh`
+   or `scripts/compose-sync.sh`. It is the only thing standing between an edit and the PRO-273
+   failure modes coming back, and it fails loudly on the pre-fix scripts — run it against
+   `git show HEAD:scripts/lua-sync.sh` if you doubt a case is real.
 
 ## Out of scope
 

@@ -253,15 +253,20 @@ the root copies.
 `pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
 are not in the `pira` group, so a bare `scripts/compose-sync.sh` exits `1` on
 the first `cp`; prefix it with `sudo -u pira` (as above) or run from a `pira`
-shell. `--check` only reads and is safe as any user.
+shell. `--check` only reads and is safe as any user. On a fresh clone the tree
+is owned by you, so no sudo is needed there either. The same rule applies
+verbatim to `scripts/lua-sync.sh`.
 
 ### Keep the ALE Lua scripts in sync (pre-boot assertion)
 
-ALE loads every `*.lua` it finds in `ALE.ScriptPath`
-(`env/dist/etc/modules/lua_scripts`, gitignored via `/env/dist/*`), so a script
-that is only ever hand-placed there is invisible to git: it survives until
-something re-syncs or recreates that directory, and then the worldserver
-simply stops loading it. That is exactly how `ranger_vex_gossip.lua` (Ranger
+ALE loads every script it finds **under** `ALE.ScriptPath`
+(`env/dist/etc/modules/lua_scripts`, gitignored via `/env/dist/*`):
+`ALE::GetScripts` walks that directory recursively (mod-ale `LuaEngine.cpp:617`,
+`:653`) and `ALE::AddScriptPath` (`:366`) accepts `.lua`, `.moon`, `.ext`,
+`.dll`, `.so` and `.out` (`:378`) — not just `*.lua`, and not only at the top
+level. So a script that is only ever hand-placed there is invisible to git: it
+survives until something re-syncs or recreates that directory, and then the
+worldserver simply stops loading it. That is exactly how `ranger_vex_gossip.lua` (Ranger
 Vex `900200`, quests `900101`/`900102`) ended up live with no tracked copy
 behind it — [PRO-163](/PRO/issues/PRO-163) red flag **R6**, filed as
 [PRO-269](/PRO/issues/PRO-269). A lost script reads as a content regression in
@@ -278,20 +283,76 @@ scripts/lua-sync.sh --check        # read-only pre-boot assertion; any user
 sudo -u pira scripts/lua-sync.sh   # install: this WRITES — tree owner only
 ```
 
+**Run the install as the tree owner.** The build-host checkout is
+`pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
+are not in the `pira` group, so a bare `scripts/lua-sync.sh` exits `1` on the
+first `cp`; prefix it with `sudo -u pira` (as above) or run from a `pira`
+shell. `--check` only reads and is safe as any user. On a fresh clone the tree
+is owned by you, so no sudo is needed there either. The same rule applies
+verbatim to `scripts/compose-sync.sh`.
+
 Run `--check` alongside `scripts/compose-sync.sh --check` before any
 `docker compose up`/`build`. Like compose-sync there is no allowlist: every
 tracked script must be byte-identical (`cmp`), and — the part compose-sync has
-no analogue for — a `*.lua` in the deployed directory that the snapshot does
-not have is reported as an **orphan** and also fails the check. That is the
-signal that would have caught PRO-269 at boot time. The installer never
-deletes an orphan: a hand-placed script is either committed into the snapshot
-directory (the normal case) or removed by hand, deliberately, because silently
-deleting a script a live worldserver depends on is the failure being prevented.
+no analogue for — a script ALE would load in the deployed tree that the
+snapshot does not have is reported as an **orphan** and also fails the check.
+The orphan scan is compared against what ALE actually loads, so it recurses and
+takes the same extension set: `sub/sneaky.lua` and a live `payload.moon` are
+orphans too (PRO-273 finding b). Things ALE would never load are left alone —
+`notes.txt`, `README.LUA` (ALE compares extensions case-sensitively) and
+dotfiles (ALE skips entries starting with `.`, `LuaEngine.cpp:646`).
 
-Confirming the install actually took effect is a log check, not a file check
-(`ALE.BytecodeCache = true`): `docker logs ac-worldserver | grep UNBOUND` must
-show a load line per script, e.g.
-`[UNBOUND] ranger_vex_gossip.lua loaded: entry 900200, quests 900101/900102`.
+A deployed path may only be absent or a **regular file**, and that is decided
+before anything reads or copies it, in both modes. A symlink is never `ok`:
+ALE opens symlinked files (`is_regular_file(dir_iter->status())` follows the
+link), so an untracked symlink is an orphan and a symlink at a tracked path is
+refused rather than copied through — `cp -p` follows links, so the old
+installer would have overwritten a file outside the deployed directory and
+still printed `wrote`. A FIFO, socket, device or directory there is refused the
+same way; a FIFO used to hang the installer inside `cmp` with no output
+(PRO-273 finding a). Every refusal is one legible line and exit `1`.
+
+That is the signal that would have caught PRO-269 at boot time. The installer
+never deletes an orphan: a hand-placed script is either committed into the
+snapshot directory (the normal case) or removed by hand, deliberately, because
+silently deleting a script a live worldserver depends on is the failure being
+prevented. A symlinked **subdirectory** is reported as `UNAUDITED` rather than
+clean — ALE walks it, `find` without `-L` does not, so its contents cannot be
+asserted from here.
+
+### What the boot log does and does not prove
+
+Confirming an install took effect wants a log check, but there is **no
+per-script load line** to grep. These two lines are all `[UNBOUND]` produces at
+the script-loading phase of boot (verified against the live container: lines
+818-819 of a 42k-line log, immediately after `>> Loaded 14495 SmartAI scripts`):
+
+```bash
+ssh -o BatchMode=yes 192.168.1.71 'docker logs ac-worldserver | grep UNBOUND'
+# [UNBOUND] ranger_vex_gossip.lua loaded: entry 900200, quests 900101/900102
+# [UNBOUND] Prereq map built.
+```
+
+- the first is `ranger_vex_gossip.lua`'s own load-time print, and the only one
+  that names its file;
+- the second is `unbound_mentor.lua`'s (`print("[UNBOUND] Prereq map built.")`
+  at `unbound_mentor.lua:117`, run by `pcall(BuildPrereqMap)` at load). It does
+  **not** name the file, so it cannot be used to tell the two scripts apart —
+  a grep that filters on a filename will not find it.
+
+Do not expect ALE's own lines. `ALE::GetScripts` logs
+`[ALE]: Searching scripts from ...` (`LuaEngine.cpp:129`) and the loader logs
+the aggregate `[ALE]: Executed N Lua scripts in X ms (...)` (`:795`) at Info,
+and the per-script `[ALE]: Successfully loaded ...` (`:782`) only at Debug —
+but no `[ALE]` line reaches `docker logs ac-worldserver` in this stack at all
+(there is no `env/dist/etc/log4cplus.conf`, so the `ALE` logger has no
+appender). Adding one is a config change to a live stack, so treat the count as
+unavailable rather than as a failure signal.
+
+So: the **file** assertion is `scripts/lua-sync.sh --check`; the **log**
+assertion is those two `[UNBOUND]` lines plus the absence of
+`LuaScript:`/`ALE` script errors. Anything that promises a load line per
+installed script is overpromising what this build emits.
 
 ### Load testing (randombot volume, PRO-33)
 
@@ -594,17 +655,23 @@ From the host:
 docker logs ac-worldserver | grep UNBOUND
 ```
 
-Healthy boot shows unbound-class log lines **including the marker**:
+Healthy boot shows both `[UNBOUND]` lines, in this order:
 
 ```
+[UNBOUND] ranger_vex_gossip.lua loaded: entry 900200, quests 900101/900102
 [UNBOUND] Prereq map built.
 ```
 
-plus ALE loading lines for every installed script — `unbound_mentor.lua` and
-`ranger_vex_gossip.lua` (PRO-269; a missing `ranger_vex_gossip.lua` line means
-the deployed directory drifted from the snapshot, so run
-`scripts/lua-sync.sh --check`). If **no** ALE lines appear
-at all, prove mod-ale is compiled in before debugging further:
+That is the complete set — see
+[What the boot log does and does not prove](#what-the-boot-log-does-and-does-not-prove).
+The first names its file, so a missing `ranger_vex_gossip.lua` line there means
+the deployed directory drifted from the snapshot: run
+`scripts/lua-sync.sh --check`. The second comes from `unbound_mentor.lua` but
+does not name it, so do not grep for a load line **per installed script** — this
+build emits none, and ALE's own `[ALE]:` lines (including the
+`[ALE]: Executed N Lua scripts ...` aggregate) do not reach this container's log
+at all. Per-script presence is what `scripts/lua-sync.sh --check` is for. If you
+want the ALE lines anyway, first prove mod-ale is compiled in:
 
 ```bash
 docker exec ac-worldserver strings /azerothcore/env/dist/bin/worldserver | grep -i ALE.Enabled
@@ -737,7 +804,10 @@ cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 # ALE Lua is installed by the installer, never hand-placed (PRO-269): it copies
 # every tracked script into env/dist/etc/modules/lua_scripts/ and --check
-# fails on drift or on a hand-placed orphan
+# fails on drift or on a hand-placed orphan. On a fresh clone the tree is owned
+# by you, so no sudo is needed; on the existing build-host checkout (owned by
+# pira:pira, and agent logins are not in that group) use
+# `sudo -u pira scripts/lua-sync.sh` instead. `--check` is read-only.
 scripts/lua-sync.sh
 # installs both generated root overrides. On a fresh clone the tree is owned
 # by you, so no sudo is needed; on the existing build-host checkout (owned by
@@ -934,9 +1004,13 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   straight into the deployed directory: `ranger_vex_gossip.lua` lived there
   untracked that way (PRO-163 red flag R6) and would have silently disappeared
   on the next sync or `--force-recreate`, which QA would have misread as a
-  content regression. The check also fails on a deployed `*.lua` the snapshot
-  does not have; the installer never deletes such an orphan — commit it or
-  remove it deliberately.
+  content regression. The check also fails on any script ALE would load in the
+  deployed tree that the snapshot does not have — recursively, and over every
+  extension ALE accepts (`.lua`, `.moon`, `.ext`, `.dll`, `.so`, `.out`), not
+  just a top-level `*.lua`; the installer never deletes such an orphan — commit
+  it or remove it deliberately. Anything at a deployed path that is neither
+  absent nor a regular file (symlink, FIFO, socket, device, directory) is
+  refused with exit `1` rather than read or copied through.
 - This fork's `AGENTS.md`: SQL outside `data/sql/updates/pending_db_*/` is
   immutable; module work lives under `modules/`; C++ is 4-space, no tabs,
   LF, ≤120 cols.

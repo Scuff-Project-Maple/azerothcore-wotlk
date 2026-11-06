@@ -32,7 +32,7 @@ Companion guide: `guides/unbound-wrath/Wrath-Unbound-Addon-HOWTO.md` (blob
 | `docker-compose.override.yml` | `docker-compose.override.yml` (repo root) |
 | `docker-compose.loadtest.override.yml` | `docker-compose.loadtest.override.yml` (repo root; PRO-33 load-test profile, not loaded by a plain `docker compose up`) |
 | `../scripts/compose-sync.sh` | repo `scripts/compose-sync.sh` — installs both root overrides above from these snapshots; `--check` is the pre-boot drift assertion |
-| `../scripts/lua-sync.sh` | repo `scripts/lua-sync.sh` — installs every tracked ALE Lua script above into `env/dist/etc/modules/lua_scripts/`; `--check` is the pre-boot drift assertion and also fails on a hand-placed script with no tracked source (PRO-269) |
+| `../scripts/lua-sync.sh` | repo `scripts/lua-sync.sh` — installs every tracked ALE Lua script above into `env/dist/etc/modules/lua_scripts/`; `--check` is the pre-boot drift assertion and also fails on a hand-placed script with no tracked source, recursively and over every extension ALE loads, and refuses any deployed path that is not a regular file (PRO-269, PRO-273 findings a/b) |
 
 Notes:
 
@@ -61,7 +61,15 @@ Notes:
   in the change under test (PRO-163 red flag R6). Add new Lua under the
   snapshot directory here and run the installer; never hand-place a script into
   the deployed directory — `scripts/lua-sync.sh --check` reports such an orphan
-  as drift rather than deleting it.
+  as drift rather than deleting it. The orphan scan matches what ALE actually
+  loads: it recurses under the deployed directory and accepts every extension
+  ALE does (`.lua`, `.moon`, `.ext`, `.dll`, `.so`, `.out` — mod-ale
+  `LuaEngine.cpp:378`), so `sub/sneaky.lua` and a live `payload.moon` fail the
+  check too; files ALE would not load (`notes.txt`, `README.LUA`, dotfiles) are
+  left alone. A deployed path that is neither absent nor a regular file —
+  symlink, FIFO, socket, device or directory — is refused with exit `1` before
+  anything reads or copies it, because `cp -p` follows symlinks and `cmp` on a
+  FIFO blocks forever (PRO-273 finding a).
 - `modules/mod-unbound` needs **no CMakeLists.txt**: with the docker build's
   `MODULES=static`, AzerothCore's `modules/CMakeLists.txt`
   (`GetModuleSourceList` → `CollectSourceFiles`) auto-collects
@@ -85,11 +93,14 @@ Notes:
 
 ## Staging command
 
-Run these **as the tree owner**. On the build host the checkout is
+**Run the install as the tree owner.** The build-host checkout is
 `pira:pira` (`0775` dirs, `0664` files) and agent logins such as `scuff-dev`
-are not in the `pira` group, so a bare write exits `1` on the first `cp`;
-use a `pira` shell or prefix with `sudo -u pira` (shown on the installer
-below). `scripts/compose-sync.sh --check` is read-only and safe as any user.
+are not in the `pira` group, so a bare `scripts/compose-sync.sh` or
+`scripts/lua-sync.sh` exits `1` on the first `cp`; prefix it with `sudo -u pira`
+(as below) or run from a `pira` shell. `--check` only reads and is safe as any
+user. On a fresh clone the tree is owned by you, so no sudo is needed there
+either. The same rule applies verbatim to both installers — see
+[`docs/dev-environment.md`](../docs/dev-environment.md#keep-the-ale-lua-scripts-in-sync-pre-boot-assertion).
 
 ```bash
 cp -r wrath-unbound/modules/mod-unbound modules/
@@ -97,12 +108,15 @@ cp -r wrath-unbound/modules/mod-custom-classes modules/
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
 # ALE Lua: install every tracked script into env/dist/etc/modules/lua_scripts/
-# (PRO-269). This WRITES, so on the build host it runs as the tree owner;
-# `--check` is the read-only pre-boot assertion and needs no sudo.
+# (PRO-269). `--check` is the read-only pre-boot assertion (any user), the
+# install WRITES so it runs as the tree owner — on the build host that means
+# `sudo -u pira scripts/lua-sync.sh`, on a fresh clone plain
+# `scripts/lua-sync.sh`.
+scripts/lua-sync.sh --check
 sudo -u pira scripts/lua-sync.sh
 # root overrides are generated copies of the snapshots above (PRO-180):
-# the installer WRITES, so it runs as the tree owner; `--check` is the
-# read-only pre-boot assertion and needs no sudo
+# same shape — `--check` reads (any user), the install WRITES as the tree owner
+scripts/compose-sync.sh --check
 sudo -u pira scripts/compose-sync.sh
 # core hook patches are in-tree on Playerbot (f5b197b8d, b732dfd71):
 # verify, do not re-apply (on a base-pinned tree, git-apply both patches

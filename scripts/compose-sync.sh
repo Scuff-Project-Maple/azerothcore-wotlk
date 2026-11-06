@@ -16,9 +16,40 @@
 #   scripts/compose-sync.sh --check   pre-boot assertion; non-zero exit on
 #                                     drift. Read-only: safe as any user.
 #
+# A root copy may only ever be ABSENT or a REGULAR FILE, and that is checked
+# before anything reads or writes it, in both modes (PRO-273 finding (a),
+# inherited from the same house pattern as scripts/lua-sync.sh). Anything else
+# is refused rather than touched: `cmp`/`diff` on a FIFO blocks forever, and
+# `cp -p` follows a symlink, so a link at a root copy would let the installer
+# overwrite a file elsewhere in — or outside — the tree while still printing
+# `wrote`.
+#
+# Tested by ops/preflight/ops/preflight/test_sync_scripts.sh — run it after any change here.
+#
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Name the kind of thing sitting at a root path, so the refusal is legible
+# enough to act on without a second `ls`.
+path_kind() {
+  local p=$1
+  if [[ -L "$p" ]]; then
+    printf 'symlink -> %s' "$(readlink "$p" 2>/dev/null || echo 'unreadable')"
+  elif [[ -p "$p" ]]; then
+    printf 'FIFO'
+  elif [[ -S "$p" ]]; then
+    printf 'socket'
+  elif [[ -d "$p" ]]; then
+    printf 'directory'
+  elif [[ -b "$p" ]]; then
+    printf 'block device'
+  elif [[ -c "$p" ]]; then
+    printf 'character device'
+  else
+    printf 'non-regular file'
+  fi
+}
 
 # canonical snapshot path : installed (gitignored, compose-visible) path
 pairs=(
@@ -51,6 +82,22 @@ for pair in "${pairs[@]}"; do
     continue
   fi
 
+  # Gate every read and write on this, with one message and one verdict in
+  # both modes. Before this, a non-regular root copy reached the final `else`
+  # and was reported as "missing", and a symlink to matching content was
+  # reported as `ok`.
+  if [[ -L "$root/$installed" || ( -e "$root/$installed" && ! -f "$root/$installed" ) ]]; then
+    kind="$(path_kind "$root/$installed")"
+    echo "compose-sync: $installed is a $kind, not a regular file — refusing to overwrite" >&2
+    echo "compose-sync: remove it, then install as the tree owner:" >&2
+    echo "compose-sync:  sudo -u pira scripts/compose-sync.sh" >&2
+    if [[ $mode == check ]]; then
+      status=1
+      continue
+    fi
+    exit 1
+  fi
+
   if [[ -f "$root/$installed" ]] && cmp -s "$root/$canonical" "$root/$installed"; then
     echo "compose-sync: ok    $installed"
     continue
@@ -60,18 +107,11 @@ for pair in "${pairs[@]}"; do
     echo "compose-sync: DRIFT $installed does not match $canonical" >&2
     if [[ -f "$root/$installed" ]]; then
       diff -u "$root/$canonical" "$root/$installed" >&2 || true
-    elif [[ -d "$root/$installed" ]]; then
-      echo "compose-sync:       $installed is a directory, expected a regular file (remove it, then sudo -u pira scripts/compose-sync.sh)" >&2
     else
       echo "compose-sync:       $installed is missing (run: sudo -u pira scripts/compose-sync.sh)" >&2
     fi
     status=1
   else
-    if [[ -d "$root/$installed" ]]; then
-      # cp would silently copy *into* the directory and report success
-      echo "compose-sync: $installed is a directory, expected a regular file" >&2
-      exit 1
-    fi
     # Keep cp's own message: ENOSPC/EROFS must not be reported as a
     # permissions problem just because the tree is pira-owned (PRO-180 review).
     if ! cp_err=$(cp -p "$root/$canonical" "$root/$installed" 2>&1); then
