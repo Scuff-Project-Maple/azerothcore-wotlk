@@ -4,7 +4,9 @@
 # The write policy is only as good as its column names: a key column that does
 # not exist in the real schema silently stops bounding anything, so a policy
 # typo is a hole, not a bug. This checks every `keyColumns`, `keySets`, `bands`
-# and `refs` name against the `CREATE TABLE` bodies in this tree.
+# and `refs` name against the `CREATE TABLE` bodies in this tree, and every
+# `upstreamProvenance` claim against the invariants the upstream exemption needs
+# (PRO-248 review N3).
 #
 #   python3 ops/preflight/audit_policy_schema.py [--repo PATH] [--no-modules]
 #
@@ -112,6 +114,41 @@ def named_columns(entry):
     return cols
 
 
+def provenance_problems(policy):
+    """Check the upstreamProvenance invariants the write-policy exemption rests on.
+
+    PRO-248 review N3. `classify_origin()` decides the exemption for an
+    `origin: "upstream"` directory from this block before it parses a single statement,
+    so a policy that quietly loses the block — or names a `verifiedRef` that a local
+    commit can move — re-hands out the exemption the PRO-248 rule exists to withhold.
+    Nothing else in this repository machine-checks that; the `_comment` next to it is
+    prose, and prose is what review B1 found to be untrue.
+
+    This is a column audit's equal: the claim is `verifiedRef` names a remote-tracking
+    ref that only a fetch can move, and an unverifiable claim here is a hole, not a bug.
+    """
+    cfg = policy.get("upstreamProvenance")
+    if not isinstance(cfg, dict):
+        return ["upstreamProvenance: block is missing, so a new file in an "
+                "origin:upstream directory would fall back to the pre-PRO-248 "
+                "directory+author exemption"]
+    problems = []
+    ref = str(cfg.get("verifiedRef") or "").strip()
+    if not ref:
+        problems.append("upstreamProvenance.verifiedRef: empty, so the upstream "
+                        "exemption is decided by directory+author alone")
+    elif not ref.startswith("refs/remotes/"):
+        problems.append(
+            f"upstreamProvenance.verifiedRef: {ref!r} is not under refs/remotes/, so "
+            f"the person whose forged `git commit --author=...` this rule exists to "
+            f"catch can move it (name it fully qualified, e.g. "
+            f"refs/remotes/origin/Playerbot)")
+    if not str(cfg.get("refreshCommand") or "").strip():
+        problems.append("upstreamProvenance.refreshCommand: empty, so a boot refusal "
+                        "could not name the command that clears it")
+    return problems
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Audit preflight-policy.json table/column claims against the real DDL.")
@@ -181,6 +218,10 @@ def main() -> int:
 
     for line in unchecked:
         print(f"WARN {line}: not verified — module SQL was skipped with --no-modules")
+    # The upstream exemption is a policy claim like any other column name: if it does
+    # not hold the failure is silent, so it is audited here rather than in a review
+    # comment nobody re-reads (PRO-248 review N3).
+    problems += provenance_problems(policy)
     for line in problems:
         print(f"FAIL {line}")
     if unchecked:

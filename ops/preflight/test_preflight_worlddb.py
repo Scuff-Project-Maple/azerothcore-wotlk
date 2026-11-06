@@ -261,6 +261,10 @@ class TestProvenance(unittest.TestCase):
     def pf_with_author(author):
         pf = make_preflight()
         pf.git_author_origin = lambda path: author
+        # These tests are about the directory tag and the author; the tracked-ref
+        # question (PRO-248) has its own class and needs no real git here.
+        pf.upstream_ref_state = lambda path: (Preflight.REF_VERIFIED, "stubbed: in ref",
+                                              "verified")
         return pf
 
     @staticmethod
@@ -283,6 +287,16 @@ class TestProvenance(unittest.TestCase):
         pf = self.pf_with_author(("upstream", "ac@azerothcore.org\tAC\tfix"))
         origin, _ = pf.classify_origin(self.file_in("$/data/sql/updates/db_world", "upstream"))
         self.assertEqual(origin, "upstream")
+
+    def test_upstream_also_needs_the_tracked_ref(self):
+        # PRO-248: a non-company author is a claim, not evidence. The third tag — the
+        # file existing in the ref the tree tracks — is what makes it upstream.
+        pf = self.pf_with_author(("upstream", "ac@azerothcore.org\tAC\tfix"))
+        pf.upstream_ref_state = lambda path: (Preflight.REF_UNVERIFIED,
+                                             "stubbed: absent from origin/Playerbot",
+                                             "absent")
+        origin, _ = pf.classify_origin(self.file_in("$/data/sql/updates/db_world", "upstream"))
+        self.assertEqual(origin, "company")
 
     def test_untracked_never_gets_the_exemption(self):
         pf = self.pf_with_author(("unknown", "untracked"))
@@ -943,6 +957,535 @@ class TestCorpusSweepCompanyColumn(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual(POLICY["liveDatabase"], seen.get("live_db"),
                          "cross-schema-write was measured against a hard-coded schema")
+
+
+class TestUpstreamRefProvenance(unittest.TestCase):
+    """PRO-248 (PRO-179 review NB-E): an upstream-tagged dir is not a self-serve exemption.
+
+    The POC in the issue is a real one, so it is reproduced here against a real git
+    repository: write the file, commit it with a forged upstream `--author`, keep the
+    work tree clean. The only thing that separates that from a `git pull` is whether the
+    file exists in the ref the tree is tracking, so the ref is what these tests move.
+    """
+
+    UP_REL = "data/sql/updates/db_world"
+    IN_BAND = ("INSERT INTO `creature_template` (`entry`,`DifficultyEntry`,`name`) "
+               "VALUES (900200,0,'Risen Watcher');\n")
+    OUT_OF_BAND = ("INSERT INTO `creature_template` (`entry`,`DifficultyEntry`,`name`) "
+                   "VALUES (1234,0,'Risen Watcher');\n")
+    EMPTY = "-- company content that parses to nothing at all\n"
+
+    def _git(self, d, *args):
+        import subprocess
+        proc = subprocess.run(["git", *args], cwd=str(d), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, f"git {' '.join(args)}: {proc.stdout[:300]}")
+        return proc.stdout.strip()
+
+    def _repo(self):
+        import shutil
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / self.UP_REL).mkdir(parents=True)
+        self._git(d, "init", "-q")
+        self._git(d, "config", "user.email", "bot@paperclip.local")
+        self._git(d, "config", "user.name", "Scuff Bot")
+        base = d / self.UP_REL / "2026_01_01_00.sql"
+        base.write_text("DELETE FROM `creature_template` WHERE `entry` = 1;\n")
+        self._git(d, "add", "-A")
+        self._git(d, "commit", "-qm", "upstream update")
+        # What a `git pull` leaves behind: a remote-tracking ref holding the history.
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", "HEAD")
+        return d
+
+    def _commit(self, d, rel, sql, author="Someone <x@azerothcore.org>"):
+        p = d / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(sql, encoding="utf-8")
+        self._git(d, "add", "--", rel)
+        self._git(d, "commit", "-qm", f"add {rel}", f"--author={author}")
+        return p
+
+    def _pf(self, d, verified_ref="refs/remotes/origin/Playerbot",
+            refresh="git fetch --prune origin Playerbot"):
+        pf = make_preflight()
+        pf.git_root = d
+        policy = json.loads(json.dumps(POLICY))
+        if verified_ref is not None or refresh is not None:
+            policy["upstreamProvenance"] = {"verifiedRef": verified_ref,
+                                            "refreshCommand": refresh}
+        else:
+            policy.pop("upstreamProvenance", None)
+        pf.p = policy
+        return pf
+
+    def _file(self, d, p):
+        return {"rel": str(p.relative_to(d)), "path": p, "basename": p.name,
+                "key": p.name.lower(), "size": p.stat().st_size, "sha1": "",
+                "dir": {"db_path": "$/data/sql/updates/db_world", "state": "RELEASED",
+                        "dir": d / self.UP_REL, "origin": "upstream"}}
+
+    def _run(self, pf, f):
+        """What check_ledger + check_policy do for one new file."""
+        origin, prov = pf.classify_origin(f)
+        f["origin"], f["provenance"] = origin, prov
+        pf.check_policy([f])
+        return origin, prov
+
+    def _outcomes(self, pf):
+        return ([(x.rule, x.message) for x in pf.r.findings if x.severity == "FAIL"],
+                [x.rule for x in pf.r.findings if x.severity == "WARN"])
+
+    # --- the POC must be refused ------------------------------------------------ #
+
+    def test_forged_author_poc_is_a_boot_refusal_naming_pending_db_world(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d)
+        origin, prov = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        rules = [r for r, _ in fails]
+        self.assertEqual("company", origin,
+                         "a forged --author bought the upstream exemption")
+        self.assertIn("unverified-upstream-origin", rules)
+        msg = next(m for r, m in fails if r == "unverified-upstream-origin")
+        self.assertIn("pending_db_world", msg)
+        self.assertIn("refs/remotes/origin/Playerbot", msg)
+        self.assertIn("2026_11_04_00.sql", msg)
+        self.assertTrue(pf.r.failed, "the gate must refuse this boot")
+
+    def test_forged_author_poc_is_refused_even_when_nothing_parses(self):
+        # An empty file has no statement to blame, so the provenance finding cannot
+        # depend on the parser finding something.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.EMPTY)
+        pf = self._pf(d)
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("unverified-upstream-origin", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed)
+
+    def test_forged_author_poc_still_reports_its_own_policy_violations(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.OUT_OF_BAND)
+        pf = self._pf(d)
+        self._run(pf, self._file(d, p))
+        rules = [r for r, _ in self._outcomes(pf)[0]]
+        self.assertIn("unverified-upstream-origin", rules)
+        self.assertIn("reserved-band", rules,
+                      "the file was refused for provenance but never policy-checked")
+
+    def test_check_ledger_lists_the_ref_state_of_a_new_file(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d)
+        f = self._file(d, p)
+        pf.db = None                      # check_ledger's file loop needs no database
+        pf.ledger = lambda: {}
+        new = pf.check_ledger([f])
+        self.assertEqual(1, len(new))
+        self.assertEqual(pf.REF_UNVERIFIED, new[0]["upstream_ref_state"])
+        listed = [t for t in pf.r.sections.get("2", []) if "NEW " in t]
+        self.assertTrue(any("upstreamRef=unverified" in t for t in listed), listed)
+
+    # --- the ordinary `git pull` must keep booting ------------------------------ #
+
+    def test_genuine_upstream_pull_still_passes_offline(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        # Simulate the pull: the ref now carries the commit that introduced the file.
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("upstream", origin)
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertIn("policy-exempt-origin", warns)
+        self.assertFalse(pf.r.failed, "an ordinary upstream pull must not refuse boot")
+
+    def test_verified_file_is_reported_as_present_in_the_ref(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        pf = self._pf(d)
+        f = self._file(d, p)
+        pf.classify_origin(f)
+        self.assertEqual(pf.REF_VERIFIED, f["upstream_ref_state"])
+
+    def test_missing_ref_does_not_refuse_an_offline_boot(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("upstream", origin, "a clone that has not fetched must still boot")
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertIn("upstream-ref-unverified", warns)
+        warn = next(x.message for x in pf.r.findings if x.rule == "upstream-ref-unverified")
+        self.assertIn("git fetch --prune origin Playerbot", warn)
+
+    def test_unconfigured_ref_falls_back_to_the_legacy_directory_exemption(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref=None, refresh=None)
+        origin, _ = self._run(pf, self._file(d, p))
+        self.assertEqual("upstream", origin)
+        self.assertFalse(pf.r.failed)
+
+    def test_indeterminate_ref_fails_closed_naming_the_refresh_command(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d)
+        pf.upstream_ref = lambda: {"state": "error", "ref": "refs/remotes/origin/Playerbot",
+                                   "refresh": "git fetch --prune origin Playerbot",
+                                   "paths": None, "detail": "git ls-tree exited 128",
+                                   "remoteTracked": True}
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin)
+        self.assertIn("unverified-upstream-origin", [r for r, _ in fails])
+        msg = next(m for r, m in fails if r == "unverified-upstream-origin")
+        self.assertIn("git fetch --prune origin Playerbot", msg)
+        self.assertIn("Failing", msg)
+        self.assertTrue(pf.r.failed)
+
+    def test_a_local_branch_as_the_verified_ref_refuses_the_boot(self):
+        # PRO-248 review B1: the policy and the README both say verifiedRef *must* be a
+        # remote-tracking ref. A 'must' that costs a warning is the exemption with extra
+        # steps — the file stays exempt while the gate says it is worried.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="master")
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("company", origin,
+                         "a ref the author can move still bought the exemption")
+        self.assertIn("upstream-ref-not-remote", [r for r, _ in fails])
+        msg = next(m for r, m in fails if r == "upstream-ref-not-remote")
+        self.assertIn("refs/remotes/", msg)
+        self.assertIn("pending_db_world", msg)
+        self.assertTrue(pf.r.failed, "a non-remote verifiedRef must refuse this boot")
+
+    def test_a_shadow_branch_does_not_answer_for_a_short_ref_name(self):
+        # `git branch origin/Playerbot HEAD` makes the short name ambiguous: git then
+        # reads refs/heads/origin/Playerbot for ls-tree AND refuses to name the ref for
+        # `rev-parse --symbolic-full-name`. Before review B1 the unanswered question
+        # defaulted to 'remote-tracking', so the forged local branch vouched for the
+        # forged file and the reserved-band write was exempt again.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "branch", "-f", "origin/Playerbot", head)
+        pf = self._pf(d, verified_ref="origin/Playerbot")
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin, "the shadow branch vouched for the file")
+        self.assertIn("upstream-ref-not-remote", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed)
+
+    def test_a_shadow_branch_cannot_touch_a_fully_qualified_ref(self):
+        # The other half of review B1: the qualified name must keep working, and keep
+        # refusing, with the same shadow branch in place — so the fix is the ref name,
+        # not a warning nobody reads.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "branch", "-f", "origin/Playerbot", head)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin)
+        self.assertIn("unverified-upstream-origin", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed)
+
+    def test_a_shadow_branch_does_not_refuse_a_genuine_pull(self):
+        # ...and the qualified name must not fail closed just because someone made a
+        # branch with a confusing name.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "branch", "-f", "origin/Playerbot", "HEAD~1")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("upstream", origin)
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertIn("policy-exempt-origin", warns)
+        self.assertFalse(pf.r.failed)
+
+    # --- B1/N4: the two halves of the remote-tracking test, pinned separately ----- #
+
+    def _stub_git(self, pf, named, rc=0, err=""):
+        """Answer only the ref-name question; record every argv git is asked.
+
+        Review N4: one `elif` covers both "exit 0 with no name" and "non-zero exit", and
+        every real-git test in this file reaches both through the same branch. Only a
+        stub can hand git the first shape on its own, which is the shape a shadow branch
+        really produces — so a future edit that drops `or not full.strip()` would
+        otherwise still pass the whole suite.
+        """
+        calls = []
+
+        def fake(argv, timeout=60, errors="replace"):
+            calls.append(list(argv))
+            if argv[:2] == ["rev-parse", "--symbolic-full-name"]:
+                return rc, named, err
+            if argv[:2] == ["rev-parse", "--verify"]:
+                return 0, "0" * 40, ""
+            return 128, "", f"stub refused {argv}"
+
+        pf._git = fake
+        return calls
+
+    def test_a_zero_exit_naming_no_ref_is_not_remote_tracking(self):
+        # Measured on git 2.43.0: with `git branch origin/Playerbot HEAD` present,
+        # `rev-parse --symbolic-full-name origin/Playerbot` exits 0 and prints nothing,
+        # with the ambiguity on stderr. The name never came back, so the ref may not
+        # vouch for anything (PRO-248 review B1).
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="origin/Playerbot")
+        calls = self._stub_git(pf, "", rc=0,
+                               err="warning: refname 'origin/Playerbot' is ambiguous.")
+        up = pf.upstream_ref()
+        self.assertEqual("ok", up["state"])
+        self.assertFalse(up["remoteTracked"],
+                         "an unanswered question defaulted to remote-tracking")
+        self.assertIn("ambiguous", up["remoteDetail"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]],
+                         "an untrusted ref was still asked for its tree")
+
+    def test_a_nonzero_exit_is_not_remote_tracking_either(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="origin/Playerbot")
+        calls = self._stub_git(pf, "", rc=1,
+                               err="error: unknown revision 'origin/Playerbot'")
+        up = pf.upstream_ref()
+        self.assertFalse(up["remoteTracked"])
+        self.assertIn("unknown revision", up["remoteDetail"])
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+
+    def test_a_non_remote_ref_refusal_names_the_refresh_command(self):
+        # Review N2: the README table promises this FAIL names `refreshCommand`, so the
+        # author of a gutted policy gets the command that would have fixed the ref.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="master")
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        msg = next(m for r, m in fails if r == "upstream-ref-not-remote")
+        self.assertIn("git fetch --prune origin Playerbot", msg)
+        self.assertIn("pending_db_world", msg)
+
+    # --- B2: a filename git would quote must not look like a forgery ------------ #
+
+    NON_ASCII = "2026_11_04_00_érfar.sql"
+
+    def test_a_non_ascii_upstream_filename_boots(self):
+        # `git ls-tree` without `-z` answers with "...\\303\\251rfar.sql", which can
+        # never equal the name on disk, so a genuine upstream file became unverified and
+        # the boot was refused — the worst direction for a false positive.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/{self.NON_ASCII}", self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("upstream", origin, "a quoted path was not matched to the ref")
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertFalse(pf.r.failed, "an ordinary upstream pull must not refuse boot")
+
+    def test_a_non_ascii_filename_is_still_refused_when_it_is_not_in_the_ref(self):
+        # The passing case above is only meaningful if the same name is refused when the
+        # ref really does not hold it.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/{self.NON_ASCII}", self.IN_BAND)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin)
+        self.assertIn("unverified-upstream-origin", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed)
+
+    # --- N1: a case-only twin is tolerated, but not silently -------------------- #
+
+    def test_a_case_only_twin_is_exempt_but_warned(self):
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        self._commit(d, rel, self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        twin = f"{self.UP_REL}/2026_11_04_00.SQL"
+        p = self._commit(d, twin, self.IN_BAND)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("upstream", origin,
+                         "a case-insensitive checkout must still boot")
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertIn("upstream-ref-case-divergence", warns)
+        warn = next(x.message for x in pf.r.findings
+                    if x.rule == "upstream-ref-case-divergence")
+        self.assertIn("2026_11_04_00.sql", warn,
+                      "the WARN has to name the ref path it matched modulo case")
+
+    def test_a_case_only_twin_with_different_bytes_is_refused(self):
+        # The tolerance is for checkouts, not for content: a twin whose bytes are not the
+        # ref's bytes is the N2 case wearing a case difference.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        self._commit(d, rel, self.OUT_OF_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        twin = f"{self.UP_REL}/2026_11_04_00.SQL"
+        p = self._commit(d, twin, self.IN_BAND)
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin)
+        self.assertIn("unverified-upstream-content", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed)
+
+    # --- N2: the name being in the ref is not the file being in the ref ---------- #
+
+    def test_rewritten_content_under_a_verified_name_is_refused(self):
+        # Measured in review N2: the file is in the ref, the body is replaced with a
+        # reserved-band creature under a forged --author, the work tree is clean, and a
+        # path-only check still says 'present in the ref'. The blob is what differs.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        self._commit(d, rel, self.OUT_OF_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        (d / rel).write_text(self.IN_BAND, encoding="utf-8")
+        self._git(d, "commit", "-qam", "resurrect the Risen Watcher",
+                  "--author=Someone <x@azerothcore.org>")
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, d / rel))
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin,
+                         "a rewritten body kept the upstream exemption")
+        self.assertIn("unverified-upstream-content", [r for r, _ in fails])
+        msg = next(m for r, m in fails if r == "unverified-upstream-content")
+        self.assertIn("pending_db_world", msg)
+        self.assertIn("2026_11_04_00.sql", msg)
+        self.assertTrue(pf.r.failed)
+
+    def test_a_verified_name_keeps_its_exemption_when_the_bytes_match(self):
+        # The negative control for the blob check: same content, same name, clean tree.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        pf = self._pf(d)
+        f = self._file(d, p)
+        self._run(pf, f)
+        self.assertEqual(pf.REF_VERIFIED, f["upstream_ref_state"])
+        self.assertEqual("verified", f["upstream_ref_cause"])
+
+    def test_the_ref_listing_carries_blob_ids(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/{self.NON_ASCII}", self.IN_BAND)
+        head = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "update-ref", "refs/remotes/origin/Playerbot", head)
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual({"2026_01_01_00.sql", self.NON_ASCII},
+                         {n.split("/")[-1] for n in up["paths"]})
+        self.assertTrue(up["blobs"][f"{self.UP_REL}/{self.NON_ASCII}"].startswith(
+            self._git(d, "hash-object", "--", f"{self.UP_REL}/{self.NON_ASCII}")[:12]))
+
+    def test_a_company_directory_never_needs_the_ref(self):
+        d = self._repo()
+        p = self._commit(d, "data/sql/updates/pending_db_world/2026_11_04_00.sql",
+                         self.OUT_OF_BAND, author="Scuff <scuff@paperclip.local>")
+        pf = self._pf(d)
+        f = self._file(d, p)
+        f["dir"] = {"db_path": "$/data/sql/updates/pending_db_world", "state": "PENDING",
+                    "dir": d / "data/sql/updates/pending_db_world", "origin": "company"}
+        origin, _ = self._run(pf, f)
+        fails, _ = self._outcomes(pf)
+        self.assertEqual("company", origin)
+        self.assertNotIn("unverified-upstream-origin", [r for r, _ in fails])
+        self.assertIn("reserved-band", [r for r, _ in fails])
+
+    def test_company_author_in_an_upstream_dir_is_still_company(self):
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_01.sql", self.IN_BAND,
+                         author="Scuff <scuff@paperclip.local>")
+        pf = self._pf(d)
+        origin, _ = self._run(pf, self._file(d, p))
+        self.assertEqual("company", origin)
+        self.assertNotIn("unverified-upstream-origin",
+                         [r for r, _ in self._outcomes(pf)[0]])
+
+    def test_policy_stats_count_the_ref_outcomes(self):
+        d = self._repo()
+        forged = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d)
+        self._run(pf, self._file(d, forged))
+        self.assertEqual({pf.REF_UNVERIFIED: 1}, pf.policy_stats["upstreamRef"])
+        listed = " ".join(pf.r.sections.get("4", []))
+        self.assertIn("upstream ref refs/remotes/origin/Playerbot", listed)
+
+
+class TestPolicyAuditPinsProvenance(unittest.TestCase):
+    """PRO-248 review N3: the ref the exemption rests on is a policy invariant too.
+
+    `audit_policy_schema.py` used to check only baseTables/customTables columns, so
+    deleting the whole upstreamProvenance block — or pointing verifiedRef at a branch —
+    audited clean while quietly re-handing out the upstream exemption. These assert the
+    audit refuses each of those, and accepts what ships.
+    """
+
+    def _problems(self, policy):
+        import audit_policy_schema
+        return audit_policy_schema.provenance_problems(policy)
+
+    def test_the_shipped_policy_passes(self):
+        self.assertEqual([], self._problems(POLICY))
+
+    def test_a_missing_block_is_a_problem(self):
+        policy = json.loads(json.dumps(POLICY))
+        policy.pop("upstreamProvenance", None)
+        problems = self._problems(policy)
+        self.assertEqual(1, len(problems))
+        self.assertIn("upstreamProvenance", problems[0])
+
+    def test_an_empty_verified_ref_is_a_problem(self):
+        policy = json.loads(json.dumps(POLICY))
+        policy["upstreamProvenance"]["verifiedRef"] = "  "
+        self.assertIn("verifiedRef", " ".join(self._problems(policy)))
+
+    def test_a_verified_ref_outside_refs_remotes_is_a_problem(self):
+        # Both shapes review B1 measured: the ambiguous short name, and a plain branch.
+        for ref in ("origin/Playerbot", "Playerbot", "HEAD"):
+            policy = json.loads(json.dumps(POLICY))
+            policy["upstreamProvenance"]["verifiedRef"] = ref
+            problems = self._problems(policy)
+            self.assertEqual(1, len(problems), ref)
+            self.assertIn(ref, problems[0])
+            self.assertIn("refs/remotes/", problems[0])
+
+    def test_an_empty_refresh_command_is_a_problem(self):
+        policy = json.loads(json.dumps(POLICY))
+        policy["upstreamProvenance"]["refreshCommand"] = ""
+        self.assertIn("refreshCommand", " ".join(self._problems(policy)))
+
+    def test_a_non_dict_block_is_a_problem(self):
+        policy = json.loads(json.dumps(POLICY))
+        policy["upstreamProvenance"] = "origin/Playerbot"
+        self.assertEqual(1, len(self._problems(policy)))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,42 @@
 
   "writePolicyExemptOrigins": ["upstream"],
 
+  "upstreamProvenance": {
+    "verifiedRef": "refs/remotes/origin/Playerbot",
+    "refreshCommand": "git fetch --prune origin Playerbot",
+    "_comment": [
+      "PRO-248 (PRO-179 review NB-E). The write-policy exemption for an origin:upstream",
+      "directory is a claim about history, and `git commit --author=\"Someone",
+      "<x@azerothcore.org>\" data/sql/updates/db_world/x.sql` is enough to make that",
+      "claim locally. So a new file in an upstream-tagged directory is only exempt when",
+      "it also exists in verifiedRef — with the bytes that ref holds for it, not just the",
+      "name — the ref the tree is tracking. A forged --author",
+      "does not put the file in the ref; a `git pull` does.",
+      "verifiedRef must name a remote-tracking ref (refs/remotes/...): a local branch is",
+      "writable by the very person the rule constrains, and pointing it at HEAD would",
+      "make every file look upstream. Write it fully qualified: the short name",
+      "`origin/Playerbot` is ambiguous the moment anyone runs `git branch origin/Playerbot",
+      "HEAD`, and git then reads refs/heads/origin/Playerbot while refusing to say which",
+      "ref it meant — `git rev-parse --symbolic-full-name` answers with nothing. The gate",
+      "treats that unanswered question as 'not remote-tracking' and refuses the boot",
+      "(PRO-248 review B1) rather than defaulting to the exemption. It is read with local",
+      "object database lookups only — nothing here fetches, so an ordinary offline boot",
+      "still resolves it.",
+      "States: verified -> exempt as before (a match that only holds modulo case is exempt",
+      "but WARNed as upstream-ref-case-divergence). unverified -> FAIL naming the pending",
+      "directory, because company content belongs in pending_db_world; a name that is in",
+      "the ref whose bytes are not is FAILed as unverified-upstream-content. indeterminate",
+      "(git could not answer, or verifiedRef is not under refs/remotes/) -> FAIL, failing",
+      "closed, naming refreshCommand.",
+      "unchecked (ref not configured or not present locally) -> WARN naming",
+      "refreshCommand and the pre-PRO-248 dir+author exemption is kept: refusing every",
+      "clone that has never fetched is worse than the status quo, and the report says so.",
+      "Deleting this block, emptying verifiedRef, or moving verifiedRef out of",
+      "refs/remotes/ is a governance change to a reviewed file, not a way to pass:",
+      "ops/preflight/audit_policy_schema.py exits 1 on all three."
+    ]
+  },
+
   "forbiddenStatements": [
     "ALTER", "DROP", "TRUNCATE", "RENAME", "GRANT", "REVOKE",
     "LOAD", "CALL", "LOCK", "UNLOCK", "HANDLER", "PREPARE", "DEALLOCATE",

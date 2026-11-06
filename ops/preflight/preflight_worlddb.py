@@ -1133,6 +1133,321 @@ class Preflight:
             return "company", line
         return "upstream", line
 
+    # -- upstream ref provenance (PRO-248, PRO-179 review NB-E) --------------- #
+
+    # Outcomes of asking "did this file arrive with the history we are tracking?".
+    REF_VERIFIED = "verified"            # in the ref -> upstream history, exempt
+    REF_UNVERIFIED = "unverified"        # ref resolved, file absent -> introduced locally
+    REF_INDETERMINATE = "indeterminate"  # git could not answer -> fail closed
+    REF_UNCHECKED = "unchecked"          # no ref / ref absent -> pre-PRO-248 behaviour
+
+    def _git(self, argv: list[str], timeout: int = 60, errors: str = "replace"):
+        """Run git in the tracked tree. (returncode, out, err), or (None, '', reason).
+
+        `errors` is exposed because `git ls-tree -z` emits raw path bytes: decoding
+        those with "replace" would silently mangle a non-ASCII filename and turn a
+        genuine upstream file into an unverified one (PRO-248 review B2).
+        """
+        try:
+            proc = subprocess.run(["git", *argv], cwd=str(self.git_root),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  timeout=timeout)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            return None, "", str(exc)
+        return (proc.returncode,
+                proc.stdout.decode("utf-8", errors),
+                proc.stderr.decode("utf-8", "replace").strip())
+
+    def upstream_ref_setting(self) -> tuple[str | None, str]:
+        """(verifiedRef, refreshCommand) from policy, with a derived fetch hint."""
+        cfg = self.p.get("upstreamProvenance")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        ref = str(cfg.get("verifiedRef") or "").strip() or None
+        refresh = str(cfg.get("refreshCommand") or "").strip()
+        if not refresh:
+            if ref and ref.startswith("refs/remotes/"):
+                remote, _, branch = ref[len("refs/remotes/"):].partition("/")
+                refresh = f"git fetch --prune {remote} {branch}"
+            elif ref and "/" in ref and not ref.startswith("refs/"):
+                remote, _, branch = ref.partition("/")
+                refresh = f"git fetch --prune {remote} {branch}"
+            else:
+                refresh = "git fetch --prune"
+        return ref, refresh
+
+    def upstream_ref(self) -> dict:
+        """Resolve the tracked upstream ref once per run.
+
+        Returns {state, ref, refresh, paths, blobs, pathsLower, pathsByLower, detail,
+        remoteTracked, remoteDetail} where state is 'ok' (`paths` is the set of tree
+        paths, `blobs` maps a tree path to its blob id), 'unconfigured', 'missing' or
+        'error'. A missing ref is not an error: this must never need the network, and a
+        clone that has not fetched yet still has to boot.
+
+        `remoteTracked` answers "is verifiedRef under refs/remotes/?" and it fails
+        closed (PRO-248 review B1). `git rev-parse --symbolic-full-name` prints nothing
+        and reports failure for a short name that is ambiguous — which is exactly what
+        `git branch origin/Playerbot HEAD` creates — while every other read of that same
+        name silently resolves refs/heads/origin/Playerbot, the local branch the
+        `--author` forger can rewrite. An unanswered question therefore means "not a
+        remote-tracking ref", never the default "yes".
+        """
+        cached = getattr(self, "_upstream_ref_cache", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        ref, refresh = self.upstream_ref_setting()
+        out = {"state": "ok", "ref": ref, "refresh": refresh, "paths": None,
+               "blobs": None, "pathsLower": None, "pathsByLower": None,
+               "detail": "", "remoteTracked": True, "remoteDetail": ""}
+        if not ref:
+            out.update(state="unconfigured",
+                       detail="policy has no upstreamProvenance.verifiedRef")
+        else:
+            rc, full, err = self._git(["rev-parse", "--symbolic-full-name", ref])
+            if rc is None:
+                out.update(state="error", detail=f"git unavailable: {err}")
+            elif rc != 0 or not full.strip():
+                # Ambiguous, unresolvable, or answered with nothing: `git rev-parse
+                # --symbolic-full-name origin/Playerbot` prints no name when a local
+                # branch shadows the remote-tracking one. Fail closed (review B1).
+                first = (err.strip().splitlines() or [""])[0]
+                out.update(remoteTracked=False,
+                           remoteDetail=first or f"`git rev-parse --symbolic-full-name "
+                                                 f"{ref}` exited {rc} without naming a ref")
+            elif not full.strip().startswith("refs/remotes/"):
+                out.update(remoteTracked=False,
+                           remoteDetail=f"it resolves to {full.strip()}")
+            if out["state"] == "ok":
+                rc, _, err = self._git(["rev-parse", "--verify", "--quiet",
+                                        f"{ref}^{{commit}}"])
+                if rc is None:
+                    out.update(state="error", detail=f"git unavailable: {err}", paths=None)
+                elif rc != 0:
+                    out.update(state="missing",
+                               detail=f"{ref} does not exist in this clone")
+            if out["state"] == "ok" and out["remoteTracked"]:
+                # `-z` is not cosmetic: without it git quotes every path that is not
+                # plain ASCII, so `2026_01_01_01_érfar.sql` comes back as
+                # "...\\303\\251rfar.sql" and can never equal the on-disk name — a
+                # genuine upstream file would be refused a boot (review B2). `-z` also
+                # drops `--name-only` so the same single call carries the blob id the
+                # content check needs (review N2).
+                rc, body, err = self._git(["ls-tree", "-z", "-r", ref], errors="surrogateescape")
+                if rc is None:
+                    out.update(state="error", detail=f"git unavailable: {err}")
+                elif rc != 0:
+                    out.update(state="error",
+                               detail=f"git ls-tree {ref} exited {rc}: {err[:200]}")
+                else:
+                    blobs: dict[str, str] = {}
+                    for record in body.split("\0"):
+                        if not record:
+                            continue
+                        meta, sep, name = record.partition("\t")
+                        if not sep or not name:
+                            continue
+                        fields = meta.split(" ")
+                        if len(fields) >= 3 and fields[1] == "blob":
+                            blobs[name] = fields[2]
+                    out["blobs"] = blobs
+                    out["paths"] = set(blobs)
+                    out["pathsLower"] = {n.lower() for n in blobs}
+                    lower: dict[str, str] = {}
+                    for n in blobs:
+                        lower.setdefault(n.lower(), n)
+                    out["pathsByLower"] = lower
+        self._upstream_ref_cache = out
+        return out
+
+    def upstream_ref_state(self, path: Path) -> tuple[str, str, str]:
+        """Did `path` arrive with the tracked upstream history? (state, detail, cause).
+
+        `cause` is the machine-readable reason behind the state so the report can name
+        the right recovery: 'verified', 'absent', 'content-diverged', 'case-diverged',
+        'not-remote', 'unreadable', 'uncomparable', 'outside-tree', 'unhashable',
+        'unconfigured' or 'missing'.
+        """
+        up = self.upstream_ref()
+        ref = up["ref"] or "the configured upstreamProvenance.verifiedRef"
+        if up["state"] == "unconfigured":
+            return self.REF_UNCHECKED, (f"upstream ref not configured; set "
+                                        f"upstreamProvenance.verifiedRef or run "
+                                        f"{up['refresh']}"), "unconfigured"
+        if up["state"] == "missing":
+            return (self.REF_UNCHECKED,
+                    f"{ref} is not present locally; run {up['refresh']}", "missing")
+        if up["state"] == "error":
+            return (self.REF_INDETERMINATE,
+                    f"cannot read {ref}: {up['detail']}", "unreadable")
+        if not up.get("remoteTracked", True):
+            # The ref itself is not trustworthy, so nothing it says about this file is.
+            # A ref outside refs/remotes/ is a branch, and a branch is moved by the same
+            # `git commit` / `git update-ref` this rule exists to catch (review B1).
+            return (self.REF_INDETERMINATE,
+                    f"{ref} is not a remote-tracking ref ({up.get('remoteDetail', '')}), "
+                    f"so whoever can move it can manufacture this exemption",
+                    "not-remote")
+        try:
+            rel = Path(os.path.relpath(path, self.git_root)).as_posix()
+        except ValueError:
+            return (self.REF_INDETERMINATE,
+                    f"{path} is not comparable to {self.git_root}", "uncomparable")
+        if rel.startswith(".."):
+            return (self.REF_INDETERMINATE,
+                    f"{path} is outside the tracked tree {self.git_root}", "outside-tree")
+        # `updates.name` is utf8mb4_unicode_ci, so the updater itself cannot tell two
+        # paths apart that differ only in case (PRO-179 review N4). Matching the same
+        # way here keeps a case-only rename from being accused of forgery — but a
+        # case-only twin is still reported, because 'the ref has a path that matches
+        # modulo case' is not the claim the exemption is built on (review N1).
+        exact = rel in up["paths"]
+        twin = None if exact else (up.get("pathsByLower") or {}).get(rel.lower())
+        if not exact and twin is None:
+            return self.REF_UNVERIFIED, f"absent from {ref}", "absent"
+        ref_path = rel if exact else twin
+        # A name in the ref is not the file. `git add` a rewritten body under a forged
+        # `--author`, commit it, leave the tree clean, and a path-only check still says
+        # 'present in the ref' while the updater runs content no fetch ever delivered
+        # (review N2). Compare the blob the ref actually holds.
+        want = (up.get("blobs") or {}).get(ref_path)
+        rc, got, err = self._git(["hash-object", "--", rel])
+        if rc is None or rc != 0 or not got.strip():
+            return (self.REF_INDETERMINATE,
+                    f"cannot hash {rel} to compare it with {ref}: "
+                    f"{(err or f'exited {rc}')[:200]}", "unhashable")
+        got = got.strip()
+        if want and got != want:
+            where = "in the work tree" if self.is_dirty(path) else "as committed"
+            return (self.REF_UNVERIFIED,
+                    f"its bytes are not the blob {ref} holds for {ref_path} "
+                    f"({got[:12]} vs {want[:12]}) {where}: the name is upstream, the "
+                    f"content is not", "content-diverged")
+        if not exact:
+            return (self.REF_VERIFIED,
+                    f"present in {ref} as {ref_path}, which differs from {rel} only in "
+                    f"case", "case-diverged")
+        return self.REF_VERIFIED, f"present in {ref}", "verified"
+
+    def pending_dir_for_message(self) -> str:
+        """Where company content belongs, as named by the policy's own PENDING dir."""
+        for entry in self.p.get("includedDirs", []):
+            if str(entry.get("state", "")).upper() == "PENDING" \
+                    and entry.get("origin") == "company":
+                return str(entry.get("path", "")).lstrip("$").lstrip("/")
+        return "data/sql/updates/pending_db_world"
+
+    def report_upstream_provenance(self, f: dict) -> None:
+        """PRO-248: an origin:upstream file that the tracked ref cannot vouch for is
+        company content, not an exempt one.
+
+        `classify_origin()` already re-claims the file for the write policy when this
+        returns 'unverified'/'indeterminate'; this adds the boot-refusing finding that
+        tells the author where the file actually belongs. Called for every new file,
+        including one with no statements at all, so an empty file cannot slip through
+        on a policy run that finds nothing to parse.
+        """
+        state = f.get("upstream_ref_state")
+        if state is None:
+            return
+        counts = self.policy_stats.setdefault("upstreamRef", {})
+        counts[state] = counts.get(state, 0) + 1
+        up = self.upstream_ref()
+        ref = up["ref"] or "upstreamProvenance.verifiedRef"
+        pending = self.pending_dir_for_message()
+        db_path = (f.get("dir") or {}).get("db_path", "?")
+        prov = f.get("provenance", "")
+        detail = f.get("upstream_ref_detail", "")
+        cause = f.get("upstream_ref_cause", "")
+        # A provenance FAIL is a boot refusal exactly like a policy finding, so it is
+        # recorded the same way: `corpus_sweep.py` tallies `engine.violations`, which
+        # only `_policy_statement()` filled, so the rule the README claims to falsify
+        # was invisible to the tool doing the falsifying (PRO-248 review N4).
+        def bad(rule: str, message: str) -> None:
+            self.r.fail("4", message, file=f["rel"], rule=rule)
+            self.violations.append({"file": f["rel"], "line": 0, "rule": rule,
+                                    "detail": message, "statement": "provenance"})
+        if state == self.REF_UNVERIFIED and cause == "content-diverged":
+            bad("unverified-upstream-content",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} with a non-company author ({prov}), and {ref} "
+                f"does hold that path, but {detail}. A `git pull` puts the "
+                f"name and its bytes in the ref together; rewriting one of "
+                f"them under a forged --author is not upstream history. "
+                f"Company content belongs in {pending}, where it is always "
+                f"policy-checked: move it there. If this is an accidental "
+                f"local edit, restore it with `git checkout -- {f['rel']}`, "
+                f"or run `{up['refresh']}` if the ref is simply behind, and "
+                f"re-run this gate.",
+                )
+        elif state == self.REF_UNVERIFIED:
+            bad("unverified-upstream-origin",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} with a non-company author ({prov}), but it is "
+                f"not in {ref}. Only a fetch/pull puts a file in that ref — "
+                f"git commit --author=<upstream author> does not, so this "
+                f"reads as company content wearing an upstream provenance. "
+                f"Company content belongs in {pending}, where it is always "
+                f"policy-checked: move it there, or if it genuinely arrived "
+                f"with upstream history run `{up['refresh']}` (or point "
+                f"upstreamProvenance.verifiedRef at the ref this tree "
+                f"tracks) and re-run this gate.",
+                )
+        elif state == self.REF_INDETERMINATE and cause == "not-remote":
+            # Both the policy comment and the README say verifiedRef *must* be a
+            # remote-tracking ref. A 'must' that only costs a warning is the exemption
+            # with extra steps: the file stays exempt on the word of a ref the person
+            # whose forged --author this rule exists to catch can move (review B1).
+            bad("upstream-ref-not-remote",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} and the upstream exemption was about to be "
+                f"granted on {ref}: {detail}. A ref outside refs/remotes/ is a branch, and "
+                f"a branch is rewritten by the same `git commit` / "
+                f"`git update-ref` this rule constrains, so it cannot vouch "
+                f"for anything. Point upstreamProvenance.verifiedRef at "
+                f"refs/remotes/<remote>/<branch> and re-run; if that ref is "
+                f"the right one and is merely behind, refresh it with "
+                f"`{up['refresh']}` first. If this file is company content it "
+                f"belongs in {pending}.",
+                )
+        elif state == self.REF_INDETERMINATE:
+            bad("unverified-upstream-origin",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} and git could not decide whether it is in {ref} "
+                f"({prov}): {detail}. Failing closed rather than handing out "
+                f"the upstream exemption on an unanswered question. Refresh "
+                f"the ref with `{up['refresh']}` and re-run; if this is "
+                f"company content, it belongs in {pending}.",
+                )
+        elif state == self.REF_UNCHECKED:
+            key = f"unchecked:{f['rel']}"
+            if not getattr(self, "_upstream_warn_emitted", None):
+                self._upstream_warn_emitted = set()
+            if key not in self._upstream_warn_emitted:
+                self._upstream_warn_emitted.add(key)
+                self.r.warn("4", f"{f['rel']} sits in an upstream-tagged directory and "
+                                 f"the upstream exemption could not be verified against "
+                                 f"a ref ({detail}), so the pre-PRO-248 directory+author "
+                                 f"exemption was used. Restore verification with "
+                                 f"`{up['refresh']}`.",
+                            file=f["rel"], rule="upstream-ref-unverified")
+        elif state == self.REF_VERIFIED and cause == "case-diverged":
+            # The exemption is kept — `updates.name` is utf8mb4_unicode_ci and a
+            # case-insensitive checkout produces exactly this shape — but a path that
+            # only matches the ref modulo case is a fact a reviewer should see, not a
+            # detail the gate swallows while calling the file 'present in the ref'
+            # (review N1).
+            key = f"case:{f['rel']}"
+            if not getattr(self, "_upstream_warn_emitted", None):
+                self._upstream_warn_emitted = set()
+            if key not in self._upstream_warn_emitted:
+                self._upstream_warn_emitted.add(key)
+                self.r.warn("4", f"{f['rel']} is exempt as upstream content only by a "
+                                 f"case-insensitive match: {detail}. The write policy "
+                                 f"still treats it as upstream (the updater cannot tell "
+                                 f"the two names apart either), but a case-only twin of "
+                                 f"an upstream path is worth a look before this boots.",
+                            file=f["rel"], rule="upstream-ref-case-divergence")
+
     def classify_origin(self, f: dict, author: tuple[str, str] | None = None
                         ) -> tuple[str, str]:
         """Provenance used for write-policy exemption: ('company'|'upstream'|'unknown', detail).
@@ -1145,6 +1460,17 @@ class Preflight:
         outside the company domains. Anything git cannot attribute is 'unknown'
         and gets no exemption, so a file dropped in or committed with a foreign
         --author inside a company directory can never skip checks 2-5.
+
+        Rule (PRO-248, PRO-179 review NB-E): author metadata is a claim anyone can
+        make with `git commit --author=...`, so an upstream-tagged directory plus an
+        upstream-looking author is no longer enough. The file must also exist in the
+        tracked upstream ref (policy upstreamProvenance.verifiedRef) with the bytes that
+        ref holds for its path, which only a fetch/pull can produce, and that ref must
+        live under refs/remotes/ or it is a branch the forger can move (PRO-248 review
+        B1/N2). When the ref says the file is not from that history — or git cannot
+        answer — the file is 'company' and is policy-checked like any
+        other company file; report_upstream_provenance() turns it into a FAIL that
+        names pending_db_world.
         """
         dir_origin = (f.get("dir") or {}).get("origin", "unknown")
         author_origin, detail = author if author else self.git_author_origin(f["path"])
@@ -1156,7 +1482,20 @@ class Preflight:
             return "company", f"company directory {f['dir']['db_path']}, " \
                               f"foreign commit author {detail}"
         if dir_origin == "upstream":
-            return "upstream", f"upstream directory and author: {detail}"
+            state, ref_detail, cause = self.upstream_ref_state(f["path"])
+            f["upstream_ref_state"] = state
+            f["upstream_ref_detail"] = ref_detail
+            f["upstream_ref_cause"] = cause
+            if state == self.REF_VERIFIED:
+                return "upstream", f"upstream directory, author and ref — {detail}, " \
+                                   f"{ref_detail}"
+            if state == self.REF_UNVERIFIED:
+                return "company", f"{detail} but {ref_detail} — a non-company author is " \
+                                  f"not evidence of upstream history"
+            if state == self.REF_INDETERMINATE:
+                return "company", f"{detail} and {ref_detail} — failing closed"
+            return "upstream", f"upstream directory and author (ref not verified — " \
+                               f"{ref_detail}): {detail}"
         return "unknown", f"unrecognised directory origin {dir_origin!r} for {f['dir']['db_path']}"
 
     def dirty_paths(self) -> set | None:
@@ -1653,8 +1992,10 @@ class Preflight:
         self.r.line("2", f"{len(files)} file(s) on disk, {checked} already in the ledger, "
                          f"{len(new_files)} will be applied on next boot")
         for f in new_files:
+            ref_state = f.get("upstream_ref_state") or "-"
             self.r.line("2", f"  NEW {f['rel']}  sha1={f['sha1'][:12]} size={f['size']}B "
-                             f"state={f['dir']['state']} origin={f['origin']}")
+                             f"state={f['dir']['state']} origin={f['origin']} "
+                             f"upstreamRef={ref_state}")
         if not new_files:
             self.r.line("2", "  (nothing new — the next boot applies no update files)")
         if dead:
@@ -1682,6 +2023,11 @@ class Preflight:
         checked_files = 0
         statements = 0
         for f in new_files:
+            # PRO-248: the upstream exemption is a claim about history, so it has to be
+            # vouched for by the tracked ref, not by --author alone. This both reports
+            # the finding and counts the outcome, and runs before the exemption branch
+            # so a file with no parsable statements is still refused.
+            self.report_upstream_provenance(f)
             if f.get("origin") in exempt and not self.a.policy_all:
                 # The exemption is a HEAD-level claim. If the work tree disagrees
                 # with HEAD, the bytes the updater is about to run are company
@@ -1710,13 +2056,21 @@ class Preflight:
                 verb_at = off + (len(masked) - len(masked.lstrip()))
                 line = self.line_of(text, verb_at)
                 self._policy_statement(f, st, line)
+        ref_counts = self.policy_stats.get("upstreamRef", {}) if isinstance(
+            self.policy_stats, dict) else {}
         self.policy_stats = {"files": checked_files, "statements": statements,
-                             "exemptFiles": len(new_files) - checked_files}
+                             "exemptFiles": len(new_files) - checked_files,
+                             "upstreamRef": ref_counts}
+        ref_note = ""
+        if ref_counts:
+            ref = self.upstream_ref().get("ref") or "upstream ref unconfigured"
+            ref_note = f"; upstream ref {ref} (" + \
+                       ", ".join(f"{k}={v}" for k, v in sorted(ref_counts.items())) + ")"
         self.r.line("4", f"{checked_files} new file(s) under write policy, {statements} statement(s) "
                          f"inspected; reserved bands "
                          f"creature_template.entry/quest_template.ID>="
                          f"{self._band_min('creature_template', 'entry')}, "
-                         f"creature.guid>={self._band_min('creature', 'guid')}")
+                         f"creature.guid>={self._band_min('creature', 'guid')}{ref_note}")
         if checked_files == 0:
             self.r.info("4", "no new company files to policy-check", rule="write-policy")
 
