@@ -140,11 +140,39 @@ python3 ops/preflight/corpus_sweep.py --rule table-not-allowed  # offending file
 The number that matters is the `company` column: it must stay 0, because a finding in
 company-authored SQL is a boot refusal. It is therefore also the exit status — a non-zero company
 total, or a `--diff` that shows findings migrating `upstream → company` at constant totals, exits
-1 so this can be wired into CI rather than read by eye (PRO-179 review NB-C). `--measure-only`
-returns 0 regardless, which is what a baseline capture needs. The `upstream` columns are the corpus
-the gate exempts by default, and are measured with `--strict-all` to see how much syntax the engine
-understands. `liveDatabase` is read from the policy file, so `cross-schema-write` is measured
-against the schema the gate actually uses.
+1 (PRO-179 review NB-C). `--measure-only` returns 0 regardless, which is what a baseline capture
+needs. The `upstream` columns are the corpus the gate exempts by default, and are measured with
+`--strict-all` to see how much syntax the engine understands. `liveDatabase` is read from the
+policy file, so `cross-schema-write` is measured against the schema the gate actually uses.
+
+**Be honest about the CI claim:** the exit status is *shaped* for CI, but nothing in
+`.github/workflows/` calls `corpus_sweep.py` today, so nothing fails a pull request on a parser
+regression. A run over the whole corpus costs a few minutes (the per-file `git log` author lookups
+dominate), which is the actual reason it is not wired up yet. Until someone adds the workflow,
+treat the sweep as a review step you run, not a check that runs you.
+
+The second invariant the sweep enforces (PRO-179 review rank 3) is printed on its own line:
+
+```
+region-scan consultations=1 multi-table-write=1 unmatched=0
+```
+
+`_region_tables()` is the report text for a statement the gate has **already refused**; it is not a
+second way to pass. Over the whole corpus it must therefore be consulted exactly once per
+`multi-table-write` finding, and a non-zero `unmatched` exits 1: either a multi-table write is now
+accepted while still consulting the scan — a policy change wearing a report fix — or a refusal
+stopped naming the tables it rejected. The unit-test twin of this property is
+`TestRev5RegionScanImpliesRefusal`, whose `REJECTED` list deliberately includes an all-custom-table
+`JOIN`, because "let it through when every table is one of ours" is the edit that would otherwise
+leave every other literal green.
+
+Both name lists a refusal prints — `tables named` and `other names in region` — come out of the
+same bare-name scan, so when that scan is what produced them both carry the
+`(heuristic — unquoted region)` suffix, and neither carries it when every name was quoted
+(PRO-179 review rank 4). A schema is likewise believed only when the writer quoted the half that
+claims one, decided per component from the token's own backticks: `` `other`.updates `` names
+`other`, `a.b.c` names nothing, and `` `acore_world`.`my.table` `` is one table called `my.table`
+(PRO-179 review rank 1).
 
 ## Dry run (check 5)
 

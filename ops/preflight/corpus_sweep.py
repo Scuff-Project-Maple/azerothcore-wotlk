@@ -96,7 +96,24 @@ def build_files(engine: pf.Preflight, policy: dict, workers: int) -> list[dict]:
 
 
 def tally(engine: pf.Preflight, files: list[dict]) -> dict:
-    engine.check_policy(files)
+    # PRO-179 review rank 3, as a corpus property rather than a handful of literals:
+    # `_region_tables()` exists only to name the tables a *refused* multi-table write was
+    # reaching for, so over the whole corpus it must be consulted exactly once per
+    # `multi-table-write` finding. A consultation with no refusal means the scan is
+    # reachable on a write the gate accepts — a policy change wearing a report fix — and
+    # a refusal with no consultation means the report lost the table it should name.
+    consultations: list[str] = []
+    real_scan = pf._region_tables
+
+    def spy(masked, lo, hi, from_end=None, known_names=None):
+        consultations.append(masked[lo:hi])
+        return real_scan(masked, lo, hi, from_end, known_names)
+
+    pf._region_tables = spy
+    try:
+        engine.check_policy(files)
+    finally:
+        pf._region_tables = real_scan
     by_rel = {f["rel"]: f for f in files}
     by_rule: Counter = Counter()
     by_rule_origin: dict[str, Counter] = {}
@@ -113,6 +130,8 @@ def tally(engine: pf.Preflight, files: list[dict]) -> dict:
         "filesUnderPolicy": engine.policy_stats.get("files", 0),
         "statements": engine.policy_stats.get("statements", 0),
         "findings": sum(by_rule.values()),
+        "regionScanConsultations": len(consultations),
+        "scanConsultationsWithoutRefusal": len(consultations) - by_rule.get("multi-table-write", 0),
         "byRule": dict(sorted(by_rule.items())),
         "byRuleOrigin": {r: dict(c) for r, c in sorted(by_rule_origin.items())},
         "byDir": dict(sorted(by_dir.items())),
@@ -124,6 +143,9 @@ def print_report(result: dict, top: int, rule_filter: str | None,
                  engine: pf.Preflight) -> None:
     print(f"files={result['files']} under-write-policy={result['filesUnderPolicy']} "
           f"statements={result['statements']} findings={result['findings']}")
+    print(f"region-scan consultations={result.get('regionScanConsultations', '?')} "
+          f"multi-table-write={result['byRule'].get('multi-table-write', 0)} "
+          f"unmatched={result.get('scanConsultationsWithoutRefusal', '?')}")
     print("\nrule                              total   company  upstream  unknown")
     for rule, count in sorted(result["byRule"].items(), key=lambda kv: -kv[1])[:top]:
         o = result["byRuleOrigin"].get(rule, {})
@@ -249,6 +271,15 @@ def main(argv=None) -> int:
     if result["companyFindings"]:
         print(f"\nCOMPANY findings: {result['companyFindings']} — every one of these is a "
               f"boot refusal today; list them with --rule RULE")
+        if not args.measure_only:
+            exit_code = 1
+    unmatched = result.get("scanConsultationsWithoutRefusal")
+    if unmatched:
+        print(f"\nREGION SCAN: {unmatched} consultation(s) of the write-region name scan are "
+              f"not matched by a `multi-table-write` finding. The scan is report text for a "
+              f"refusal, not a second way to pass: either a multi-table write is now being "
+              f"accepted while still consulting it, or a refusal stopped naming the tables "
+              f"it rejected.")
         if not args.measure_only:
             exit_code = 1
     if args.out:

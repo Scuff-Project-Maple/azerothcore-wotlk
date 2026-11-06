@@ -416,11 +416,20 @@ def unquote_ident(token: str) -> str:
 
 
 def split_qualified(token: str) -> tuple[str | None, str]:
-    token = token.strip()
-    if token.count(".") == 1:
-        db, tbl = token.split(".", 1)
-        return unquote_ident(db), unquote_ident(tbl)
-    return None, unquote_ident(token)
+    """(schema, table) for a possibly qualified name token.
+
+    The split is the backtick-aware one in `_ident_parts()`, so a name that contains a
+    dot is one component and not two: `` `acore_world`.`my.table` `` is `my.table` in
+    schema `acore_world`, not the string ``acore_world`.`my.table`` (PRO-179 review
+    rank 1). Callers that must decide whether a schema was *claimed* use
+    `_ident_parts()`/`_schema_of()` instead, which still see the quoting.
+    """
+    parts = _ident_parts(token)
+    if len(parts) == 2:
+        return unquote_ident(parts[0]), unquote_ident(parts[1])
+    if len(parts) == 1:
+        return None, unquote_ident(parts[0])
+    return None, ".".join(parts)
 
 
 def paren_depths(masked: str) -> list[int]:
@@ -933,12 +942,47 @@ def blank_backticked(s: str) -> str:
 
 
 def _ident_parts(token: str) -> list[str]:
-    """The identifier components of a possibly qualified name token."""
-    return [p.strip() for p in token.split(".") if p.strip()]
+    """The identifier components of a possibly qualified name token.
+
+    Split on the dots that sit *outside* backticks. ``token.split(".")`` is wrong: a
+    backticked name may contain a dot, and `` `acore_world`.`my.table` `` then yields
+    three pieces of which the last is ``table` `` — not quote-balanced, so the bare-name
+    test said "heuristic" about a fully quoted name, and the all-quoted test said
+    "invented" about a schema the file really did quote (PRO-179 review rank 1). Both
+    judgements are made per component, so both have to come from a tokenisation that
+    knows where the backticks are. An unbalanced run leaves the remainder in one piece,
+    which the region grammar then rejects anyway.
+    """
+    parts: list[str] = []
+    cur: list[str] = []
+    quoted = False
+    for ch in token:
+        if ch == "`":
+            quoted = not quoted
+            cur.append(ch)
+        elif ch == "." and not quoted:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _is_quoted(part: str) -> bool:
     return len(part) >= 2 and part.startswith("`") and part.endswith("`")
+
+
+def _schema_of(parts: list[str]) -> str | None:
+    """The schema a qualified name claims, or None when it does not earn being believed.
+
+    A component is believed only when the writer quoted it. Nothing is ever read out of
+    bare text: ``a.b.c`` names no schema, while `` `other`.updates `` names `other` even
+    though the table half is bare (PRO-179 review rank 1).
+    """
+    if len(parts) == 2 and _is_quoted(parts[0]):
+        return unquote_ident(parts[0])
+    return None
 
 
 def write_targets(st: Statement,
@@ -1060,17 +1104,20 @@ def _region_tables(masked: str, lo: int, hi: int, from_end: int | None = None,
       `updates` and `creature` instead of `u` and `c` (PRO-179 review NB-B);
     * the third return value says whether any name in the *table list* came from the
       bare-name scan. The bare scan cannot tell a table from an `ON`-clause column or
-      an index hint, so a table list built from it is a hint at what to look at, not a
-      verdict — the caller labels it as such (PRO-179 review NB-3). Names that only
-      reach the `others` set are noise whatever their spelling, so they do not flip it.
+      an index hint, so a name list built from it is a hint at what to look at, not a
+      verdict — the caller labels both lists it returns as such (PRO-179 review NB-3,
+      rank 4). Names that only reach the `others` set are noise whatever their
+      spelling, so they do not flip it.
 
-    A schema is only believed when every component of the qualified name is quoted.
-    Where the scan invented one from bare tokens, `cross-schema-write` accused files
-    that never name a schema, and it is the one accusation in this path that costs an
-    engineer an afternoon (PRO-179 review NB-3). `ledger-table` and `table-not-allowed`
-    still fire on the table name, which is what a reviewer acts on. A name is never
-    dropped for spelling a keyword when the policy or the ledger actually has a table
-    of that name (PRO-179 review NB-4).
+    A schema is believed only when the writer quoted the half that claims one, which is
+    what `_ident_parts()` / `_schema_of()` decide from the token's own backticks. Where
+    the scan invented one from bare tokens, `cross-schema-write` accused files that never
+    name a schema, and it is the one accusation in this path that costs an engineer an
+    afternoon (PRO-179 review NB-3); where it dropped one the file did quote, the report
+    lost the accusation instead (PRO-179 review rank 1). `ledger-table` and
+    `table-not-allowed` still fire on the table name, which is what a reviewer acts on.
+    A name is never dropped for spelling a keyword when the policy or the ledger actually
+    has a table of that name (PRO-179 review NB-4).
 
     What a bare-name scan cannot tell is an index hint: `USE INDEX (idx)` contributes
     `idx` as a name. That is noise in a message about a statement that is already
@@ -1092,7 +1139,7 @@ def _region_tables(masked: str, lo: int, hi: int, from_end: int | None = None,
         parts = _ident_parts(token)
         if not parts:
             return None
-        schema, table = split_qualified(token)
+        table = split_qualified(token)[1]
         if not table:
             return None
         tbl_bare = not _is_quoted(parts[-1])
@@ -1100,8 +1147,9 @@ def _region_tables(masked: str, lo: int, hi: int, from_end: int | None = None,
         # policy table whose real name spells a keyword is not noise.
         if tbl_bare and table.lower() in REGION_NAME_STOPWORDS and table.lower() not in known:
             return None
-        if not all(_is_quoted(p) for p in parts):
-            schema = None
+        # Believed only when the writer quoted the half that claims a schema; `parts`
+        # is the only thing left here that still knows where the backticks were.
+        schema = _schema_of(parts)
         return table.lower(), (schema, table), tbl_bare
 
     parsed: list[tuple[bool, list[tuple[int, str, tuple[str | None, str], bool]]]] = []
@@ -1888,13 +1936,14 @@ class Preflight:
         targets, qualifiers, err, region, heuristic = write_targets(st, known)
         if err:
             extra = ", ".join(sorted({t for _, t in targets})) or "none identifiable"
-            # The bare-name scan also harvests ON-clause columns and operators, so a
-            # name list it produced is labelled as the hint it is rather than passed off
-            # as a parsed table list (PRO-179 review NB-3).
-            label = "tables named (heuristic — unquoted region)" if heuristic else "tables named"
-            named = f"{label}: {extra}"
+            # Both name lists come out of the same bare-name scan, so both carry the
+            # same caveat: it cannot tell a table from an `ON`-clause column or an index
+            # hint. Labelling only the table list left `other names in region` reading
+            # as parsed fact (PRO-179 review rank 4).
+            suffix = " (heuristic — unquoted region)" if heuristic else ""
+            named = f"tables named{suffix}: {extra}"
             if qualifiers:
-                named += f"; other names in region: {', '.join(sorted(qualifiers))}"
+                named += f"; other names in region{suffix}: {', '.join(sorted(qualifiers))}"
             bad("multi-table-write",
                 f"{st.verb} is not a single-table write: {err} (write region {region!r}; "
                 f"{named}). Split it into one statement per table, each "
