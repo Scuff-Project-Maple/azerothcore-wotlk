@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -1290,6 +1291,40 @@ class Preflight:
         declared = gp.strip()
         return declared if self._resolve_git_path(declared).exists() else ""
 
+    # One bounded chunk: enough for any reflog line or FETCH_HEAD record, and the
+    # reason a pathological file cannot make this probe read forever (review N4).
+    _OBSERVATION_READ_CAP = 1 << 16
+
+    def _file_observations(self, path: Path) -> bool:
+        """Does the file at `path` hold anything other than whitespace?
+
+        Presence is not observation (PRO-301 review N1). `git update-ref` creates
+        `logs/<ref>` and a fetch that changes nothing can leave it empty, so a 0-byte
+        file is a file, not a record of anything having happened. The same question
+        applies to `FETCH_HEAD` (review N2): `exists()` alone was buying the word
+        "fetched" from an empty file, one level up from the reflog the review named.
+
+        The read is bounded (review N4). Every other probe here goes through
+        `_git(..., timeout=60)`; a bare `open()` on a path git reports would block the
+        boot indefinitely on a fifo at `.git/logs/<ref>` — silently, holding the
+        single-writer lease, with the server never starting. So `stat` answers first,
+        anything that is not a regular file answers False, and at most one capped chunk
+        is ever read. An unreadable file answers False, because the claim the gate then
+        withholds is its own.
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+            return False
+        try:
+            with open(path, "rb") as fh:
+                chunk = fh.read(self._OBSERVATION_READ_CAP)
+        except OSError:
+            return False
+        return bool(chunk.strip())
+
     def _reflog_observations(self, declared: str) -> bool:
         """Does the reflog at `declared` hold at least one entry?
 
@@ -1298,20 +1333,12 @@ class Preflight:
         reflog is a file, not a record of the ref having been here — the same
         distinction PRO-291 review B1 drew for the sibling probe, one level down.
         Presence still fails closed via `_reflog_path()`; what an empty file may not
-        do is support the deletion half of the sentence. An unreadable file answers
-        False, because the claim the gate then withholds is its own.
+        do is support the deletion half of the sentence. See `_file_observations()` for
+        the bounded read and why an unreadable answer is False.
         """
         if not declared:
             return False
-        try:
-            with self._resolve_git_path(declared).open("r", encoding="utf-8",
-                                                       errors="replace") as fh:
-                for line in fh:
-                    if line.strip():
-                        return True
-        except OSError:
-            return False
-        return False
+        return self._file_observations(self._resolve_git_path(declared))
 
     def upstream_ref_setting(self) -> tuple[str | None, str]:
         """(verifiedRef, refreshCommand) from policy, with a derived fetch hint."""
@@ -1359,7 +1386,9 @@ class Preflight:
           deletes it again, so on its own it only catches a ref removed some other
           way (a loose-ref `rm`, a rename). It is the signal the review named, so it
           is checked; it is not sufficient, which is why the other two are here.
-        - `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not.
+        - `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not —
+          and which counts as a fetch only when it holds something, for the same reason
+          the reflog does (review N2).
         - any sibling ref under the same `refs/remotes/<remote>/` namespace other
           than `<remote>/HEAD` that carries **its own reflog**. The reflog is the
           point: `git clone` populates `refs/remotes/<remote>/*` itself, so a sibling
@@ -1372,8 +1401,9 @@ class Preflight:
         `certainty` says how far the evidence actually reaches: 'held' when this
         clone holds `ref`'s own reflog **with at least one entry in it**, which is a
         record of *this* ref having been here; 'fetched' when the strongest signal is
-        someone else's — a FETCH_HEAD or a sibling reflog with entries — which proves
-        the clone has fetched but not that the configured ref ever arrived; and
+        someone else's — a FETCH_HEAD with a record in it or a sibling reflog with
+        entries — which proves the clone has fetched but not that the configured ref
+        ever arrived; and
         'unobserved' when every trace is an empty file, which proves nothing at all
         but still fails closed. Callers must not assert a deletion on anything but
         'held', and must not claim a fetch on 'unobserved' either (PRO-301 review N1).
@@ -1391,9 +1421,18 @@ class Preflight:
                              f"is a file rather than a record of it having been here")
         rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
         if rc == 0 and fp.strip():
-            if self._resolve_git_path(fp.strip()).exists():
-                found.append(f"{fp.strip()} is here, so this clone has fetched")
+            # Review N2: `exists()` alone bought the word "fetched" from an empty file,
+            # which is the conflation review N1 just fixed one level up. An empty
+            # FETCH_HEAD is still a trace a never-fetched clone does not have, so it
+            # keeps the FAIL as an unobserved question; it does not earn the claim.
+            declared = fp.strip()
+            if self._file_observations(self._resolve_git_path(declared)):
+                found.append(f"{declared} is here and holds a fetch record, so this "
+                             f"clone has fetched")
                 fetched = True
+            elif self._resolve_git_path(declared).exists():
+                found.append(f"{declared} exists but holds nothing, which is a file "
+                             f"rather than a record of a fetch")
         if ref.startswith("refs/remotes/"):
             remote = ref[len("refs/remotes/"):].partition("/")[0]
             ns = f"refs/remotes/{remote}/"
@@ -1601,16 +1640,20 @@ class Preflight:
                     # either — it is a question, and a question fails closed without a
                     # story attached to it.
                     verdict = (f"{ref} is not present locally and nothing in this clone "
-                               f"records that it ever arrived ({why}); a reflog file "
-                               f"with no entries in it records nothing either way, so "
-                               f"the gate will neither assert a deletion it did not "
-                               f"observe nor grant the upstream exemption on the "
-                               f"question")
+                               f"records that it ever arrived ({why}); a file with "
+                               f"nothing in it — an empty reflog, an empty FETCH_HEAD — "
+                               f"records nothing either way, so the gate will neither "
+                               f"assert a deletion it did not observe nor grant the "
+                               f"upstream exemption on the question")
                 else:
-                    verdict = (f"{ref} is not present locally and has no reflog of its "
-                               f"own, while this clone does have fetch history ({why}), "
-                               f"so the ref was either deleted after it arrived or "
-                               f"never existed in this clone")
+                    # PRO-301 review N1: on this tier the own reflog may well be a file
+                    # that exists and holds nothing — the evidence list says so in the
+                    # parenthetical. "No reflog of its own" would contradict it; what the
+                    # gate did not observe is an *entry*.
+                    verdict = (f"{ref} is not present locally and has no reflog entry of "
+                               f"its own, while this clone does have fetch history "
+                               f"({why}), so the ref was either deleted after it arrived "
+                               f"or never existed in this clone")
                 if self.allow_missing_upstream_ref():
                     return (self.REF_UNCHECKED,
                             f"{verdict}; --allow-missing-upstream-ref was passed, which "
@@ -1790,9 +1833,9 @@ class Preflight:
                 evidence = "a ref that this clone demonstrably had and no longer does " \
                            "is not that"
             elif cert == "unobserved":
-                evidence = "the only local trace is a reflog file with no entries in " \
-                           "it, which records nothing, and the gate will not grant the " \
-                           "exemption on that"
+                evidence = "every local trace is a file with nothing in it — an empty " \
+                           "reflog or an empty FETCH_HEAD — which records nothing, and " \
+                           "the gate will not grant the exemption on that"
             else:
                 evidence = "this clone has fetched, so the ref either arrived and was " \
                            "deleted or never existed here, and the gate will not grant " \
@@ -1907,37 +1950,52 @@ class Preflight:
         whole run, cached. Callers must treat None as dirty: a question git
         cannot answer is not a clean bill of health.
 
-        `core.quotePath=false` is load-bearing, not cosmetic (PRO-301 review N2). It
-        defaults to true, so git answers every non-ASCII path octal-quoted —
-        `"\303\251rfar.sql"` for `érfar.sql` — and a quoted string can never equal
-        the on-disk relpath `is_dirty()` compares against. The file then reads as
-        clean, which is the one answer that keeps the fail-open dirty exemption:
-        exactly the file a hand-edit should have been caught on. The same `-z`
-        reasoning settled the `ls-tree` half of this (review B2); `status --porcelain`
-        has no `-z` per-path form that keeps the `XY ` status columns, so the config is
-        the fix. Decoding is `surrogateescape` for the same B2 reason: a path that is
-        not valid UTF-8 at all must come back byte-for-byte, or it too reads as clean.
+        `-z` is load-bearing, not cosmetic (PRO-301 review N2, B1). `git status
+        --porcelain` C-quotes a path that contains `"`, `\`, a tab, a newline, or any
+        byte git dislikes, and it does that regardless of `core.quotePath` — that config
+        only governs the >= 0x80 class, so `core.quotePath=false` leaves
+        `"data/sql/.../we\"ird.sql"` quoted and the comparison still fails. Measured on
+        git 2.43.0, the `-c` answer and the plain answer are byte-identical for those
+        names. A quoted string can never equal the on-disk relpath `is_dirty()`
+        compares against, so the file reads as clean — the one answer that keeps the
+        fail-open dirty exemption, on exactly the hand-edited upstream bytes the check
+        exists to catch. `status --porcelain -z` keeps the `XY ` columns, NUL-terminates
+        each entry, and emits paths raw even with `core.quotePath=true`, which is the
+        invariant that actually matters; it is also what settled the `ls-tree` half of
+        this (review B2). Under `-z` a rename/copy entry's original path is the *next*
+        NUL field, not `"old -> new"`. Decoding is `surrogateescape` for the same B2
+        reason: a path that is not valid UTF-8 at all must come back byte-for-byte, or
+        it too reads as clean.
         """
         cached = getattr(self, "_dirty_cache", _UNSET)
         if cached is not _UNSET:
             return cached
         paths: set | None = set()
         # Through `_git` so the "nothing in the gate reaches the network" assertion
-        # actually covers this call too (review N5), the leading global `-c` included.
-        rc, out, _err = self._git(["-c", "core.quotePath=false", "status",
-                                   "--porcelain", "--ignore-submodules=none"],
+        # actually covers this call too (review N5).
+        rc, out, _err = self._git(["status", "--porcelain", "-z",
+                                   "--ignore-submodules=none"],
                                   timeout=60, errors="surrogateescape")
         if rc is None or rc != 0:
             paths = None
         else:
-            for entry in out.splitlines():
+            fields = out.split("\0")
+            i = 0
+            while i < len(fields):
+                entry = fields[i]
+                i += 1
                 if len(entry) < 4 or entry[:2] == "!!":
                     continue
-                # R/C entries carry "old -> new"; both sides count as touched.
-                for part in entry[3:].split(" -> "):
-                    part = part.strip().strip('"')
-                    if part:
-                        paths.add(Path(part).as_posix().lower())
+                # `XY <path>`; under `-z` the path is raw, so it is taken verbatim —
+                # no strip(), which would corrupt a name that really ends in `"`.
+                paths.add(Path(entry[3:]).as_posix().lower())
+                # R/C entries pair with the original path in the following field.
+                if "R" in entry[:2] or "C" in entry[:2]:
+                    if i < len(fields):
+                        original = fields[i]
+                        i += 1
+                        if original:
+                            paths.add(Path(original).as_posix().lower())
         self._dirty_cache = paths
         return paths
 

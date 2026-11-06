@@ -1575,7 +1575,13 @@ class TestUpstreamRefProvenance(unittest.TestCase):
 
     @staticmethod
     def _git_argv(argv):
-        """An argv with any leading global `-c key=value` pairs removed."""
+        """An argv with any leading global `-c key=value` pairs removed.
+
+        Kept defensive rather than load-bearing: `dirty_paths()` asks for raw paths with
+        `-z` now, not with a `-c` config (PRO-301 review B1), so nothing in the gate
+        leads with `-c` today. A stub that read `argv[0]` would break the moment
+        something does.
+        """
         i = 0
         while i + 1 < len(argv) and argv[i] == "-c":
             i += 2
@@ -1585,11 +1591,12 @@ class TestUpstreamRefProvenance(unittest.TestCase):
     def _git_verb(cls, argv):
         """The git verb an argv asks for, ignoring leading global `-c key=value`.
 
-        PRO-301 review N2: `dirty_paths()` now passes `-c core.quotePath=false`, so a
-        stub or a spy that reads `argv[0]` as the verb stops seeing `status` at all —
-        which is how a naive matcher silently turns "git refused" into "the work tree
-        is dirty" and, worse, how the no-network assertion stops covering the very
-        call it was extended to cover.
+        PRO-301 review N2: a stub or a spy that reads `argv[0]` as the verb can stop
+        seeing `status` at all — which is how a naive matcher silently turns "git
+        refused" into "the work tree is dirty" and, worse, how the no-network assertion
+        stops covering the very call it was extended to cover. This is only the verb
+        *parser*; the no-network check itself is an allowlist (review N3), because a
+        leading `-C`/`--git-dir=`/`--exec-path=` would hide the verb from anything.
         """
         rest = cls._git_argv(argv)
         return rest[0] if rest else ""
@@ -2085,6 +2092,101 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         msg = next(m for r, m in fails if r == "upstream-ref-deleted")
         self.assertNotIn("this clone has fetched", msg)
 
+    def test_an_empty_own_reflog_with_a_real_fetch_head_stays_fetched(self):
+        # PRO-301 review N5, the twin the ladder needs: the own reflog holds nothing but
+        # FETCH_HEAD does, so certainty must climb to 'fetched' and must not be dragged
+        # down to 'unobserved' by the empty file beside it. Review N1 is the other half
+        # of this test — on that tier the gate has a reflog *file* and no reflog *entry*,
+        # and the sentence has to say the second thing while the evidence list names the
+        # first.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD", ""), namespace=(0, "", ""))
+        self._empty_own_reflog(d, "refs/remotes/origin/Absent")
+        (d / ".git" / "FETCH_HEAD").write_text(
+            "abc123\t\tbranch 'Playerbot' of origin\n")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual("fetched", up["wasTrackedCertainty"],
+                         "a real FETCH_HEAD was over-corrected by the empty reflog "
+                         "beside it")
+        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+        _state, detail, _cause = pf.upstream_ref_state(p)
+        self.assertIn("holds no entries", detail,
+                      "the evidence list stopped naming the empty reflog file")
+        self.assertIn("no reflog entry of its own", detail)
+        self.assertNotIn("has no reflog of its own", detail,
+                         "the sentence contradicts the evidence beside it")
+        self._run(pf, self._file(d, p))
+        self.assertTrue(pf.r.failed)
+
+    def test_an_empty_fetch_head_fails_closed_without_claiming_a_fetch(self):
+        # PRO-301 review N2: the same presence/observation conflation one level up. A
+        # 0-byte FETCH_HEAD is a file `exists()` says yes to, and `exists()` alone was
+        # buying the word "fetched". It stays a trace — so the boot is still refused —
+        # but it earns neither the fetch claim nor the deletion claim.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD", ""), namespace=(0, "", ""))
+        (d / ".git" / "FETCH_HEAD").write_bytes(b"")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"],
+                        "an empty FETCH_HEAD was read as a clone that never fetched")
+        self.assertEqual("unobserved", up["wasTrackedCertainty"],
+                         "an empty FETCH_HEAD was allowed to claim a fetch")
+        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertTrue(pf.r.failed, "an empty FETCH_HEAD let the exemption through")
+        msg = next(m for r, m in fails if r == "upstream-ref-deleted")
+        self.assertNotIn("this clone has fetched", msg)
+        self.assertIn("records nothing", msg)
+
+    def test_a_reflog_that_is_not_a_regular_file_answers_that_nothing_was_observed(self):
+        # PRO-301 review N4: every other probe here is a `git` call with a 60s timeout.
+        # These two are bare file reads, so a fifo at `logs/<ref>` — which `open()` waits
+        # on for a writer that never comes — would hang the boot gate silently while it
+        # holds the single-writer lease. The alarm is the failure mode: without the
+        # stat-first guard this test dies on the signal instead of on an assertion.
+        import os
+        import signal
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        logs = d / ".git" / "logs" / "refs" / "remotes" / "origin" / "Absent"
+        logs.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(logs))
+        self.addCleanup(lambda: logs.unlink(missing_ok=True))
+
+        def on_alarm(signum, frame):
+            raise AssertionError("the reflog probe blocked on a non-regular file")
+
+        previous = signal.signal(signal.SIGALRM, on_alarm)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        signal.alarm(10)
+        try:
+            self.assertFalse(pf._file_observations(logs),
+                             "a fifo was read as a record of something")
+            up = pf.upstream_ref()
+        finally:
+            signal.alarm(0)
+        self.assertTrue(up["wasTracked"],
+                        "a fifo where the reflog belongs was read as a never-fetched clone")
+        self.assertEqual("unobserved", up["wasTrackedCertainty"])
+        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+
     # -- PRO-301 review N2: git quoting a path out of the dirty exemption ---------- #
 
     def test_a_dirty_non_ascii_path_is_not_read_as_clean(self):
@@ -2129,31 +2231,105 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertTrue(pf.is_dirty(p),
                         "a path git cannot decode was reported clean by replacement")
 
-    def test_the_dirty_check_is_the_call_that_turns_off_path_quoting(self):
-        # The stub shape that tells the two answers apart on one repository: git quotes
-        # by default and answers plainly only under `-c core.quotePath=false`, so a
-        # regression that drops the flag flips is_dirty() to clean here.
+    def test_the_dirty_check_is_the_call_that_asks_git_for_raw_paths(self):
+        # PRO-301 review B1: the property worth pinning is "paths come back raw whatever
+        # the clone's core.quotePath says", not "we pass a config flag". Plain porcelain
+        # C-quotes `"` and `\` even under `-c core.quotePath=false`, so only `-z` is
+        # config-independent. The stub is the discriminator: it answers `-z` with raw
+        # NUL-separated fields and any other call with the quoted line real git prints
+        # without `-z`, and the negative control below shows the parser does not rescue
+        # that quoted line — so a regression that drops `-z` flips is_dirty() to clean
+        # right here.
         d = self._repo()
-        rel = f"{self.UP_REL}/2026_11_04_00_érfar.sql"
+        rel = f'{self.UP_REL}/2026_11_04_00_we"ird.sql'
         p = self._commit(d, rel, self.IN_BAND)
         pf = self._pf(d)
-        quoted = '"data/sql/updates/db_world/2026_11_04_00_\\303\\251rfar.sql"'
+        quoted = ' M "data/sql/updates/db_world/2026_11_04_00_we\\"ird.sql"'
         calls = []
 
         def fake(argv, timeout=60, errors="replace"):
             calls.append(list(argv))
             if self._git_verb(argv) == "status":
-                if "core.quotePath=false" in argv:
-                    return 0, f" M {rel}", ""
-                return 0, f" M {quoted}", ""
+                if "-z" in argv:
+                    return 0, f" M {rel}\0", ""
+                return 0, quoted, ""
             return 128, "", f"stub refused {argv}"
 
         pf._git = fake
         self.assertTrue(pf.is_dirty(p),
                         "the gate took git's quoted path as a clean work tree")
-        self.assertTrue(any(c[:2] == ["-c", "core.quotePath=false"] and
-                            self._git_verb(c) == "status" for c in calls),
-                        "status was never asked unquoted")
+        self.assertTrue(any(self._git_verb(c) == "status" and "-z" in c
+                            for c in calls),
+                        "status was never asked NUL-delimited")
+        self.assertFalse(any("core.quotePath" in " ".join(c) for c in calls),
+                         "the fix went back to a config flag, which git ignores for "
+                         "C-quoted names")
+        naive = self._pf(d)
+        naive._git = lambda argv, timeout=60, errors="replace": (
+            (0, quoted, "") if self._git_verb(argv) == "status"
+            else (128, "", f"stub refused {argv}"))
+        self.assertFalse(naive.is_dirty(p),
+                         "the parser rescued the quoted path, so the `-z` assertion "
+                         "above would be testing the stub")
+
+    def test_a_dirty_path_git_would_quote_is_not_read_as_clean(self):
+        # PRO-301 review B1: the érfar repro above fixes the character class that
+        # happened to be in the repro, not the mechanism. `core.quotePath` governs only
+        # bytes >= 0x80; git still C-quotes `"`, `\`, a tab and a newline regardless of
+        # it, so each name here was a hand-edited upstream file the gate called clean
+        # and left exempt. Plain porcelain is the fixture guard — if git ever stops
+        # quoting these, this test stops testing anything and says so.
+        import subprocess
+        d = self._repo()
+        shapes = {
+            "quote": 'we"ird.sql',
+            "trailing-quote": 'tail".sql',
+            "quote-at-end": 'quote_at_end.sql"',
+            "space-at-end": "pad.sql ",
+            "backslash": "back\\slash.sql",
+            "tab": "tab\tchar.sql",
+            "newline": "nl\nname.sql",
+            "space": "sp ace.sql",
+        }
+        edited = {}
+        for label, name in shapes.items():
+            rel = f"{self.UP_REL}/2026_11_04_00_{name}"
+            edited[label] = (rel, self._commit(d, rel, self.IN_BAND))
+        for _label, (_rel, path) in edited.items():
+            path.write_text(self.OUT_OF_BAND, encoding="utf-8")
+        raw = subprocess.run(["git", "status", "--porcelain"], cwd=str(d),
+                             stdout=subprocess.PIPE, text=True,
+                             timeout=60).stdout
+        self.assertIn('\\"', raw, "git stopped quoting a quote character")
+        self.assertIn("\\\\", raw, "git stopped quoting a backslash")
+        self.assertIn("sp ace.sql", raw, "git stopped quoting a space")
+        pf = self._pf(d)
+        for label, (rel, path) in edited.items():
+            with self.subTest(label):
+                self.assertIn(rel.lower(), pf.dirty_paths())
+                self.assertTrue(pf.is_dirty(path),
+                                "a hand-edited upstream file was reported clean")
+                f = self._file(d, path)
+                f["origin"], f["provenance"] = ("upstream",
+                                                "upstream directory and author")
+                pf.check_policy([f])
+                self.assertIn("dirty-worktree",
+                              [x.rule for x in pf.r.findings if x.severity == "FAIL"],
+                              "the exemption survived a hand-edit of upstream bytes")
+
+    def test_a_dirty_rename_is_dirty_on_both_sides_of_the_name(self):
+        # Under `-z` a rename's original path is the *following* NUL field, not
+        # `"old -> new"`. Parsing it the old way loses one of the two paths, and the
+        # path that disappears is the one that used to be upstream content.
+        d = self._repo()
+        old = self._commit(d, f"{self.UP_REL}/2026_11_04_00_old name.sql", self.IN_BAND)
+        self._git(d, "mv", "--", str(old.relative_to(d)),
+                  f"{self.UP_REL}/2026_11_04_00_new name.sql")
+        pf = self._pf(d)
+        dirty = pf.dirty_paths()
+        self.assertIn(f"{self.UP_REL}/2026_11_04_00_new name.sql".lower(), dirty)
+        self.assertIn(f"{self.UP_REL}/2026_11_04_00_old name.sql".lower(), dirty,
+                      "the rename's original path vanished from the dirty set")
 
     def _watch_git_verbs(self, pf):
         """Record every git verb the gate runs, while delegating to real git."""
@@ -2172,8 +2348,13 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         # gate" is a claim about the argv the gate passes git, so it is checked at the
         # argv boundary — and it has to cover the three PRO-291 local-history probes,
         # which are the newest way to hand the boot gate a network command by accident.
-        network = {"fetch", "pull", "push", "clone", "ls-remote", "fetch-pack",
-                   "http-fetch", "http-pull", "archive", "upload-pack"}
+        # PRO-301 review N3: an allowlist, not a denylist over the first token. A
+        # denylist passes whatever it did not think to name, and `_git_verb` only skips
+        # leading `-c` pairs — a `-C`, `--git-dir=` or `--exec-path=` prefix would hide
+        # the real verb and the check would wave it through. Anything the gate has not
+        # been seen to ask for is now a failure.
+        allowed = {"cat-file", "for-each-ref", "hash-object", "log", "ls-tree",
+                   "rev-parse", "status"}
         for label, ref, prep, build in (
                 ("verified", "refs/remotes/origin/Playerbot",
                  lambda d: self._git(d, "update-ref", "refs/remotes/origin/Playerbot",
@@ -2200,8 +2381,9 @@ class TestUpstreamRefProvenance(unittest.TestCase):
                 seen = self._watch_git_verbs(pf)
                 self._run(pf, self._file(d, p))
                 self.assertEqual(
-                    [], [c for c in seen if self._git_verb(c) in network],
-                    f"the gate reached the network while deciding {label}")
+                    [], [c for c in seen if self._git_verb(c) not in allowed],
+                    f"the gate asked git for a verb this allowlist does not cover "
+                    f"while deciding {label}")
                 self.assertTrue(any(c[:1] == ["rev-parse"] for c in seen),
                                 "the probes never ran, so this checked nothing")
                 if label == "verified":
