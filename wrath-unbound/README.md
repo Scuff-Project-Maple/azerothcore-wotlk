@@ -28,10 +28,11 @@ Companion guide: `guides/unbound-wrath/Wrath-Unbound-Addon-HOWTO.md` (blob
 | `modules/mod-custom-classes/` | `modules/mod-custom-classes/` (C++ module + table DDL + core hook patch; company-authored for [PRO-9](/PRO/issues/PRO-9), not part of the installer payload) |
 | `env/dist/etc/modules/mod_ale.conf` | `env/dist/etc/modules/mod_ale.conf` |
 | `env/dist/etc/modules/mod_custom_classes.conf` | `env/dist/etc/modules/mod_custom_classes.conf` |
-| `env/dist/etc/modules/lua_scripts/unbound_mentor.lua` | `env/dist/etc/modules/lua_scripts/unbound_mentor.lua` |
+| `env/dist/etc/modules/lua_scripts/*.lua` (`unbound_mentor.lua`, `ranger_vex_gossip.lua`) | `env/dist/etc/modules/lua_scripts/` — installed by `scripts/lua-sync.sh`, never by hand |
 | `docker-compose.override.yml` | `docker-compose.override.yml` (repo root) |
 | `docker-compose.loadtest.override.yml` | `docker-compose.loadtest.override.yml` (repo root; PRO-33 load-test profile, not loaded by a plain `docker compose up`) |
 | `../scripts/compose-sync.sh` | repo `scripts/compose-sync.sh` — installs both root overrides above from these snapshots; `--check` is the pre-boot drift assertion |
+| `../scripts/lua-sync.sh` | repo `scripts/lua-sync.sh` — installs every tracked ALE Lua script above into `env/dist/etc/modules/lua_scripts/`; `--check` is the pre-boot drift assertion and also fails on a hand-placed script with no tracked source (PRO-269) |
 
 Notes:
 
@@ -48,6 +49,19 @@ Notes:
   The override also mounts the
   PRO-30 dev DB tuning `conf/mysql-dev.cnf`, which is tracked in the fork
   itself (gitignore exception `!/conf/mysql-dev.cnf`) and needs no staging.
+- `env/dist/etc/modules/lua_scripts/` here is the tracked home of the ALE
+  scripts the worldserver loads at start from the gitignored
+  `env/dist/etc/modules/lua_scripts/` (`/env/dist/*`). They are installed by
+  `scripts/lua-sync.sh` — the same snapshot-installer shape as
+  `compose-sync.sh`, added in [PRO-269](/PRO/issues/PRO-269)
+  after `ranger_vex_gossip.lua` (Ranger Vex `900200`, quests `900101`/`900102`)
+  was found live on the build host with nothing in git behind it: it had been
+  hand-placed, so a tree-driven sync or `--force-recreate` would have dropped
+  Ranger Vex's gossip with no trace and QA would have read that as a regression
+  in the change under test (PRO-163 red flag R6). Add new Lua under the
+  snapshot directory here and run the installer; never hand-place a script into
+  the deployed directory — `scripts/lua-sync.sh --check` reports such an orphan
+  as drift rather than deleting it.
 - `modules/mod-unbound` needs **no CMakeLists.txt**: with the docker build's
   `MODULES=static`, AzerothCore's `modules/CMakeLists.txt`
   (`GetModuleSourceList` → `CollectSourceFiles`) auto-collects
@@ -80,10 +94,12 @@ below). `scripts/compose-sync.sh --check` is read-only and safe as any user.
 ```bash
 cp -r wrath-unbound/modules/mod-unbound modules/
 cp -r wrath-unbound/modules/mod-custom-classes modules/
-mkdir -p env/dist/etc/modules/lua_scripts
 cp wrath-unbound/env/dist/etc/modules/mod_ale.conf env/dist/etc/modules/
 cp wrath-unbound/env/dist/etc/modules/mod_custom_classes.conf env/dist/etc/modules/
-cp wrath-unbound/env/dist/etc/modules/lua_scripts/unbound_mentor.lua env/dist/etc/modules/lua_scripts/
+# ALE Lua: install every tracked script into env/dist/etc/modules/lua_scripts/
+# (PRO-269). This WRITES, so on the build host it runs as the tree owner;
+# `--check` is the read-only pre-boot assertion and needs no sudo.
+sudo -u pira scripts/lua-sync.sh
 # root overrides are generated copies of the snapshots above (PRO-180):
 # the installer WRITES, so it runs as the tree owner; `--check` is the
 # read-only pre-boot assertion and needs no sudo
