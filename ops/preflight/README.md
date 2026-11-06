@@ -91,11 +91,49 @@ lookups only (`git ls-tree`), never a fetch:
 | ref resolved, name absent | `company` | `FAIL` `unverified-upstream-origin` naming `pending_db_world` |
 | git could not answer | `company` | `FAIL` `unverified-upstream-origin`, failing closed, naming `refreshCommand` |
 | ref does not resolve under `refs/remotes/` | `company` | `FAIL` `upstream-ref-not-remote` naming `refreshCommand` |
-| ref unset / not present locally | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
+| ref resolves but is not a commit (tree, blob, null sha) | `company` | `FAIL` `upstream-ref-not-a-commit` naming `refreshCommand` |
+| ref is gone, but this clone still has local history for it | `company` | `FAIL` `upstream-ref-deleted` naming `refreshCommand` and `--allow-missing-upstream-ref` |
+| ref unset | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
+| ref is absent and this clone has no trace of it | `upstream` | `WARN` `upstream-ref-unverified` naming `refreshCommand` |
 
-A ref that is simply missing is deliberately a `WARN` and not a `FAIL`: refusing every clone that
-has not fetched is worse than the pre-PRO-248 status quo, and the report names the command that
-restores the check. Every other answer the ref can give is a `FAIL`.
+#### `missing`, `indeterminate`, `unchecked` (PRO-291, PRO-248 review N1)
+
+"Is the ref there?" is not one question and the gate no longer answers it with one state. The
+distinction matters because `unchecked` is the only ref answer that still grants the exemption on a
+`WARN`, so anything that can be laundered into `missing` has bought back the pre-PRO-248
+directory+author rule.
+
+| state | what git actually said | what the gate does |
+| --- | --- | --- |
+| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand` |
+| `indeterminate` / `ref-deleted` | the ref is gone **but** local history says it was here | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
+| `indeterminate` / `not-a-commit` | the name resolves to an object that is not a commit — `HEAD^{tree}`, a blob, a mistyped object name, the null sha | `FAIL`, failing closed, naming `refreshCommand`. It is not missing, and calling it `missing` was the false statement that kept the exemption |
+| `indeterminate` / other | git errored, or the ref is not under `refs/remotes/` | `FAIL`, failing closed |
+
+Before PRO-291 both of the last two rows were filed as `missing`, so a `verifiedRef` pointed at a
+tree object booted a forged-author file on a `WARN` — the reason `git rev-parse --verify <ref>^{commit}`
+is no longer the existence test. It is now a two-step question: peel to a commit, and if that fails
+ask separately whether the name resolved to *anything* (`rev-parse --verify --quiet <ref>`, with
+`cat-file -t` naming what came back). Only a name that resolves to nothing at all may be `missing`.
+`git ls-tree` is never asked of a ref the gate does not trust, and none of these probes fetch.
+
+The `ref-deleted` discrimination is local history only — three signals, no network:
+
+- the ref's own reflog, at `git rev-parse --git-path logs/<ref>`;
+- `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not;
+- any sibling ref under the same `refs/remotes/<remote>/` namespace other than `<remote>/HEAD`,
+  which a fetch created (`for-each-ref`, not `show-ref` — `show-ref` matches anchored whole ref
+  names, so a bare namespace prefix answers "no refs").
+
+That set exists because the reflog alone is not enough: measured on git 2.43.0, `git update-ref -d`
+deletes the reflog along with the ref, so the exact command the review named would otherwise be
+indistinguishable from a clone that never fetched. The sibling-namespace probe is what catches it.
+A clone that has none of the three is treated as never having fetched and keeps its `WARN`.
+
+`--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
+case only. It does not rescue `not-a-commit`, any other `indeterminate` cause, or a ref that was
+genuinely never fetched — the `WARN` for that one is already granted without it, and the flag is not
+a general mute switch.
 
 `verifiedRef` is stored fully qualified, as `refs/remotes/origin/Playerbot`. A short
 `origin/Playerbot` is ambiguous: git expands `refs/heads/` before `refs/remotes/`, so a single
