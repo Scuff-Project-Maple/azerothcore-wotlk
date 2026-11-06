@@ -139,9 +139,23 @@ namespace populated and every branch sibling reflog-free; a `git fetch`, a `git 
 
 That set exists because the ref's own reflog alone is not enough: `git update-ref -d` deletes the
 reflog along with the ref, so the exact command the review named would otherwise be
-indistinguishable from a clone that never fetched. The sibling-reflog probe is what catches it, and
-`origin/HEAD` is excluded from it because a clone writes that one reflog without anyone ever
-fetching a branch.
+indistinguishable from a clone that never fetched. The sibling-reflog probe is what catches it —
+**in a clone where something was ever fetched**, which is a clone that has run `refreshCommand` at
+least once. `origin/HEAD` is excluded from the probe because a clone writes that one reflog without
+anyone ever fetching a branch.
+
+The limit of that sentence belongs in this README rather than left to inference, because what this
+section owes the operator is what the gate actually guarantees. In a clone that has **never**
+fetched, every sibling reflog is absent by construction, so
+`git update-ref -d refs/remotes/origin/Playerbot` there leaves a state identical, in everything the
+gate reads, to an honest clone of a remote that never carried the ref — and that honest clone is the
+case this section promises boots offline. The deletion is invisible in that one case, and no local
+check can separate the two; the same holds for an operator who deletes the ref and then removes
+`FETCH_HEAD` and `logs/refs/remotes/`. Saying otherwise would be the same species of over-claim
+PRO-248 review N3 removed. Telling "no fetch artifacts" apart from "never held the ref" needs a
+durable attestation written by a verified boot and checked by the next one, which is outside this
+gate. What is guaranteed is the flow the policy models: a clone that has fetched and then loses the
+ref fails closed.
 
 The three signals are not equally strong, and the report says which one it used. `ref`'s own reflog
 is a record of *this* ref having been here, so the message says it was deleted rather than never
