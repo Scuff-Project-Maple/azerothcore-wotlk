@@ -1282,14 +1282,88 @@ class Preflight:
                 refresh = "git fetch --prune"
         return ref, refresh
 
+    def allow_missing_upstream_ref(self) -> bool:
+        """Did the operator explicitly opt into the missing-ref exemption?
+
+        Off by default on the boot path. The permissive answer to "the tracked
+        upstream ref is not here" used to be inherited by simply saying nothing;
+        `--allow-missing-upstream-ref` makes it a decision that has to be typed
+        (PRO-248 review N1, opening 2).
+        """
+        return bool(getattr(self.a, "allow_missing_upstream_ref", False))
+
+    def missing_ref_evidence(self, ref: str) -> tuple[bool, str]:
+        """Has this clone ever held `ref`? (evidence, what was found) — local only.
+
+        `missing` is the one ref answer that keeps the upstream exemption, so the
+        gate has to tell "this clone has never fetched" from "the ref was here and
+        someone deleted it". Both used to produce the same WARN, which put exactly
+        one command — `git update-ref -d refs/remotes/origin/Playerbot` — between
+        the boot gate and the pre-PRO-248 directory+author exemption the author
+        forger can satisfy (PRO-248 review N1, opening 2; the same class of hole B1
+        closed for the ambiguous-name case).
+
+        Three local signals, none of which touch the network:
+
+        - the ref's own reflog, at `git rev-parse --git-path logs/<ref>`. Measured on
+          git 2.43.0: `git update-ref` *creates* that file and `git update-ref -d`
+          deletes it again, so on its own it only catches a ref removed some other
+          way (a loose-ref `rm`, a rename). It is the signal the review named, so it
+          is checked; it is not sufficient, which is why the other two are here.
+        - `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not.
+        - any sibling ref under the same `refs/remotes/<remote>/` namespace other
+          than `<remote>/HEAD`, which a fetch created. If the namespace is populated
+          but the one ref the policy is configured to trust is gone, the ref was
+          deleted or never fetched into this clone — either way the exemption is not
+          owed to it.
+
+        A genuinely never-fetched clone has none of the three and keeps its WARN.
+        """
+        found: list[str] = []
+        rc, gp, _err = self._git(["rev-parse", "--git-path", f"logs/{ref}"])
+        if rc == 0 and gp.strip():
+            lp = Path(gp.strip())
+            if not lp.is_absolute():
+                lp = self.git_root / lp
+            if lp.exists():
+                found.append(f"its reflog ({gp.strip()}) is still in this clone")
+        rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
+        if rc == 0 and fp.strip():
+            fhp = Path(fp.strip())
+            if not fhp.is_absolute():
+                fhp = self.git_root / fhp
+            if fhp.exists():
+                found.append(f"{fp.strip()} is here, so this clone has fetched")
+        if ref.startswith("refs/remotes/"):
+            remote = ref[len("refs/remotes/"):].partition("/")[0]
+            ns = f"refs/remotes/{remote}/"
+            # `for-each-ref`, not `git show-ref refs/remotes/<remote>/`: show-ref matches
+            # its arguments as anchored patterns against whole ref names, so a bare
+            # namespace prefix answers "no refs" (measured on git 2.43.0) and the
+            # namespace probe would never fire.
+            rc, body, _err = self._git(["for-each-ref", "--format=%(refname)", ns])
+            if rc == 0:
+                sibs = [ln.strip() for ln in body.splitlines() if ln.strip()]
+                sibs = [s for s in sibs if s != f"{ns}HEAD" and s != ref]
+                if sibs:
+                    found.append(f"{len(sibs)} other {ns}* refs are still in this "
+                                 f"clone, including {sibs[0]}")
+        return (bool(found), "; ".join(found))
+
     def upstream_ref(self) -> dict:
         """Resolve the tracked upstream ref once per run.
 
         Returns {state, ref, refresh, paths, blobs, pathsLower, pathsByLower, detail,
-        remoteTracked, remoteDetail} where state is 'ok' (`paths` is the set of tree
-        paths, `blobs` maps a tree path to its blob id), 'unconfigured', 'missing' or
-        'error'. A missing ref is not an error: this must never need the network, and a
-        clone that has not fetched yet still has to boot.
+        remoteTracked, remoteDetail, wasTracked, wasTrackedDetail} where state is 'ok'
+        (`paths` is the set of tree paths, `blobs` maps a tree path to its blob id),
+        'unconfigured', 'missing', 'not-a-commit' or 'error'. A missing ref is not an
+        error: this must never need the network, and a clone that has not fetched yet
+        still has to boot. A ref that resolves to something which is *not a commit* is
+        not missing either — see PRO-248 review N1 opening 1.
+
+        `wasTracked` answers "did this clone ever have the ref?" for a 'missing' ref:
+        local history only, no network — see `missing_ref_evidence()` (review N1
+        opening 2).
 
         `remoteTracked` answers "is verifiedRef under refs/remotes/?" and it fails
         closed (PRO-248 review B1). `git rev-parse --symbolic-full-name` prints nothing
@@ -1305,7 +1379,9 @@ class Preflight:
         ref, refresh = self.upstream_ref_setting()
         out = {"state": "ok", "ref": ref, "refresh": refresh, "paths": None,
                "blobs": None, "pathsLower": None, "pathsByLower": None,
-               "detail": "", "remoteTracked": True, "remoteDetail": ""}
+               "detail": "", "remoteTracked": True, "remoteDetail": "",
+               "wasTracked": False, "wasTrackedDetail": "",
+               "objectId": "", "objectType": ""}
         if not ref:
             out.update(state="unconfigured",
                        detail="policy has no upstreamProvenance.verifiedRef")
@@ -1330,8 +1406,37 @@ class Preflight:
                 if rc is None:
                     out.update(state="error", detail=f"git unavailable: {err}", paths=None)
                 elif rc != 0:
-                    out.update(state="missing",
-                               detail=f"{ref} does not exist in this clone")
+                    # `^{commit}` failing says one of two different things, and only one
+                    # of them is "this clone does not have the ref". `verifiedRef` aimed at
+                    # a tree or a blob — `refs/tags/<annotated>^{tree}`, or a mistyped
+                    # object name — fails the peel because the object it names is not a
+                    # commit, and `git rev-parse --symbolic-full-name <tree>` exits 0
+                    # printing nothing, so a tree also arrives here with remoteTracked
+                    # already False. Filing that as `missing` handed back the pre-PRO-248
+                    # directory+author exemption on a WARN (PRO-248 review N1, opening 1:
+                    # Rev's POC was a tree object and a forged-author file that booted).
+                    # Ask the separate question: does the name resolve to *any* object?
+                    rc2, oid, err2 = self._git(["rev-parse", "--verify", "--quiet", ref])
+                    if rc2 is None:
+                        out.update(state="error", detail=f"git unavailable: {err2}",
+                                   paths=None)
+                    elif rc2 == 0 and oid.strip():
+                        out.update(state="not-a-commit", objectId=oid.strip())
+                        rc3, otype, _e3 = self._git(["cat-file", "-t", ref])
+                        out["objectType"] = (otype.strip().lower()
+                                             if rc3 == 0 and otype.strip()
+                                             else "non-commit object")
+                        out["detail"] = (f"{ref} resolves to {oid.strip()[:12]}, which is "
+                                         f"a {out['objectType']}, not a commit")
+                    else:
+                        # Nothing to find at all: not a ref, not an object name.
+                        out.update(state="missing",
+                                   detail=f"{ref} does not exist in this clone")
+            if out["state"] == "missing":
+                # Review N1, opening 2: 'missing' is a WARN that keeps the exemption, so
+                # "never fetched" and "was here and got deleted" must not share it.
+                existed, why = self.missing_ref_evidence(ref)
+                out.update(wasTracked=existed, wasTrackedDetail=why)
             if out["state"] == "ok" and out["remoteTracked"]:
                 # `-z` is not cosmetic: without it git quotes every path that is not
                 # plain ASCII, so `2026_01_01_01_érfar.sql` comes back as
@@ -1371,8 +1476,21 @@ class Preflight:
 
         `cause` is the machine-readable reason behind the state so the report can name
         the right recovery: 'verified', 'absent', 'content-diverged', 'case-diverged',
-        'not-remote', 'unreadable', 'uncomparable', 'outside-tree', 'unhashable',
-        'unconfigured' or 'missing'.
+        'not-remote', 'not-a-commit', 'ref-deleted', 'unreadable', 'uncomparable',
+        'outside-tree', 'unhashable', 'unconfigured', 'missing' or 'missing-allowed'.
+
+        Three of these answer the same question — "is the ref there?" — and they are
+        not interchangeable, which is what PRO-248 review N1 was about:
+
+        - 'missing' / REF_UNCHECKED: git cannot find the name at all and this clone has
+          no local history for it. A clone that has genuinely never fetched still
+          boots, on a WARN that names `refreshCommand`.
+        - 'ref-deleted' / REF_INDETERMINATE: git cannot find the ref but local history
+          says it was here. Fail closed; `--allow-missing-upstream-ref` is the only way
+          back to the WARN, and it is a decision someone has to type.
+        - 'not-a-commit' / REF_INDETERMINATE: the name resolves to a tree, blob or other
+          non-commit object. Fail closed. It is not missing, and calling it missing was
+          the false statement that kept the exemption.
         """
         up = self.upstream_ref()
         ref = up["ref"] or "the configured upstreamProvenance.verifiedRef"
@@ -1381,8 +1499,31 @@ class Preflight:
                                         f"upstreamProvenance.verifiedRef or run "
                                         f"{up['refresh']}"), "unconfigured"
         if up["state"] == "missing":
+            if up.get("wasTracked"):
+                if self.allow_missing_upstream_ref():
+                    return (self.REF_UNCHECKED,
+                            f"{ref} is not present locally, but this clone has local "
+                            f"history for it ({up.get('wasTrackedDetail', '')}), so it was "
+                            f"deleted rather than never fetched; --"
+                            f"allow-missing-upstream-ref was passed, which opts into the "
+                            f"pre-PRO-248 exemption on that answer",
+                            "missing-allowed")
+                return (self.REF_INDETERMINATE,
+                        f"{ref} is not present locally, but this clone has local history "
+                        f"for it ({up.get('wasTrackedDetail', '')}), so it was deleted "
+                        f"rather than never fetched",
+                        "ref-deleted")
             return (self.REF_UNCHECKED,
                     f"{ref} is not present locally; run {up['refresh']}", "missing")
+        if up["state"] == "not-a-commit":
+            # The name is here, it is just not a commit, so it cannot say what arrived
+            # with upstream history. That is git failing to answer, not a clone that has
+            # not fetched (PRO-248 review N1, opening 1).
+            return (self.REF_INDETERMINATE,
+                    f"{up['detail'] or (ref + ' does not peel to a commit')}; the "
+                    f"upstream exemption is a claim about commit history and a "
+                    f"{up.get('objectType') or 'non-commit'} cannot make it",
+                    "not-a-commit")
         if up["state"] == "error":
             return (self.REF_INDETERMINATE,
                     f"cannot read {ref}: {up['detail']}", "unreadable")
@@ -1515,6 +1656,36 @@ class Preflight:
                 f"the right one and is merely behind, refresh it with "
                 f"`{up['refresh']}` first. If this file is company content it "
                 f"belongs in {pending}.",
+                )
+        elif state == self.REF_INDETERMINATE and cause == "not-a-commit":
+            # Review N1, opening 1. `git rev-parse --verify <ref>^{commit}` cannot tell
+            # "no such ref" from "the ref names a tree", and the second one used to be
+            # filed as `missing`, which is a WARN that keeps the exemption.
+            bad("upstream-ref-not-a-commit",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} and the upstream exemption was about to be "
+                f"granted on {ref}: {detail}. A ref that does not peel to a "
+                f"commit cannot say what arrived with upstream history, and "
+                f"it is not a clone that has simply not fetched — `missing` "
+                f"would be a false statement about it. Point "
+                f"upstreamProvenance.verifiedRef at a remote-tracking commit "
+                f"ref, or refresh it with `{up['refresh']}`, and re-run. If "
+                f"this file is company content it belongs in {pending}.",
+                )
+        elif state == self.REF_INDETERMINATE and cause == "ref-deleted":
+            # Review N1, opening 2. Without this branch the file keeps the exemption on
+            # the word of a ref that is one `git update-ref -d` away from being gone.
+            bad("upstream-ref-deleted",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} and the upstream exemption was about to be "
+                f"granted on {ref}, which is not present in this clone: {detail}. "
+                f"A clone that has genuinely never fetched still boots on a "
+                f"WARN; a ref that this clone demonstrably had and no longer "
+                f"does is not that. Restore it with `{up['refresh']}` and "
+                f"re-run; if you are deliberately running without the ref, "
+                f"pass --allow-missing-upstream-ref so the exemption is "
+                f"opted into rather than inherited. If this file is company "
+                f"content it belongs in {pending}.",
                 )
         elif state == self.REF_INDETERMINATE:
             bad("unverified-upstream-origin",
@@ -2869,6 +3040,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--keep-scratch", action="store_true")
     ap.add_argument("--strict-all", action="store_true",
                     help="enforce the write policy on upstream-provenanced files too")
+    ap.add_argument("--allow-missing-upstream-ref", action="store_true",
+                    help="grant the upstream exemption even when the tracked "
+                         "upstreamProvenance.verifiedRef has been deleted from this clone "
+                         "(local history says it was here). Off by default: the boot path "
+                         "refuses, and a clone that has genuinely never fetched still "
+                         "boots on a WARN without it (PRO-248 review N1).")
     ap.add_argument("--policy-all", action="store_true",
                     help="same as --strict-all but keeps the origin note")
     ap.add_argument("--clean-dead-ref-max-count", type=int, default=3)
