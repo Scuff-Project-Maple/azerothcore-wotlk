@@ -68,6 +68,15 @@ unreadable history — are never exempt, and neither is an upstream file with **
 changes**: provenance is read from HEAD, so a hand edit in the work tree re claims the file for
 the policy (`dirty-worktree`) instead of letting the edit ride the exemption.
 
+That work-tree check is `git -c core.quotePath=false status --porcelain`, and the config is
+load-bearing (PRO-301 review N2). `core.quotePath` defaults to true, so git answers every non-ASCII
+path octal-quoted — `"\303\251rfar.sql"` for `érfar.sql` — and that quoted string never equals the
+name on disk, so the file reads as clean and the edit rides the exemption anyway. Plain output is
+the fail-closed direction here, which is why it is set on the command line rather than left to
+whoever cloned the repo; the output is also decoded with `surrogateescape`, for the same reason a
+path that is not valid UTF-8 at all has to come back byte-for-byte. Do not tidy either of those
+away.
+
 ### The third tag: the tracked upstream ref (PRO-248)
 
 Directory tag plus author tag is a claim about **history**, and history metadata is cheap to
@@ -158,11 +167,19 @@ gate. What is guaranteed is the flow the policy models: a clone that has fetched
 ref fails closed.
 
 The three signals are not equally strong, and the report says which one it used. `ref`'s own reflog
-is a record of *this* ref having been here, so the message says it was deleted rather than never
-fetched. A `FETCH_HEAD` or a sibling reflog only proves somebody fetched, which leaves "the remote
-never had this branch" standing; the gate still fails closed on that, but it says the ref was
-either deleted or never existed here, because a boot refusal must not assert a deletion it did not
-observe.
+**with an entry in it** is a record of *this* ref having been here, so the message says it was
+deleted rather than never fetched. A `FETCH_HEAD` or a sibling reflog only proves somebody fetched,
+which leaves "the remote never had this branch" standing; the gate still fails closed on that, but
+it says the ref was either deleted or never existed here, because a boot refusal must not assert a
+deletion it did not observe.
+
+A reflog file that is **empty** is weaker than either, and is reported as weaker (PRO-301 review
+N1). `git update-ref` creates `logs/<ref>` and a fetch that changes nothing can leave it empty, so
+`os.path.exists()` answers yes to a file that records nothing. Presence is still the fail-closed
+answer — an empty reflog is a file a clone that never fetched does not have, so the boot stays
+refused — but neither half of the old sentence is owed to it: the gate says the only local trace is
+a reflog with no entries in it, which records nothing, rather than claiming a deletion it did not
+see or a fetch it cannot show.
 
 `--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
 case only. It does not rescue `not-a-commit`, any other `indeterminate` cause, or a ref that was

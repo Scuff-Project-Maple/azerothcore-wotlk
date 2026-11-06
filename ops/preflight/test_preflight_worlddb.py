@@ -1573,6 +1573,27 @@ class TestUpstreamRefProvenance(unittest.TestCase):
 
     # --- PRO-291 / PRO-248 review N1: 'missing' is not one answer, it is three ---- #
 
+    @staticmethod
+    def _git_argv(argv):
+        """An argv with any leading global `-c key=value` pairs removed."""
+        i = 0
+        while i + 1 < len(argv) and argv[i] == "-c":
+            i += 2
+        return list(argv[i:])
+
+    @classmethod
+    def _git_verb(cls, argv):
+        """The git verb an argv asks for, ignoring leading global `-c key=value`.
+
+        PRO-301 review N2: `dirty_paths()` now passes `-c core.quotePath=false`, so a
+        stub or a spy that reads `argv[0]` as the verb stops seeing `status` at all —
+        which is how a naive matcher silently turns "git refused" into "the work tree
+        is dirty" and, worse, how the no-network assertion stops covering the very
+        call it was extended to cover.
+        """
+        rest = cls._git_argv(argv)
+        return rest[0] if rest else ""
+
     def _stub_git_shapes(self, pf, full_name=(0, "refs/remotes/origin/Playerbot", ""),
                          commit_peel=(0, "0" * 40, ""), obj=(1, "", ""),
                          obj_type=(1, "", ""), reflog_path=(0, ".git/logs/ABSENT", ""),
@@ -1595,6 +1616,7 @@ class TestUpstreamRefProvenance(unittest.TestCase):
 
         def fake(argv, timeout=60, errors="replace"):
             calls.append(list(argv))
+            argv = self._git_argv(argv)
             if argv[:2] == ["rev-parse", "--symbolic-full-name"]:
                 return full_name
             if argv[:2] == ["rev-parse", "--verify"]:
@@ -1959,6 +1981,180 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         direct = next(m for r, m in fails2 if r == "upstream-ref-deleted")
         self.assertIn("deleted rather than never fetched", direct)
 
+    # -- PRO-301 review N1: a reflog that holds nothing observed nothing ----------- #
+
+    def _empty_own_reflog(self, d, refname):
+        """Leave a 0-byte `logs/<refname>` — a file, but not a record.
+
+        `git update-ref` creates the file and a fetch that changes nothing leaves it
+        empty, which is the shape the review named: `os.path.exists()` answers yes to
+        it, so presence keeps failing closed while the sentence about a deletion has
+        to fall away.
+        """
+        logs = d / ".git" / "logs" / refname
+        logs.parent.mkdir(parents=True, exist_ok=True)
+        logs.write_bytes(b"")
+        self.assertEqual(0, logs.stat().st_size)
+        return logs
+
+    def test_a_zero_byte_reflog_still_fails_closed(self):
+        # The fail-closed half of the nit: an empty reflog is still a file a clone that
+        # never fetched does not have, so the boot stays refused.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        calls = self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        self._empty_own_reflog(d, "refs/remotes/origin/Absent")
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        self.assertTrue(up["wasTracked"],
+                        "a 0-byte reflog was read as a clone that never fetched")
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]])
+        state, _detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "ref-deleted"), (state, cause))
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed, "a 0-byte reflog let an upstream file keep the "
+                                     "exemption")
+
+    def test_a_zero_byte_reflog_does_not_assert_a_deletion(self):
+        # The wording half, on the same shape: nothing was ever written in that file,
+        # so the gate does not get to say it watched the ref go away.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        self._empty_own_reflog(d, "refs/remotes/origin/Absent")
+        up = pf.upstream_ref()
+        self.assertNotEqual("held", up["wasTrackedCertainty"],
+                            "an empty reflog was reported as a record of the ref")
+        _state, detail, _cause = pf.upstream_ref_state(p)
+        self.assertNotIn("deleted rather than never fetched", detail)
+        self._run(pf, self._file(d, p))
+        msg = next(m for r, m in self._outcomes(pf)[0] if r == "upstream-ref-deleted")
+        self.assertNotIn("so it was deleted rather than never fetched", msg)
+        self.assertIn("records nothing", msg)
+
+    def test_only_a_reflog_with_an_entry_in_it_asserts_a_deletion(self):
+        # The discriminator the two above share: byte-identical stub, one byte of
+        # difference in the file. Without this twin the empty-reflog test would also
+        # pass in a build that simply dropped the own-reflog signal altogether.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        self._write_reflog(d, "refs/remotes/origin/Absent")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual("held", up["wasTrackedCertainty"])
+        _state, detail, _cause = pf.upstream_ref_state(p)
+        self.assertIn("deleted rather than never fetched", detail)
+
+    def test_an_empty_sibling_reflog_fails_closed_without_claiming_a_fetch(self):
+        # The same nit one level down: a sibling's 0-byte reflog is the sibling's empty
+        # file, not the sibling's fetch. It still withdraws the exemption; it does not
+        # earn the sentence "this clone has fetched".
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+            namespace=(0, "refs/remotes/origin/Playerbot\n", ""),
+            reflog_paths={"logs/refs/remotes/origin/Playerbot":
+                          (0, ".git/logs/refs/remotes/origin/Playerbot", "")})
+        self._empty_own_reflog(d, "refs/remotes/origin/Playerbot")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual("unobserved", up["wasTrackedCertainty"])
+        self.assertEqual("ref-deleted", pf.upstream_ref_state(p)[2])
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertTrue(pf.r.failed)
+        msg = next(m for r, m in fails if r == "upstream-ref-deleted")
+        self.assertNotIn("this clone has fetched", msg)
+
+    # -- PRO-301 review N2: git quoting a path out of the dirty exemption ---------- #
+
+    def test_a_dirty_non_ascii_path_is_not_read_as_clean(self):
+        # `core.quotePath` defaults to true, so `git status --porcelain` answers
+        # `"\303\251rfar.sql"` for `érfar.sql`. That string can never equal the on-disk
+        # relpath, is_dirty() says clean, and the check that is supposed to withdraw the
+        # upstream exemption on hand-edited bytes withdraws nothing.
+        import subprocess
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00_érfar.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        p.write_text(self.OUT_OF_BAND, encoding="utf-8")
+        raw = subprocess.run(["git", "status", "--porcelain"], cwd=str(d),
+                             stdout=subprocess.PIPE, text=True,
+                             timeout=60).stdout
+        self.assertIn("\\303\\251rfar", raw,
+                      "the fixture stopped being the shape this test is about")
+        self.assertNotIn("érfar", raw,
+                         "git answered plainly, so nothing here tests the quoting")
+        pf = self._pf(d)
+        self.assertIn(rel.lower(), pf.dirty_paths())
+        self.assertTrue(pf.is_dirty(p),
+                        "a hand-edited non-ASCII file was reported clean")
+        f = self._file(d, p)
+        f["origin"], f["provenance"] = "upstream", "upstream directory and author"
+        pf.check_policy([f])
+        self.assertIn("dirty-worktree",
+                      [x.rule for x in pf.r.findings if x.severity == "FAIL"],
+                      "the exemption survived a hand-edit of upstream bytes")
+
+    def test_a_dirty_path_git_cannot_decode_is_not_read_as_clean(self):
+        # Review B2's surrogateescape reasoning on the work-tree side: the other way a
+        # path goes missing between git and the comparison is a decode that replaces
+        # the bytes it could not read.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00_bad\udcff_name.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        with open(p, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(self.OUT_OF_BAND)
+        pf = self._pf(d)
+        self.assertIn(rel.lower(), pf.dirty_paths())
+        self.assertTrue(pf.is_dirty(p),
+                        "a path git cannot decode was reported clean by replacement")
+
+    def test_the_dirty_check_is_the_call_that_turns_off_path_quoting(self):
+        # The stub shape that tells the two answers apart on one repository: git quotes
+        # by default and answers plainly only under `-c core.quotePath=false`, so a
+        # regression that drops the flag flips is_dirty() to clean here.
+        d = self._repo()
+        rel = f"{self.UP_REL}/2026_11_04_00_érfar.sql"
+        p = self._commit(d, rel, self.IN_BAND)
+        pf = self._pf(d)
+        quoted = '"data/sql/updates/db_world/2026_11_04_00_\\303\\251rfar.sql"'
+        calls = []
+
+        def fake(argv, timeout=60, errors="replace"):
+            calls.append(list(argv))
+            if self._git_verb(argv) == "status":
+                if "core.quotePath=false" in argv:
+                    return 0, f" M {rel}", ""
+                return 0, f" M {quoted}", ""
+            return 128, "", f"stub refused {argv}"
+
+        pf._git = fake
+        self.assertTrue(pf.is_dirty(p),
+                        "the gate took git's quoted path as a clean work tree")
+        self.assertTrue(any(c[:2] == ["-c", "core.quotePath=false"] and
+                            self._git_verb(c) == "status" for c in calls),
+                        "status was never asked unquoted")
+
     def _watch_git_verbs(self, pf):
         """Record every git verb the gate runs, while delegating to real git."""
         real = pf._git
@@ -2004,13 +2200,20 @@ class TestUpstreamRefProvenance(unittest.TestCase):
                 seen = self._watch_git_verbs(pf)
                 self._run(pf, self._file(d, p))
                 self.assertEqual(
-                    [], [c for c in seen if c and c[0] in network],
+                    [], [c for c in seen if self._git_verb(c) in network],
                     f"the gate reached the network while deciding {label}")
                 self.assertTrue(any(c[:1] == ["rev-parse"] for c in seen),
                                 "the probes never ran, so this checked nothing")
                 if label == "verified":
                     self.assertFalse(pf.r.failed,
                                      "a genuine upstream pull was refused offline")
+                    # The dirty exemption is the one answer in this table a mis-parsed
+                    # `git status` can buy, so the argv spy has to be shown to have seen
+                    # that call and not only the ref probes (PRO-301 review N2).
+                    self.assertTrue(
+                        any(self._git_verb(c) == "status" for c in seen),
+                        "the work-tree check never reached _git, so the argv spy "
+                        "covered nothing there")
 
     def test_a_missing_ref_is_not_rescued_by_the_flag_when_it_never_existed(self):
         # The flag widens the deleted-ref case only; it must not become a way to silence

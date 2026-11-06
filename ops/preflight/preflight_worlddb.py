@@ -1266,6 +1266,11 @@ class Preflight:
                 proc.stdout.decode("utf-8", errors),
                 proc.stderr.decode("utf-8", "replace").strip())
 
+    def _resolve_git_path(self, declared: str) -> Path:
+        """`git rev-parse --git-path` output as a path, relative to the git root."""
+        p = Path(declared)
+        return p if p.is_absolute() else self.git_root / p
+
     def _reflog_path(self, refname: str) -> str:
         """The path of `refname`'s reflog in this clone, or '' when it holds none.
 
@@ -1273,17 +1278,40 @@ class Preflight:
         2.43.0: `git clone` creates `refs/remotes/<remote>/*` refs itself and writes
         no reflog for them, while `git fetch`, `git pull` and `git update-ref` all
         leave one behind (PRO-291 review B1).
+
+        This answers *presence* only, which is the fail-closed question: an empty
+        reflog is still a file a clone that never fetched does not have. Whether it
+        records anything is a separate question — see `_reflog_observations()`
+        (PRO-301 review N1).
         """
         rc, gp, _err = self._git(["rev-parse", "--git-path", f"logs/{refname}"])
         if rc != 0 or not gp.strip():
             return ""
         declared = gp.strip()
-        p = Path(declared)
-        resolved = p if p.is_absolute() else self.git_root / p
-        return declared if resolved.exists() else ""
+        return declared if self._resolve_git_path(declared).exists() else ""
 
-    def _reflog_present(self, refname: str) -> bool:
-        return bool(self._reflog_path(refname))
+    def _reflog_observations(self, declared: str) -> bool:
+        """Does the reflog at `declared` hold at least one entry?
+
+        Presence is not observation (PRO-301 review N1). `git update-ref` creates
+        `logs/<ref>` and a fetch that changes nothing can leave it empty, so a 0-byte
+        reflog is a file, not a record of the ref having been here — the same
+        distinction PRO-291 review B1 drew for the sibling probe, one level down.
+        Presence still fails closed via `_reflog_path()`; what an empty file may not
+        do is support the deletion half of the sentence. An unreadable file answers
+        False, because the claim the gate then withholds is its own.
+        """
+        if not declared:
+            return False
+        try:
+            with self._resolve_git_path(declared).open("r", encoding="utf-8",
+                                                       errors="replace") as fh:
+                for line in fh:
+                    if line.strip():
+                        return True
+        except OSError:
+            return False
+        return False
 
     def upstream_ref_setting(self) -> tuple[str | None, str]:
         """(verifiedRef, refreshCommand) from policy, with a derived fetch hint."""
@@ -1342,24 +1370,30 @@ class Preflight:
         A genuinely never-fetched clone has none of the three and keeps its `WARN`.
 
         `certainty` says how far the evidence actually reaches: 'held' when this
-        clone holds `ref`'s own reflog, which is a record of *this* ref having been
-        here; 'fetched' when the strongest signal is someone else's — a FETCH_HEAD
-        or a sibling reflog — which proves the clone has fetched but not that the
-        configured ref ever arrived. Callers must not assert a deletion on 'fetched'.
+        clone holds `ref`'s own reflog **with at least one entry in it**, which is a
+        record of *this* ref having been here; 'fetched' when the strongest signal is
+        someone else's — a FETCH_HEAD or a sibling reflog with entries — which proves
+        the clone has fetched but not that the configured ref ever arrived; and
+        'unobserved' when every trace is an empty file, which proves nothing at all
+        but still fails closed. Callers must not assert a deletion on anything but
+        'held', and must not claim a fetch on 'unobserved' either (PRO-301 review N1).
         """
         found: list[str] = []
         certainty = ""
+        fetched = False
         own = self._reflog_path(ref)
         if own:
-            found.append(f"its reflog ({own}) is still in this clone")
-            certainty = "held"
+            if self._reflog_observations(own):
+                found.append(f"its reflog ({own}) is still in this clone")
+                certainty = "held"
+            else:
+                found.append(f"its reflog ({own}) exists but holds no entries, which "
+                             f"is a file rather than a record of it having been here")
         rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
         if rc == 0 and fp.strip():
-            fhp = Path(fp.strip())
-            if not fhp.is_absolute():
-                fhp = self.git_root / fhp
-            if fhp.exists():
+            if self._resolve_git_path(fp.strip()).exists():
                 found.append(f"{fp.strip()} is here, so this clone has fetched")
+                fetched = True
         if ref.startswith("refs/remotes/"):
             remote = ref[len("refs/remotes/"):].partition("/")[0]
             ns = f"refs/remotes/{remote}/"
@@ -1373,12 +1407,18 @@ class Preflight:
                 sibs = [s for s in sibs if s != f"{ns}HEAD" and s != ref]
                 # B1: a cloned sibling is not fetch evidence. Keep only siblings whose
                 # own reflog survives — the file clone leaves absent and fetch leaves.
-                sibs = [s for s in sibs if self._reflog_present(s)]
-                if sibs:
-                    found.append(f"{len(sibs)} other {ns}* refs carry a reflog in this "
-                                 f"clone, including {sibs[0]}")
+                with_log = [(s, self._reflog_path(s)) for s in sibs]
+                with_log = [(s, lp) for s, lp in with_log if lp]
+                if with_log:
+                    found.append(f"{len(with_log)} other {ns}* refs carry a reflog in "
+                                 f"this clone, including {with_log[0][0]}")
+                    # N1: and a surviving *empty* reflog is a sibling's empty file, not
+                    # a sibling's fetch. It keeps the FAIL; it does not earn the word
+                    # "fetched".
+                    if any(self._reflog_observations(lp) for _s, lp in with_log):
+                        fetched = True
         if found and not certainty:
-            certainty = "fetched"
+            certainty = "fetched" if fetched else "unobserved"
         return (bool(found), "; ".join(found), certainty if found else "")
 
     def upstream_ref(self) -> dict:
@@ -1397,8 +1437,9 @@ class Preflight:
         local history only, no network — see `missing_ref_evidence()` (review N1
         opening 2). `wasTrackedCertainty` says how far that history reaches: 'held' is
         a record of this very ref having been here, 'fetched' is proof of fetching
-        only, and the two must not be reported to the operator as the same sentence
-        (review B1/N4).
+        only, and 'unobserved' is an empty reflog file, which is proof of nothing —
+        the three must not be reported to the operator as the same sentence (review
+        B1/N4, PRO-301 review N1).
 
         `remoteTracked` answers "is verifiedRef under refs/remotes/?" and it fails
         closed (PRO-248 review B1). `git rev-parse --symbolic-full-name` prints nothing
@@ -1526,11 +1567,12 @@ class Preflight:
           no local history for it. A clone that has genuinely never fetched still
           boots, on a WARN that names `refreshCommand`.
         - 'ref-deleted' / REF_INDETERMINATE: git cannot find the ref but this clone has
-          fetch history — `ref`'s own reflog, or a FETCH_HEAD or a sibling reflog that
-          only proves somebody fetched. Fail closed; `--allow-missing-upstream-ref` is
-          the only way back to the WARN, and it is a decision someone has to type. A
+          fetch history — `ref`'s own reflog with entries in it, a FETCH_HEAD, or a
+          sibling reflog that only proves somebody fetched — or nothing but an empty
+          reflog file, which proves neither. Fail closed; `--allow-missing-upstream-ref`
+          is the only way back to the WARN, and it is a decision someone has to type. A
           plain `git clone` leaves none of the three, so a clone that has never fetched
-          still lands on 'missing' (review B1).
+          still lands on 'missing' (review B1, PRO-301 review N1).
         - 'not-a-commit' / REF_INDETERMINATE: the name resolves to a tree, blob or other
           non-commit object. Fail closed. It is not missing, and calling it missing was
           the false statement that kept the exemption.
@@ -1553,6 +1595,17 @@ class Preflight:
                     verdict = (f"{ref} is not present locally, but this clone holds "
                                f"{ref}'s own reflog ({why}), so it was deleted rather "
                                f"than never fetched")
+                elif certainty == "unobserved":
+                    # PRO-301 review N1: the file is there, nothing was ever written in
+                    # it. That is not a deletion the gate observed and it is not a fetch
+                    # either — it is a question, and a question fails closed without a
+                    # story attached to it.
+                    verdict = (f"{ref} is not present locally and nothing in this clone "
+                               f"records that it ever arrived ({why}); a reflog file "
+                               f"with no entries in it records nothing either way, so "
+                               f"the gate will neither assert a deletion it did not "
+                               f"observe nor grant the upstream exemption on the "
+                               f"question")
                 else:
                     verdict = (f"{ref} is not present locally and has no reflog of its "
                                f"own, while this clone does have fetch history ({why}), "
@@ -1730,9 +1783,16 @@ class Preflight:
             # a record of *this* ref having been here; a FETCH_HEAD or a sibling reflog
             # only proves somebody fetched, which leaves "the remote never had this
             # branch" standing. The gate must not report a deletion it did not observe.
-            if up.get("wasTrackedCertainty") == "held":
+            # PRO-301 review N1 adds the third tier: a reflog file with no entries in
+            # it is not even evidence that anybody fetched.
+            cert = up.get("wasTrackedCertainty")
+            if cert == "held":
                 evidence = "a ref that this clone demonstrably had and no longer does " \
                            "is not that"
+            elif cert == "unobserved":
+                evidence = "the only local trace is a reflog file with no entries in " \
+                           "it, which records nothing, and the gate will not grant the " \
+                           "exemption on that"
             else:
                 evidence = "this clone has fetched, so the ref either arrived and was " \
                            "deleted or never existed here, and the gate will not grant " \
@@ -1846,15 +1906,27 @@ class Preflight:
         nobody's upstream content (PRO-179 review N-3). One `git status` for the
         whole run, cached. Callers must treat None as dirty: a question git
         cannot answer is not a clean bill of health.
+
+        `core.quotePath=false` is load-bearing, not cosmetic (PRO-301 review N2). It
+        defaults to true, so git answers every non-ASCII path octal-quoted —
+        `"\303\251rfar.sql"` for `érfar.sql` — and a quoted string can never equal
+        the on-disk relpath `is_dirty()` compares against. The file then reads as
+        clean, which is the one answer that keeps the fail-open dirty exemption:
+        exactly the file a hand-edit should have been caught on. The same `-z`
+        reasoning settled the `ls-tree` half of this (review B2); `status --porcelain`
+        has no `-z` per-path form that keeps the `XY ` status columns, so the config is
+        the fix. Decoding is `surrogateescape` for the same B2 reason: a path that is
+        not valid UTF-8 at all must come back byte-for-byte, or it too reads as clean.
         """
         cached = getattr(self, "_dirty_cache", _UNSET)
         if cached is not _UNSET:
             return cached
         paths: set | None = set()
         # Through `_git` so the "nothing in the gate reaches the network" assertion
-        # actually covers this call too (review N5).
-        rc, out, _err = self._git(["status", "--porcelain",
-                                   "--ignore-submodules=none"], timeout=60)
+        # actually covers this call too (review N5), the leading global `-c` included.
+        rc, out, _err = self._git(["-c", "core.quotePath=false", "status",
+                                   "--porcelain", "--ignore-submodules=none"],
+                                  timeout=60, errors="surrogateescape")
         if rc is None or rc != 0:
             paths = None
         else:
