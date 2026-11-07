@@ -4522,9 +4522,31 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         def message(self):
             raise RuntimeError("fixture: .message is unreadable")
 
+    class _HostilePayloadFinding:
+        """A finding the *presentation* layer can read but the payload build cannot.
+
+        `render()` touches `severity/check/file/rule/message`; the machine-readable
+        half asks each finding for `__dict__` instead. That makes this the one shape
+        that fails the evidence half alone, which is what PRO-339 review NB-Rev-2 is
+        about: the build used to sit outside the guard that covers the write, so a
+        report like this escaped `main()` as a traceback.
+        """
+
+        __slots__ = ()
+
+        severity = "FAIL"
+        check = "3"
+        file = ""
+        rule = "dirty-worktree"
+        message = "unreadable to the payload build"
+
+        @property
+        def __dict__(self):
+            raise RuntimeError("fixture: __dict__ is unreadable")
+
     def _drive_main(self, stdout, stderr, *, render_raises=False, json_target="default",
                     stub_rc=None, stub_findings=True, hostile_report=False,
-                    expect_raises=False):
+                    hostile_payload=False, expect_raises=False):
         """Run the real `main()` with the gate stubbed and the operator's streams swapped.
 
         `main()` had no test before this class, which is why the first version of these
@@ -4538,7 +4560,9 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         that changes what boots — checks pass, `--json` asked for, payload unwritable —
         was untested. `stub_findings=False` makes that stub honest about a passing run
         instead of pairing an rc of 0 with a FAIL finding. `hostile_report` adds
-        `_HostileFinding` for the NB1 pins.
+        `_HostileFinding` for the NB1 pins, and `hostile_payload` adds
+        `_HostilePayloadFinding` for the PRO-339 NB-Rev-2 pin — a report the terminal can
+        still read but whose evidence half cannot be built.
 
         The `_render_or_say_why` wrapper is the ordering pin (PRO-324 NB1 corollary).
         It asks the presentation half, at the moment it runs, whether the evidence half
@@ -4554,6 +4578,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
 
         raw = self.RAW
         hostile_cls = self._HostileFinding
+        hostile_payload_cls = self._HostilePayloadFinding
 
         class StubPreflight:
             def __init__(self, args, policy, report):
@@ -4569,6 +4594,8 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                                      file=raw, rule="dirty-worktree")
                 if hostile_report:
                     self.report.findings.append(hostile_cls())
+                if hostile_payload:
+                    self.report.findings.append(hostile_payload_cls())
                 return P.EXIT_FAIL if stub_rc is None else stub_rc
 
         def boom(report, args):
@@ -4578,7 +4605,23 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         real_render_or_say_why = P._render_or_say_why
 
         def spy_render_or_say_why(report, args, payload_error=None):
-            seen["payload_existed"] = out_path is not None and out_path.is_file()
+            # Existence is not the property; complete bytes are (PRO-339 review
+            # NB-Rev-1). A write that touched the path empty and filled it after
+            # presentation used to satisfy `is_file()` while leaving the audit log
+            # holding a zero-byte "evidence" file if presentation then threw — the
+            # PRO-313 B1 failure mode wearing a disguise. So read what is actually on
+            # disk at the moment the presentation half runs and compare it later.
+            existed = False
+            content = None
+            if out_path is not None:
+                try:
+                    existed = out_path.is_file()
+                    if existed:
+                        content = out_path.read_bytes()
+                except Exception as exc:                  # a fixture may break the path
+                    seen["payload_read_error"] = type(exc).__name__
+            seen["payload_existed"] = existed
+            seen["payload_bytes"] = content
             return real_render_or_say_why(report, args, payload_error)
 
         original = (P.Preflight, P.render, P._render_or_say_why,
@@ -4623,7 +4666,9 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         return types.SimpleNamespace(rc=rc, raised=raised, payload=payload,
                                       out=stdout.value(), err=stderr.value(),
                                       fallback=fallback.value(),
-                                      payload_existed_at_render=seen.get("payload_existed"))
+                                      payload_existed_at_render=seen.get("payload_existed"),
+                                      payload_bytes_at_render=seen.get("payload_bytes"),
+                                      payload_read_error=seen.get("payload_read_error"))
 
     def test_the_payload_survives_a_stdout_that_refuses_to_flush(self):
         """PRO-313 review B1 state S2: the printed half must not cost the evidence.
@@ -4867,12 +4912,21 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertEqual(P.EXIT_ERROR, res.rc)
 
     def test_the_payload_is_on_disk_before_the_presentation_half_runs(self):
-        """PRO-324 NB1 corollary: the ordering is pinned by behaviour, on both paths.
+        """PRO-324 NB1 corollary, strengthened per PRO-339 review NB-Rev-1.
 
         Hoisting `_render_or_say_why()` above the payload write survived the old suite,
         because the ordering was only ever guaranteed by that function never raising. It
         cannot raise now, so the ordering needs its own pin: ask the presentation half,
         at the moment it runs, whether the evidence half already landed.
+
+        The first version of that pin asked `is_file()`, which the reviewer defeated with
+        a write that touched the path empty before presentation and put the real bytes
+        there afterwards — every ordering test stayed green while the audit log would
+        have held a zero-byte "evidence" file had presentation then thrown. That is the
+        PRO-313 B1 failure mode again, one layer down. So the pin now compares the bytes
+        that were on disk at presentation time against the bytes that ended up there, and
+        requires them to be a parseable verdict. Complete-before-presentation, not
+        merely-present-before-presentation.
         """
         for shape, kwargs in (("primary", {}), ("degraded", {"render_raises": True})):
             with self.subTest(shape=shape):
@@ -4881,7 +4935,63 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 self.assertTrue(res.payload_existed_at_render,
                                 f"{shape} path presented the verdict before the evidence "
                                 f"was on disk; the halves have to be written in that order")
+                self.assertIsNone(res.payload_read_error,
+                                  f"{shape} path: the payload could not even be read at "
+                                  f"presentation time ({res.payload_read_error})")
                 self.assertIsNotNone(res.payload)
+                at_render = res.payload_bytes_at_render
+                self.assertIsNotNone(at_render,
+                                     f"{shape} path: nothing readable was on disk when the "
+                                     f"verdict was presented")
+                self.assertGreater(len(at_render), 0,
+                                   f"{shape} path: the evidence file was still empty when "
+                                   f"the verdict was presented")
+                self.assertEqual(
+                    at_render, res.payload,
+                    f"{shape} path: the payload on disk at presentation time is not the "
+                    f"payload that ended up there — a file that is merely present is not "
+                    f"evidence, which is the whole claim this pin exists to make")
+                doc = json.loads(at_render.decode("ascii"))
+                self.assertIn("findings", doc,
+                              f"{shape} path: the bytes handed to the operator before "
+                              f"presentation were not a verdict")
+                self.assertEqual("fail", doc["result"])
+
+    def test_a_payload_that_cannot_be_built_refuses_the_boot_instead_of_tracing_back(self):
+        """PRO-339 review NB-Rev-2: the build is on the verdict path too, so it is guarded.
+
+        The payload dictionary is read off the report — `report.data`, `report.sections`,
+        `f.__dict__` — and that reading used to sit outside the `try` that covers the
+        write. Nothing in `fail()/warn()/info()` can produce a report that breaks it, so
+        this stays a fixture-only shape; but the same was said about the degraded listing
+        before a fixture killed it, and a raise there escaped `main()` as a traceback with
+        no stated reason. The build now lives with the write, so the outcome is the one
+        this path already knows how to report: a named evidence-write failure and a
+        refused boot, with the printed verdict intact.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               hostile_payload=True)
+        self.assertIsNone(
+            res.raised,
+            "the payload build raised back into main() — a traceback where the reason "
+            "should be, which is PRO-308 finding B one half earlier")
+        self.assertEqual(
+            P.EXIT_ERROR, res.rc,
+            "an unbuilt payload is a missing payload: the boot has to be refused, not "
+            "whatever rc the checks happened to reach")
+        err = res.err.decode("ascii")
+        self.assertIn("could not write the --json payload", err)
+        self.assertIn("evidence-write failure, not a finding about your SQL", err)
+        out = res.out.decode("ascii")
+        self.assertIn("PRO-179 world-DB updater pre-flight", out,
+                      "the evidence half failing must not cost the printed verdict")
+        self.assertIn("RESULT:", out)
+        self.assertNotIn("unaffected", out,
+                         "the degraded claim about the payload is back")
+        self.assertFalse(res.payload_existed_at_render,
+                         "a payload whose build raised must not exist at presentation time")
+        self.assertIsNone(res.payload, "a half-built payload reached the operator")
 
     def test_a_finding_with_no_rule_is_not_printed_as_none(self):
         """PRO-324 NB5 (taken): both render sites guard `f.rule` like they guard `f.file`."""

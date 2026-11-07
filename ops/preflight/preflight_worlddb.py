@@ -4177,14 +4177,21 @@ def main(argv=None) -> int:
     # a payload we cannot write must not cost the printed verdict either.
     payload_error = None
     if args.json_out:
-        payload = {
-            "result": "fail" if report.failed else "pass",
-            "args": {k: str(v) for k, v in vars(args).items()},
-            "data": report.data,
-            "sections": report.sections,
-            "findings": [f.__dict__ for f in report.findings],
-        }
+        # The build is inside the guard with the write (PRO-339 review NB-Rev-2). It is
+        # not reachable on a real `Report` — `Finding`/`Report` are plain dataclasses and
+        # `failed` is a property over `severity` — but neither was the degraded listing
+        # until a fixture proved otherwise, and a raise here would escape `main()` as a
+        # traceback: the same shape PRO-308 finding B and PRO-313 review B1 exist to
+        # forbid, one half earlier. Reading the payload off the report is therefore done
+        # where a failure becomes a named evidence-write failure instead.
         try:
+            payload = {
+                "result": "fail" if report.failed else "pass",
+                "args": {k: str(v) for k, v in vars(args).items()},
+                "data": report.data,
+                "sections": report.sections,
+                "findings": [f.__dict__ for f in report.findings],
+            }
             _write_json_payload(args.json_out, payload)
         except Exception as exc:
             payload_error = (f"preflight: could not write the --json payload to "

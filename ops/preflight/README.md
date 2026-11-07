@@ -104,11 +104,18 @@ degrades to listing the findings if `render()` itself blows up, and the degraded
 too, so a report that raises while it is being read still prints the two-line
 `PRO-179 … / RESULT: …` header instead of losing the verdict (PRO-324 NB1); that line names the
 payload's actual outcome — written, not requested, or also unwritable — rather than claiming it is
-unaffected (PRO-324 NB2); and a payload we cannot write refuses the boot with `EXIT_ERROR` rather
-than letting it through on the checks' own rc, which only bites an operator who asked for `--json`
-(PRO-324 NB4). The rule behind all
+unaffected (PRO-324 NB2); the dictionary behind that payload is built *inside* the same guard as the
+write, so a report the terminal can still read but the evidence half cannot (`report.data`,
+`report.sections`, a finding with no readable `__dict__`) becomes a named evidence-write failure
+rather than a traceback out of `main()` (PRO-339 review NB-Rev-2); and a payload we cannot write
+refuses the boot with `EXIT_ERROR` rather than letting it through on the checks' own rc, which only
+bites an operator who asked for `--json` (PRO-324 NB4). The rule behind all
 three: the payload is the half nobody can regenerate once the scratch schema is dropped, and the
-terminal echo is the half you can re-derive by re-running. `main()` still carries no bare `print()`.
+terminal echo is the half you can re-derive by re-running. Because that ordering is the last line of
+defence, the suite does not accept a mere `is_file()` at presentation time — the ordering pin reads
+the bytes that are on disk when the presentation half runs and requires them to equal the final
+payload (PRO-339 review NB-Rev-1): *complete* before presentation, not merely *present*. `main()`
+still carries no bare `print()`.
 
 ### The third tag: the tracked upstream ref (PRO-248)
 
