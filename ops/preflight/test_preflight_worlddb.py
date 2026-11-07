@@ -2358,10 +2358,13 @@ class TestUpstreamRefProvenance(unittest.TestCase):
 
     def test_an_attestation_for_another_remote_url_fails_closed(self):
         # Two clones of two different remotes can hold the same ref name; the record has
-        # to say which one earned it.
+        # to say which one earned it. The line names the ref under verification on
+        # purpose: a record that says nothing about *this* ref is `absent` whatever its
+        # bindings say (review B1), and pinning the binding needs a record that does.
         d = self._repo()
         p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
-        self._attest(d, url="https://someone.else/Playerbot.git")
+        self._attest(d, ref="refs/remotes/origin/Absent",
+                     url="https://someone.else/Playerbot.git")
         pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
         self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(1, "", ""),
                               reflog_path=(0, ".git/logs/ABSENT", ""),
@@ -2587,6 +2590,256 @@ class TestUpstreamRefProvenance(unittest.TestCase):
                               if f.rule == "upstream-ref-attestation"
                               and f.severity == "INFO"],
                          "a clone with no record reported having written one")
+
+
+    # -- PRO-300 review: the record may refuse, never exempt ---------------------- #
+
+    def _forge_ref_move(self, d, message="unrelated root"):
+        """Move the tracked ref to an unrelated root commit and hide the reflog.
+
+        The forged shape from the PRO-297/PRO-300 reviews: `git update-ref` puts the
+        remote-tracking ref on commits of the operator's choosing, and `git update-ref`
+        does create a reflog, so the file is removed to model the silent variant.
+        """
+        self._git(d, "checkout", "-q", "--orphan", "forge")
+        self._git(d, "commit", "-qm", message)
+        forged = self._git(d, "rev-parse", "HEAD")
+        self._git(d, "checkout", "-q", "-f", "master")
+        self._git(d, "update-ref", self.ATTEST_REF, forged)
+        __import__("shutil").rmtree(d / ".git" / "logs" / "refs" / "remotes",
+                                    ignore_errors=True)
+        return forged
+
+    def test_a_forged_move_behind_a_junk_record_cannot_buy_the_exemption(self):
+        # PRO-300 review, finding 1, end to end on real git objects. One appended junk
+        # line used to make the record behave as if it were simply absent on the path
+        # that ends in a write: the forged `update-ref` move booted on the exemption and
+        # this very run then stamped the forged oid as `last-verified`, while the summary
+        # told the operator the ref had been verified.
+        d = self._repo()
+        boot = self._pf(d)
+        boot.upstream_ref()
+        path = boot.attestation_file()
+        attested, when = self._attest_pair(path)
+        forged = self._forge_ref_move(d)
+        self.assertNotEqual(attested, forged)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("someone wrote a sentence here\n")
+        before = path.read_text()
+        pf = self._pf(d)
+        seen = self._watch_git_verbs(pf)
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_03.sql", self.IN_BAND)
+        up = pf.upstream_ref()
+        self.assertEqual("untrusted", up["attestation"], up["attestationDetail"])
+        self.assertEqual("junk", up["attestationCause"],
+                         "the refusal must name which check refused")
+        self.assertTrue(up["attestationRefused"],
+                        "an untrusted record acted as no record on the path that writes")
+        self.assertTrue(up["treeSkipped"])
+        self.assertEqual([], [c for c in seen if c[:1] == ["ls-tree"]],
+                         "the gate listed the tree of a ref behind an untrusted record")
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"),
+                         (state, cause), detail)
+        self.assertIn("someone wrote a sentence here", detail)
+        self.assertIn(str(path), detail)
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-attestation-untrusted", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed, "one junk line bought back the upstream exemption")
+        # The refused boot must not repair or re-stamp the record it just refused: the
+        # forged oid becoming `last-verified` is the failure this test exists for.
+        self.assertEqual(before, path.read_text(),
+                         "a refused boot rewrote the record it refused")
+        self.assertNotIn(forged, path.read_text())
+        listed = " ".join(pf.r.sections.get("4", []))
+        self.assertIn("last-verified refused", listed)
+        self.assertIn("junk", listed)
+        self.assertNotIn(f"last-verified {forged[:12]}", listed)
+
+    def test_a_record_naming_another_repo_refuses_a_ref_that_is_otherwise_there(self):
+        # The same refusal for the other shape the issue names as REF_INDETERMINATE:
+        # "oid mismatch with a ref that does exist" and a borrowed record both have to
+        # refuse on the satisfied path, not merely on the missing one.
+        d = self._repo()
+        other = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_04.sql", self.IN_BAND)
+        self._attest(d, repo=str((other / ".git").resolve()))
+        pf = self._pf(d)
+        seen = self._watch_git_verbs(pf)
+        up = pf.upstream_ref()
+        self.assertEqual("ok", up["state"])
+        self.assertEqual("untrusted", up["attestation"], up["attestationDetail"])
+        self.assertEqual("repo", up["attestationCause"])
+        self.assertTrue(up["attestationRefused"])
+        self.assertEqual([], [c for c in seen if c[:1] == ["ls-tree"]],
+                         "a ref behind a borrowed record was still asked for its tree")
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-attestation-untrusted", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed,
+                        "a borrowed record was ignored because the ref happened to be there")
+
+    def test_a_record_with_no_repo_binding_is_not_trusted(self):
+        # Review N5: a record that never says which clone earned it is not one this gate
+        # wrote, and `write_attestation()` now refuses to produce one for exactly this
+        # reason. Compared only when git can name this tree's common dir.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._attest(d, ref="refs/remotes/origin/Absent", repo=None)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+                              reflog_path=(0, ".git/logs/ABSENT", ""),
+                              fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+                              namespace=(0, "", ""), common_dir=(0, ".git", ""))
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"), (state, cause),
+                         detail)
+        self.assertIn("repo", detail)
+
+    def test_the_gate_writes_no_record_it_cannot_bind(self):
+        # The write side of the same rule, and the `repo unknown` nit: an unbound record
+        # is read back as untrusted, so writing one would only manufacture a FAIL.
+        import tempfile
+        d = self._repo()
+        head = self._git(d, "rev-parse", self.ATTEST_REF)
+        pf = self._pf(d)
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, state_dir, ignore_errors=True)
+        pf.a.preflight_state_dir = str(state_dir)
+        self._stub_git_shapes(pf, full_name=(0, self.ATTEST_REF, ""),
+                              commit_peel=(0, head, ""), ls_tree=(0, "", ""))
+        up = pf.upstream_ref()
+        self.assertEqual("ok", up["state"])
+        path = pf.attestation_file()
+        self.assertEqual(state_dir / "last-verified", path)
+        self.assertFalse(path.exists(),
+                         "the gate wrote a record it could not bind to a repo")
+        self.assertIn("not written", up["attestationNote"], up["attestationNote"])
+
+    def test_a_record_the_os_will_not_hand_over_is_inert_on_a_ref_that_is_there(self):
+        # The one untrusted shape that stays inert on the satisfied path, stated as a
+        # test because it is a deliberate carve-out and not an oversight: an unreadable
+        # file is an environment accident, and AC 6 says the record must never be a
+        # precondition for booting. What earns the exemption there is the tree
+        # comparison, which still runs and still has to match.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        boot = self._pf(d)
+        boot.upstream_ref()
+        path = boot.attestation_file()
+        self.assertTrue(path.exists())
+        path.unlink()
+        path.mkdir()                      # any OSError shape will do; this one survives uid
+        try:
+            pf = self._pf(d)
+            up = pf.upstream_ref()
+            self.assertEqual("untrusted", up["attestation"], up["attestationDetail"])
+            self.assertEqual("unreadable", up["attestationCause"])
+            self.assertFalse(up["attestationRefused"],
+                             "an unreadable record refused a boot it does not disprove")
+            self.assertFalse(up["treeSkipped"])
+            self.assertIn("could not write", up["attestationNote"])
+            state, detail, cause = pf.upstream_ref_state(p)
+            self.assertEqual((pf.REF_VERIFIED, "verified"), (state, cause), detail)
+            self._run(pf, self._file(d, p))
+            fails, _ = self._outcomes(pf)
+            self.assertEqual([], [r for r, _ in fails],
+                              "a file the OS would not read stopped a verified boot")
+            self.assertFalse(pf.r.failed)
+        finally:
+            path.rmdir()
+
+    def test_a_foreign_repo_line_that_names_nothing_here_is_not_an_accusation(self):
+        # Review B1. A never-verified clone must not be failed by a record whose only
+        # `last-verified` lines name other refs, whatever common dir that file claims:
+        # the record is evidence *for* a deletion check, never a precondition for booting,
+        # and `rm` must not be the operator's only way out.
+        d = self._clone()
+        other = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        path = self._attest(d, ref="refs/remotes/origin/Other",
+                            repo=str((other / ".git").resolve()))
+        self.assertIn("repo ", path.read_text())
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual("absent", up["attestation"], up["attestationDetail"])
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_UNCHECKED, "missing"), (state, cause), detail)
+        self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual([], [r for r, _ in fails],
+                          f"a foreign record refused a boot it never covered: {fails}")
+        self.assertIn("upstream-ref-unverified", warns)
+        self.assertFalse(pf.r.failed,
+                         "the attestation had become a precondition for a boot")
+
+    def test_a_foreign_url_line_that_names_nothing_here_is_not_an_accusation(self):
+        # Review B1, the other binding. Same answer, same reason.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._attest(d, ref="refs/remotes/origin/Other",
+                     url="https://someone.else/Playerbot.git")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+                              reflog_path=(0, ".git/logs/ABSENT", ""),
+                              fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+                              namespace=(0, "", ""), common_dir=(0, ".git", ""),
+                              remote_url=(0,
+                                          "https://github.com/azerothcore/Playerbot.git",
+                                          ""))
+        up = pf.upstream_ref()
+        self.assertEqual("absent", up["attestation"], up["attestationDetail"])
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_UNCHECKED, "missing"), (state, cause), detail)
+        self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual([], [r for r, _ in fails],
+                          f"a foreign url line refused a boot it never covered: {fails}")
+        self.assertIn("upstream-ref-unverified", warns)
+        self.assertFalse(pf.r.failed)
+
+    def test_the_flag_does_not_rescue_an_oid_mismatch(self):
+        # `--allow-missing-upstream-ref` is an answer to "the ref is not here". The ref
+        # here *is* here, on a commit the record cannot account for, and a flag that
+        # looked away from that would make the flag a way to bless a forged ref.
+        d = self._repo()
+        boot = self._pf(d)
+        boot.upstream_ref()
+        self.assertTrue(boot.attestation_file().exists())
+        self._forge_ref_move(d)
+        pf = self._pf(d)
+        pf.a.allow_missing_upstream_ref = True
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_05.sql", self.IN_BAND)
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "oid-mismatch"), (state, cause), detail)
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-oid-mismatch", [r for r, _ in fails])
+        self.assertTrue(pf.r.failed,
+                        "--allow-missing-upstream-ref rescued a forged ref move")
+
+    def test_a_blank_common_dir_answer_is_no_state_directory(self):
+        # Review N3: `git rev-parse --git-common-dir` can answer successfully with
+        # nothing in the answer. That is the same unanswered question as a refusal — no
+        # state directory, never a guessed one — and must not become a finding.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        calls = self._stub_git_shapes(pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+                                      reflog_path=(0, ".git/logs/ABSENT", ""),
+                                      fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""),
+                                      namespace=(0, "", ""), common_dir=(0, "   ", ""))
+        self.assertIsNone(pf.attestation_file(),
+                          "a blank common-dir answer was read as a state directory")
+        self.assertEqual("absent", pf.upstream_ref()["attestation"])
+        self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual([], [r for r, _ in fails])
+        self.assertIn("upstream-ref-unverified", warns)
+        self.assertFalse(pf.r.failed)
+        self.assertTrue([c for c in calls if c[:2] == ["rev-parse", "--git-common-dir"]])
 
 
 class TestPolicyAuditPinsProvenance(unittest.TestCase):
