@@ -187,9 +187,13 @@ or applies SQL — read-only inspection commands do not need it.
 >   do implicitly — `ac-database` running and healthy, `acore_world.updates` /
 >   `updates_include` already populated, `ac-client-data` volume present and the
 >   last `ac-client-data-init` container exists, is not still running, and exited 0
-  — prints those as `[dep 1..3]`, prints a
+>   — prints those as `[dep 1..3]`, prints a
 >   `BOOT MODE:` line naming the mode it ran in, and prints
->   `acore_world.updates` rows before and after so a silent import cannot hide.
+>   `acore_world.updates` rows **and a ledger fingerprint** before and after, so a
+>   silent import cannot hide. The fingerprint is not decoration: `updates` is keyed
+>   by `name`, so applying a file that was already listed as `PENDING` rewrites that
+>   row and leaves the row count exactly where it was. A run that imported every
+>   pending update in the tree would otherwise print "rows unchanged".
 >   Where you **want** the one-offs (first import on a cold stack, or after a SQL
 >   change you want the updater to apply), say so: `--with-one-offs` (or
 >   `BOOT_MODE=with-one-offs`), and the log then states the boot is not read-only.
@@ -687,7 +691,7 @@ docker logs ac-worldserver | grep "ready..."
 >
 > The wrapper then prints its own `BOOT_T0`, the container's `StartedAt`,
 > `restarts`, a **since-boot** `LOG_FATAL` count next to the lifetime one, the
-> `acore_world.updates` row count before and after the boot, and a `BOOT
+> `acore_world.updates` row count **and ledger fingerprint** before and after the boot, and a `BOOT
 > VERDICT:` line. It **fails** if `--force-recreate` was asked for and
 > `StartedAt` did not move, so a lifetime counter can no longer be presented as
 > a fresh boot. `--require-ready` additionally waits for the `…(worldserver-daemon)

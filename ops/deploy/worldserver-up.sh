@@ -58,8 +58,13 @@
 #   --with-one-offs        the old behaviour: let compose create the one-offs.
 #                          Loudly legitimate when you *want* the updater to run
 #                          (after a SQL change, or a fresh stack) — the boot log
-#                          then says so, and the ledger row count printed
-#                          before/after shows whether anything was imported.
+#                          then says so, and the acore_world.updates row count
+#                          and fingerprint printed before/after show whether
+#                          anything was imported. The fingerprint matters
+#                          because `updates` is keyed by `name`: applying a file
+#                          that was already listed as PENDING rewrites that row
+#                          and leaves the row count exactly where it was, so a
+#                          count alone would call a full import "unchanged".
 #   --force-recreate       already forwarded to compose, but PRO-306 B2 makes it
 #                          load-bearing rather than cosmetic: `up -d` on a
 #                          running container is a no-op, so "boot and check
@@ -107,8 +112,9 @@
 # be called a clean boot: no worldserver container, --force-recreate that did
 # not move StartedAt, a since-boot FATAL line or an unreadable FATAL count
 # under --strict-boot, a missing ready banner under --require-ready, or — in
-# BOOT_MODE=no-deps only — acore_world.updates rows that changed or could not
-# be read on both sides (that mode's contract is that this boot ran no updater).
+# BOOT_MODE=no-deps only — acore_world.updates rows or fingerprint that changed,
+# or that could not be read on both sides (that mode's contract is that this
+# boot ran no updater, and a comparison it cannot make is not a pass).
 # docker compose's own exit code is passed through unchanged.
 # `--no-start` stays allowed (it is a real compose workflow) but the run is then
 # labelled NOT A BOOT: no ready-banner wait, no fresh-boot verdict, and the
@@ -206,6 +212,15 @@ DB_SERVICE="${DB_SERVICE:-ac-database}"
 DB_USER="${DB_USER:-root}"
 DB_PASSWORD="${DOCKER_DB_ROOT_PASSWORD:-password}"
 LEDGER_ROWS_BEFORE=""
+# `updates` is keyed by `name`, so applying a file that was already listed as
+# PENDING rewrites that row's state/hash and leaves COUNT(*) alone. A row count
+# on its own therefore cannot tell "nothing was imported" from "every pending
+# file was imported", which is the one thing BOOT_MODE=no-deps promises. The
+# fingerprint is the second read that can (PRO-306 B1).
+LEDGER_FP_BEFORE=""
+# One read, two numbers, so the "before" side costs a single client invocation
+# and cannot be a row count from one moment and a fingerprint from another.
+LEDGER_FP_SQL="SELECT CONCAT(COUNT(*),':',IFNULL(SUM(CRC32(CONCAT_WS('|',name,state,hash))),0) FROM updates)"
 
 while [[ $# -gt 0 ]]; do
   arg="$1"
@@ -527,7 +542,7 @@ assert_dependencies() {
   # a cold or half-imported database, so it fails closed; in with-one-offs mode
   # the one-offs are still coming up and a cold stack legitimately has an empty
   # ledger, so the same numbers are reported without refusing.
-  local require_ledger="$1" id status health rows inc vol init_id initrc="none" initrunning="unknown"
+  local require_ledger="$1" id status health rows inc fp vol init_id initrc="none" initrunning="unknown"
   note "dependency gate (asserting by hand what depends_on used to do silently)"
 
   id="$(compose_ps_q "$DB_SERVICE")" \
@@ -550,6 +565,14 @@ assert_dependencies() {
 
   rows="$(db_scalar acore_world 'SELECT COUNT(*) FROM updates')"
   inc="$(db_scalar acore_world 'SELECT COUNT(*) FROM updates_include')"
+  # Advisory by design. `state` and `hash` are how the updater records an apply,
+  # but a fork or an old base could shape that table differently, and a check
+  # that cannot be read must not be able to refuse a boot — the row count above
+  # is the enforced comparison, this one is the extra pair of eyes (PRO-306 B1).
+  fp="$(db_scalar acore_world "$LEDGER_FP_SQL")"
+  if [[ "$fp" =~ ^[0-9]+:[0-9]+$ ]]; then
+    LEDGER_FP_BEFORE="$fp"
+  fi
   # Only a real number may become the "before" side of the ledger comparison;
   # a client error text in that slot would later read as a changed ledger.
   if [[ "$rows" =~ ^[0-9]+$ ]]; then
@@ -566,7 +589,7 @@ assert_dependencies() {
     fi
     note "  [dep 2] updater ledger not populated yet: updates=$rows updates_include=$inc (ac-db-import will do it)"
   else
-    note "  [dep 2] updater ledger already imported: acore_world.updates rows=$rows updates_include rows=$inc"
+    note "  [dep 2] updater ledger already imported: acore_world.updates rows=$rows updates_include rows=$inc fingerprint=${LEDGER_FP_BEFORE:-not-computed}"
   fi
 
   # No `| head -n 1`: under `set -euo pipefail` a `head` that closes the pipe
@@ -777,6 +800,7 @@ ready="not-checked"
 fatal_since="not-counted"
 fatal_total="not-counted"
 ledger_after=""
+fp_after=""
 if [[ -z "$ws_id" ]]; then
   note "ac-worldserver has no container id; nothing to report a boot from."
   # Not a boot, whatever mode asked for it. The `--no-start` exemption an earlier
@@ -848,17 +872,39 @@ else
   fi
 
   ledger_after="$(db_scalar acore_world 'SELECT COUNT(*) FROM updates')"
+  fp_after="$(db_scalar acore_world "$LEDGER_FP_SQL")"
+  if [[ ! "$fp_after" =~ ^[0-9]+:[0-9]+$ ]]; then
+    fp_after=""
+  fi
   if [[ -n "$LEDGER_ROWS_BEFORE" && "$ledger_after" =~ ^[0-9]+$ ]]; then
-    if [[ "$LEDGER_ROWS_BEFORE" == "$ledger_after" ]]; then
-      note "acore_world.updates rows: before=$LEDGER_ROWS_BEFORE after=$ledger_after (unchanged — no update was imported by this boot)"
+    # The row count alone cannot see an apply. `updates` is keyed by `name`, so a
+    # file that was already listed as PENDING keeps its row when it is applied —
+    # only `state`/`hash`/`timestamp` move — and a boot that imported every
+    # pending update in the tree would still print "rows unchanged". The
+    # fingerprint is what separates "nothing was imported" from "everything was"
+    # (PRO-306 B1).
+    ledger_changed=0
+    ledger_how="rows"
+    if [[ "$LEDGER_ROWS_BEFORE" != "$ledger_after" ]]; then
+      ledger_changed=1
+    elif [[ -n "$LEDGER_FP_BEFORE" && -n "$fp_after" && "$LEDGER_FP_BEFORE" != "$fp_after" ]]; then
+      ledger_changed=1
+      ledger_how="ledger fingerprint while the row count stayed at $ledger_after"
+    fi
+    if [[ "$ledger_changed" == "0" ]]; then
+      if [[ -n "$LEDGER_FP_BEFORE" && -n "$fp_after" ]]; then
+        note "acore_world.updates: rows before=$LEDGER_ROWS_BEFORE after=$ledger_after, fingerprint before=$LEDGER_FP_BEFORE after=$fp_after (both reads unchanged — no update was imported by this boot)"
+      else
+        note "acore_world.updates rows: before=$LEDGER_ROWS_BEFORE after=$ledger_after (unchanged; the fingerprint was not readable on both sides, so an apply that only rewrote existing rows would not be visible here)"
+      fi
     elif [[ "$BOOT_MODE" == "no-deps" ]]; then
       # The contract of no-deps is literally "this boot ran no updater", so a
       # ledger that moved underneath it is a violated contract, not a colour line
       # (PRO-306 review NB-4).
-      echo "worldserver-up: REFUSING TO CALL THIS A CLEAN BOOT — acore_world.updates rows changed during a BOOT_MODE=no-deps boot (before=$LEDGER_ROWS_BEFORE after=$ledger_after). Something imported updates while this wrapper started ac-worldserver without them; find the writer before trusting the run." >&2
+      echo "worldserver-up: REFUSING TO CALL THIS A CLEAN BOOT — acore_world.updates changed by $ledger_how during a BOOT_MODE=no-deps boot (rows before=$LEDGER_ROWS_BEFORE after=$ledger_after; fingerprint before='${LEDGER_FP_BEFORE:-unknown}' after='${fp_after:-unknown}'). Something imported updates while this wrapper started ac-worldserver without them; find the writer before trusting the run." >&2
       rc=$(( rc != 0 ? rc : 4 ))
     else
-      note "acore_world.updates rows: before=$LEDGER_ROWS_BEFORE after=$ledger_after — CHANGED, which is what BOOT_MODE=with-one-offs asked for: ac-db-import ran the updater against the live acore_world during this boot."
+      note "acore_world.updates: rows before=$LEDGER_ROWS_BEFORE after=$ledger_after, fingerprint before='${LEDGER_FP_BEFORE:-unknown}' after='${fp_after:-unknown}' — CHANGED ($ledger_how), which is what BOOT_MODE=with-one-offs asked for: ac-db-import ran the updater against the live acore_world during this boot."
     fi
   else
     # An unreadable ledger on either side is not the same as an unchanged one.

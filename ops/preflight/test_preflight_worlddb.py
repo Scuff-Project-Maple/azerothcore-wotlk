@@ -3490,6 +3490,26 @@ def compose(argv):
             return 1
         if "COUNT(*) FROM updates_include" in sql:
             sys.stdout.write(env("FAKE_UPDATES_INCLUDE", "4") + "\n")
+        elif "CRC32" in sql:
+            # The advisory ledger fingerprint. It is read twice as well, with its
+            # own counter so FAKE_LEDGER_MOVED keeps meaning "a row appeared" and
+            # FAKE_LEDGER_FP_MOVED means "a row was rewritten in place" — the
+            # PENDING -> RELEASED apply a row count cannot see (PRO-306 B1).
+            if env("FAKE_FP_FAIL") == "1":
+                sys.stderr.write("ERROR 1054 (42S22): Unknown column 'hash' in 'field list'\n")
+                return 1
+            reads, sf = 0, env("FAKE_LEDGER_FP_STATE")
+            if sf and os.path.exists(sf):
+                with open(sf) as fh:
+                    reads = len(fh.read().splitlines())
+            if sf:
+                with open(sf, "a") as fh:
+                    fh.write("1\n")
+            moved = env("FAKE_LEDGER_FP_MOVED") == "1" and reads >= 1
+            sys.stdout.write("%s:%s\n" % (
+                env("FAKE_FP_ROWS", env("FAKE_UPDATES_BEFORE", "3078")),
+                env("FAKE_UPDATES_FP_AFTER", "999999") if moved
+                else env("FAKE_UPDATES_FP_BEFORE", "111111")))
         elif "COUNT(*) FROM updates" in sql:
             # read twice per run (dependency gate, then after the boot); a counter
             # file is the only way the second read can differ across processes
@@ -3623,7 +3643,8 @@ if __name__ == "__main__":
             env.update(COMPOSE_ROOT=tmp, LEASE_FILE=str(lease), PYTHON=str(gate),
                        PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
                        FAKE_STARTED=fake.pop("FAKE_STARTED", now),
-                       FAKE_LEDGER_STATE=str(Path(tmp) / "ledger"))
+                       FAKE_LEDGER_STATE=str(Path(tmp) / "ledger"),
+                       FAKE_LEDGER_FP_STATE=str(Path(tmp) / "ledger-fp"))
             env.update(fake)
             env.update(env_extra or {})
             proc = subprocess.run(["bash", str(self.WRAPPER), *argv],
@@ -3641,7 +3662,8 @@ if __name__ == "__main__":
         self.assertIn("BOOT MODE: no-deps", proc.stdout)
         self.assertIn("BOOT VERDICT: fresh boot", proc.stdout)
         self.assertIn("ready banner: seen", proc.stdout)
-        self.assertIn("before=3078 after=3078 (unchanged", proc.stdout)
+        self.assertIn("rows before=3078 after=3078", proc.stdout)
+        self.assertIn("both reads unchanged", proc.stdout)
 
     # --- B-2: an unreadable log stream is not "zero FATALs" ------------------ #
     def test_strict_boot_fails_when_docker_logs_is_unreadable(self):
@@ -3734,6 +3756,41 @@ if __name__ == "__main__":
         self.assertEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("BOOT MODE: with-one-offs", proc.stdout)
         self.assertNotIn("REFUSING TO CALL THIS A CLEAN BOOT", proc.stdout)
+
+    def test_an_applied_update_is_visible_even_when_the_row_count_is_not(self):
+        # `updates` is keyed by `name`, so the apply of a file already listed as
+        # PENDING rewrites that row and leaves COUNT(*) at 3078. A boot that only
+        # compared row counts would print "unchanged — no update was imported"
+        # over a full import, which is the false claim PRO-306 exists to remove.
+        proc = self._run(["--force-recreate"], fake={"FAKE_LEDGER_FP_MOVED": "1"})
+        self.assertEqual(proc.returncode, 4, proc.stdout)
+        self.assertIn("REFUSING TO CALL THIS A CLEAN BOOT", proc.stdout)
+        self.assertIn("fingerprint", proc.stdout)
+        self.assertNotIn("both reads unchanged", proc.stdout)
+
+    def test_an_applied_update_in_with_one_offs_mode_is_reported_not_refused(self):
+        proc = self._run(["--with-one-offs", "--force-recreate"],
+                         fake={"FAKE_LEDGER_FP_MOVED": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("CHANGED", proc.stdout)
+        self.assertIn("BOOT MODE: with-one-offs", proc.stdout)
+
+    def test_a_clean_boot_reports_both_ledger_reads(self):
+        proc = self._run(["--force-recreate"])
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("both reads unchanged", proc.stdout)
+        self.assertIn("fingerprint before=", proc.stdout)
+
+    def test_an_unreadable_fingerprint_is_advisory_and_never_refuses_a_boot(self):
+        # The fingerprint names columns the updater owns. If a base revision or a
+        # fork shapes that table differently the read fails, and an advisory check
+        # must not be able to stop every boot — the enforced comparison is the
+        # row count, and the log has to say the extra pair of eyes was shut.
+        proc = self._run(["--force-recreate"], fake={"FAKE_FP_FAIL": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("fingerprint was not readable on both sides", proc.stdout)
+        self.assertIn("[dep 2]", proc.stdout)
+        self.assertIn("fingerprint=not-computed", proc.stdout)
 
     # --- the dependency gate refuses what depends_on used to swallow --------- #
     def test_dependency_gate_refuses_a_cold_or_broken_stack(self):
