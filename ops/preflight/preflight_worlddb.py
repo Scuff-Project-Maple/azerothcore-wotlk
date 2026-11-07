@@ -1382,10 +1382,10 @@ class Preflight:
     def attestation_file(self) -> "Path | None":
         """The last-verified file for this tree, or None when it cannot be placed.
 
-        `--preflight-state-dir` overrides the location (a test or an operator running
-        the gate over a tree they do not want written inside); it is read with
-        `getattr` because callers such as `corpus_sweep.py` hand-roll an args object
-        that has no such attribute.
+        `--preflight-state-dir` names a directory to hold the record instead of the one
+        under the common dir (a test or an operator running the gate over a tree they do
+        not want written inside); it is read with `getattr` because callers such as
+        `corpus_sweep.py` hand-roll an args object that has no such attribute.
         """
         cached = getattr(self, "_attestation_file_cache", _UNSET)
         if cached is not _UNSET:
@@ -1393,7 +1393,12 @@ class Preflight:
         override = str(getattr(self.a, "preflight_state_dir", "") or "").strip()
         if override:
             p = Path(override)
-            value = p if p.is_absolute() else self.git_root / p
+            # A directory, as its name and its `--help` say, holding one file. The
+            # default location below is a file path, so the two branches have to be
+            # read carefully: an operator who points the flag at a state directory must
+            # not end up with the directory itself overwritten.
+            d = p if p.is_absolute() else self.git_root / p
+            value = d / self.ATTESTATION_FILE_NAME
         else:
             common = self.git_common_dir()
             value = None if common is None else (
@@ -1419,11 +1424,18 @@ class Preflight:
             return ""
         return out.strip()
 
+    # Which check refused an untrusted record, so the caller can tell the shapes a boot
+    # of this gate could never have produced ("junk", "version", "repo", "url") from the
+    # one that is an environment accident ("unreadable"). Only the first group refuses a
+    # ref that is otherwise there; see `upstream_ref()`.
+    ATTEST_CAUSES = ("unreadable", "junk", "version", "repo", "url")
+
     def attestation_record(self, ref: str) -> tuple[str, str, str, str, str]:
         """What the last-verified file says about `ref`.
 
-        (status, why, attestedOid, attestedAt) with status in ATTEST_ABSENT /
-        ATTEST_RECORDED / ATTEST_UNTRUSTED.
+        (status, why, attestedOid, attestedAt, cause) with status in ATTEST_ABSENT /
+        ATTEST_RECORDED / ATTEST_UNTRUSTED, and `cause` one of ATTEST_CAUSES (or ''
+        when nothing refused).
 
         Untrusted is deliberate and named, because the whole value of the record is
         that a *satisfied* gate wrote it: a file that is unparsable, unversioned,
@@ -1431,19 +1443,28 @@ class Preflight:
         names a different remote url is not that. Absent is different in kind — the
         ref has simply never been verified here, which is the pre-PRO-300 answer and
         still a WARN (AC 6).
+
+        The order of the checks is the answer to review B1. "This file says nothing
+        about `ref`" is settled before the repo and remote-url bindings are asked, so a
+        record copied in from elsewhere whose lines name only *other* refs cannot turn a
+        clone that honestly never verified this one into a FAIL — the operator's only
+        way out of that was `rm`, which is the act the record is meant to detect. What
+        is still settled first is what a record of ours can never look like: an
+        unparsable line, or a version this gate does not write.
         """
         path = self.attestation_file()
         if path is None:
             return (self.ATTEST_ABSENT,
                     "no attestation state directory could be placed for this tree",
-                    "", "")
+                    "", "", "")
         if not path.exists():
-            return self.ATTEST_ABSENT, f"no attestation file at {path}", "", ""
+            return (self.ATTEST_ABSENT, f"no attestation file at {path}",
+                    "", "", "")
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return (self.ATTEST_UNTRUSTED, f"{path} exists but could not be read ({exc})",
-                    "", "")
+                    "", "", "unreadable")
         version: int | None = None
         repo_line = ""
         url_line = ""
@@ -1473,7 +1494,7 @@ class Preflight:
         if junk:
             return (self.ATTEST_UNTRUSTED,
                     f"{path} holds {len(junk)} line(s) this gate cannot parse, "
-                    f"starting {junk[0][:80]!r}", "", "")
+                    f"starting {junk[0][:80]!r}", "", "", "junk")
         if version != self.ATTESTATION_VERSION:
             # One branch, two sentences. "It does not say what it is" and "it says
             # something this gate cannot read" are both reasons not to trust the file,
@@ -1482,7 +1503,19 @@ class Preflight:
                     "promising" if version is None else
                     f"is version {version}; this gate writes and reads version "
                     f"{self.ATTESTATION_VERSION} only")
-            return (self.ATTEST_UNTRUSTED, f"{path} {said}", "", "")
+            return (self.ATTEST_UNTRUSTED, f"{path} {said}", "", "", "version")
+        # Before the binding checks, on purpose (review B1): a record that holds nothing
+        # about `ref` says nothing about `ref` no matter whose common dir it names, and
+        # reading it as untrusted here would let a foreign file refuse a boot that the
+        # record itself never claimed to cover.
+        if mine is None:
+            return (self.ATTEST_ABSENT,
+                    f"{path} holds no `last-verified` line for {ref}", "", "", "")
+        # A record is only this tree's history if it says it is. `write_attestation()`
+        # refuses to write one it cannot bind for exactly this reason, so a record of
+        # ours always carries both lines and a file that carries neither is not one of
+        # ours (review N5 / the `repo unknown` nit). '' on either side means git could
+        # not say, which is "cannot compare", not "the file is wrong".
         common = self.git_common_dir()
         expect_repo = ""
         if common is not None:
@@ -1490,7 +1523,12 @@ class Preflight:
                 expect_repo = str(Path(common).resolve())
             except OSError:
                 expect_repo = str(common)
-        if repo_line and expect_repo:
+        if expect_repo:
+            if not repo_line:
+                return (self.ATTEST_UNTRUSTED,
+                        f"{path} names no `repo`, so this gate cannot tell which "
+                        f"clone it was earned in (this tree is {expect_repo})",
+                        "", "", "repo")
             try:
                 got_repo = str(Path(repo_line).resolve())
             except OSError:
@@ -1499,16 +1537,17 @@ class Preflight:
                 return (self.ATTEST_UNTRUSTED,
                         f"{path} was written for repo {repo_line}, not {expect_repo}: "
                         f"a record earned in another clone is not this one's history",
-                        "", "")
+                        "", "", "repo")
         want_url = self.remote_url_for_ref(ref)
-        if url_line and want_url and url_line != want_url:
+        if want_url and url_line and url_line != want_url:
+            # Compared when both sides can name a url, unlike `repo`, which is required:
+            # this gate always knows its common dir (it refuses to write a record it
+            # cannot bind) but a tree may legitimately have no remote configured, and a
+            # record written before `git remote add` is not a forgery.
             return (self.ATTEST_UNTRUSTED,
                     f"{path} was written against remote url {url_line}, but this "
-                    f"tree's remote url is {want_url}", "", "")
-        if mine is None:
-            return (self.ATTEST_ABSENT,
-                    f"{path} holds no `last-verified` line for {ref}", "", "")
-        return self.ATTEST_RECORDED, f"attested in {path}", mine[0], mine[1]
+                    f"tree's remote url is {want_url}", "", "", "url")
+        return self.ATTEST_RECORDED, f"attested in {path}", mine[0], mine[1], ""
 
     def write_attestation(self, ref: str, oid: str) -> tuple[str, str]:
         """Record "`ref` = `oid` verified now", keeping other refs' lines.
@@ -1534,6 +1573,13 @@ class Preflight:
                 repo_line = str(Path(common).resolve())
             except OSError:
                 repo_line = str(common)
+        if not repo_line:
+            # An unbound record is a liability rather than a memory: `attestation_record()`
+            # reads a record with no `repo` as one it cannot vouch for, so writing one now
+            # would only manufacture the next boot's FAIL. No binding, no record — and the
+            # boot still stands, because this is evidence *for* a later deletion check.
+            return ("could not determine this tree's git common dir; record not written",
+                    "")
         url_line = self.remote_url_for_ref(ref)
         keep: list[str] = []
         if path.exists():
@@ -1559,7 +1605,7 @@ class Preflight:
                 f"# Deleting this file does not restore the ref; it only removes the "
                 f"gate's memory of having verified it.",
                 f"version {self.ATTESTATION_VERSION}",
-                f"repo {repo_line}" if repo_line else "repo unknown"]
+                f"repo {repo_line}"]
         if url_line:
             body.append(f"remote url {url_line}")
         body.extend(keep)
@@ -1602,19 +1648,28 @@ class Preflight:
         `ok`+remote-tracking path after the tree could be listed — so a ref that is
         missing, untrustworthy or not a commit can never fabricate a record.
 
-        The one thing read here changes is the *shape* of the run: a ref whose attested
-        commit is not an ancestor of where it points now, with no reflog to explain the
-        move, is not the history this gate verified, so `upstream_ref()` does not even
-        ask `ls-tree` about it (review N4: never ask a ref the gate does not trust for
-        the list of files it vouches for).
+        Two things read here change the *shape* of the run, both of them refusals and
+        neither of them an exemption:
+
+        - a ref whose attested commit is not an ancestor of where it points now, with no
+          reflog to explain the move, is not the history this gate verified, so
+          `upstream_ref()` does not even ask `ls-tree` about it (review N4: never ask a
+          ref the gate does not trust for the list of files it vouches for);
+        - a record that is not one this gate could have written (`cause` in
+          ATTEST_CAUSES, other than `unreadable`) is refused the same way even when the
+          ref is there and peels to a commit — an untrusted record must never act as if
+          it were simply absent on the path that ends in a write, or appending one junk
+          line is all it takes to buy back the exemption and have the forged oid
+          stamped as verified (PRO-300 review, finding 1).
         """
         ref = up.get("ref") or ""
         path = self.attestation_file()
-        status, why, oid, when = self.attestation_record(ref)
+        status, why, oid, when, cause = self.attestation_record(ref)
         up["attestation"] = status
         up["attestationDetail"] = why
         up["attestedOid"] = oid
         up["attestedWhen"] = when
+        up["attestationCause"] = cause
         up["attestationPath"] = "" if path is None else str(path)
         current = up.get("oid") or ""
         if status != self.ATTEST_RECORDED or not oid or not current or oid == current:
@@ -1741,8 +1796,8 @@ class Preflight:
         Returns {state, ref, refresh, paths, blobs, pathsLower, pathsByLower, detail,
         remoteTracked, remoteDetail, wasTracked, wasTrackedDetail,
         wasTrackedCertainty, objectType, oid, attestation, attestationDetail,
-        attestedOid, attestedWhen, attestationPath, attestationNote, oidMismatch,
-        treeSkipped} where state is 'ok'
+        attestationCause, attestationRefused, attestedOid, attestedWhen,
+        attestationPath, attestationNote, oidMismatch, treeSkipped} where state is 'ok'
         (`paths` is the set of tree paths, `blobs` maps a tree path to its blob id),
         'unconfigured', 'missing', 'not-a-commit' or 'error'. A missing ref is not an
         error: this must never need the network, and a clone that has not fetched yet
@@ -1781,8 +1836,10 @@ class Preflight:
                "detail": "", "remoteTracked": True, "remoteDetail": "",
                "wasTracked": False, "wasTrackedDetail": "",
                "wasTrackedCertainty": "", "objectType": "", "oid": "",
-               "attestation": "", "attestationDetail": "", "attestedOid": "",
-               "attestedWhen": "", "attestationPath": "", "attestationNote": "",
+               "attestation": "", "attestationDetail": "", "attestationCause": "",
+               "attestationRefused": False,
+               "attestedOid": "", "attestedWhen": "", "attestationPath": "",
+               "attestationNote": "",
                "oidMismatch": None, "treeSkipped": False}
         if not ref:
             out.update(state="unconfigured",
@@ -1873,6 +1930,25 @@ class Preflight:
                         f"records it verified at {mism['attested'][:12]} on "
                         f"{out['attestedWhen']} and, since {mism['why']}, this ref "
                         f"holds no reflog of its own to explain the move")
+                cause = out.get("attestationCause") or ""
+                if (out.get("attestation") == self.ATTEST_UNTRUSTED and cause
+                        and cause != "unreadable"):
+                    # PRO-300 review, finding 1: an untrusted record must not act as if it
+                    # were simply absent on the path that ends in a write. If it did, one
+                    # appended junk line would buy back the exemption and the forged oid
+                    # would then be stamped `last-verified` by this very run. `unreadable`
+                    # is the exception and stays inert — a file the OS will not hand over
+                    # is an environment accident, and this record must never become a
+                    # precondition for booting (AC 6); what the exemption rests on here is
+                    # the tree comparison below, not the record.
+                    out["treeSkipped"] = True
+                    out["attestationRefused"] = True
+                    out["detail"] = (
+                        f"{ref} resolves to {(out.get('oid') or '')[:12]}, but the "
+                        f"last-verified record at "
+                        f"{out.get('attestationPath') or '(unknown)'} is not one this "
+                        f"gate can trust: {out.get('attestationDetail')}. Its tree was "
+                        f"not read and nothing was recorded")
             if out["state"] == "ok" and out["remoteTracked"] and not out.get(
                     "treeSkipped"):
                 # `-z` is not cosmetic: without it git quotes every path that is not
@@ -1955,9 +2031,16 @@ class Preflight:
           `refreshCommand`, or `--allow-missing-upstream-ref` to opt into the exemption
           by typing it (PRO-300).
         - 'attestation-untrusted' / REF_INDETERMINATE: a record exists and this gate
-          cannot verify it — unparsable, a version it does not understand, or written for
-          another repo or another remote url. Not a pass, and deliberately not the same
-          answer as having no record.
+          cannot verify it — an unparsable line, a version it does not understand, no
+          `repo` binding at all, or a `repo`/`remote url` naming somewhere else. Two
+          shapes reach it. The ref is missing and the record that would have said it was
+          ever here is unreadable: fail closed, and `--allow-missing-upstream-ref` does
+          not cover it, or corrupting a file would be the cheapest way back to the WARN.
+          Or the ref is *present* and the record that made its word worth taking is not
+          one this gate could have written: fail closed the same way, and `ls-tree` was
+          never asked of it. One exception, deliberate — a file the OS will not hand over
+          is inert on that second path, because the record is evidence for a later
+          deletion check and must never become a precondition for booting (AC 6).
         - 'oid-mismatch' / REF_INDETERMINATE: the ref is here but names a commit the
           attested one is not an ancestor of, and holds no reflog to explain the move as a
           force-push. A fetch fast-forwards a remote-tracking ref, so this is the shape
@@ -2049,6 +2132,16 @@ class Preflight:
                     f"{ref} is not a remote-tracking ref ({up.get('remoteDetail', '')}), "
                     f"so whoever can move it can manufacture this exemption",
                     "not-remote")
+        if up.get("attestationRefused"):
+            # PRO-300 review, finding 1. The ref is present and peels to a commit, so
+            # every PRO-291 check passes; what fails here is the record that made the
+            # ref's word worth taking. A file this gate could not have written is not
+            # entitled to a tree read, and must not be treated as the same answer as
+            # having no record at all on the path that ends in writing one.
+            return (self.REF_INDETERMINATE,
+                    up.get("detail") or (f"the last-verified record for {ref} is not one "
+                                         f"this gate can trust"),
+                    "attestation-untrusted")
         mism = up.get("oidMismatch")
         if mism and not mism.get("explained"):
             # PRO-300: "the ref is there" is not the claim the exemption rests on. The
@@ -2254,28 +2347,50 @@ class Preflight:
                 f"Restore the ref with `{up['refresh']}` and re-run; if you are "
                 f"deliberately running without it, pass "
                 f"--allow-missing-upstream-ref so the exemption is opted into "
-                f"rather than inherited. Deleting the record is not a fix: the next "
-                f"verified boot writes it again, and a record missing where one is "
-                f"expected is itself worth explaining in review. If this file is "
-                f"company content it belongs in {pending}.",
+                f"rather than inherited. Deleting the record does not restore the "
+                f"ref, and on a clone that still has the ref the next satisfied boot "
+                f"writes it again; if the ref has genuinely gone from the remote as "
+                f"well, say so in review instead of removing the gate's memory of "
+                f"having verified it. If this file is company content it belongs in "
+                f"{pending}.",
                 )
         elif state == self.REF_INDETERMINATE and cause == "attestation-untrusted":
             # Fail closed with a named basis. An unverifiable record must not be read as
             # "no record", because that makes corrupting one the cheapest route back to
-            # the exemption the record was blocking.
-            bad("upstream-ref-attestation-untrusted",
-                f"{f['rel']} is new in the upstream-tagged directory "
-                f"{db_path} and the upstream exemption was about to be "
-                f"granted on {ref}, which is not present in this clone, and the "
-                f"record that would have said whether it was ever verified here is "
-                f"not one this gate can trust: {detail}. The gate will not read an "
-                f"unverifiable record as no record at all. Restore the ref with "
-                f"`{up['refresh']}` and let a clean verified boot rewrite the "
-                f"record; if the record really is broken, say so in review, since "
-                f"an absent record is the same evidence state as never having "
-                f"verified the ref. If this file is company content it belongs in "
-                f"{pending}.",
-                )
+            # the exemption the record was blocking. Two shapes land here and they need
+            # different sentences: the ref is gone and the record that would have said so
+            # is unreadable, or the ref is here and the record behind it is a forgery.
+            path_note = up.get("attestationPath") or "(state file)"
+            if up.get("attestationRefused"):
+                bad("upstream-ref-attestation-untrusted",
+                    f"{f['rel']} is new in the upstream-tagged directory "
+                    f"{db_path} and the upstream exemption was about to be "
+                    f"granted on {ref}, which this clone does resolve, but the record "
+                    f"that makes its word worth taking is not one this gate can trust: "
+                    f"{detail}. The gate will not read an unverifiable record as no "
+                    f"record at all, so it did not ask that ref for a file listing and "
+                    f"did not stamp this boot as verified. Remove the record with "
+                    f"`rm {path_note}` and re-run: a satisfied boot writes a fresh one "
+                    f"naming this tree. Say so in review either way — an untrusted "
+                    f"record is not the same evidence state as a missing one, and only "
+                    f"the missing one is what a never-verified clone looks like. If this "
+                    f"file is company content it belongs in {pending}.",
+                    )
+            else:
+                bad("upstream-ref-attestation-untrusted",
+                    f"{f['rel']} is new in the upstream-tagged directory "
+                    f"{db_path} and the upstream exemption was about to be "
+                    f"granted on {ref}, which is not present in this clone, and the "
+                    f"record that would have said whether it was ever verified here is "
+                    f"not one this gate can trust: {detail}. The gate will not read an "
+                    f"unverifiable record as no record at all. Restore the ref with "
+                    f"`{up['refresh']}` and remove the record with `rm {path_note}` — a "
+                    f"boot does not repair a record it cannot parse, it keeps the lines "
+                    f"it was given — then let the next satisfied boot write a fresh one. "
+                    f"Say so in review, since an absent record is the same evidence "
+                    f"state as never having verified the ref. If this file is company "
+                    f"content it belongs in {pending}.",
+                    )
         elif state == self.REF_INDETERMINATE and cause == "oid-mismatch":
             # PRO-300. The ref is present, which is why PRO-291's checks all passed: it
             # is simply no longer the history this gate verified, and a tree read off a
@@ -2949,7 +3064,12 @@ class Preflight:
             # PRO-300: the operator has to be able to see which of the two answers the
             # ref verdict rested on — a record this gate wrote, or the absence of one.
             status = up.get("attestation") or ""
-            if status == self.ATTEST_RECORDED:
+            if up.get("attestationRefused"):
+                # The summary must not read as a satisfied boot: nothing was recorded
+                # this run and the ref's tree was never read.
+                ref_note += (f", last-verified refused (record untrusted: "
+                             f"{up.get('attestationCause') or 'unknown reason'})")
+            elif status == self.ATTEST_RECORDED:
                 ref_note += (f", last-verified {(up.get('attestedOid') or '')[:12]}"
                              f"@{up.get('attestedWhen')}")
             elif status:
