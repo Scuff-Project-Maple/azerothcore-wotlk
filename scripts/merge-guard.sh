@@ -93,16 +93,17 @@ safe_pattern() {
   say "tags kept for PRO-319's abandoned local line stay local."
 }
 
-# A local-branch refusal is decided before the fast-forward check, so a diverged
-# branch plus a non-fast-forward --publish SHA used to report one fault and hide
-# the other. Diagnostic only: it never changes the verdict or the exit code, and
-# an unresolvable SHA is simply not reported rather than turning exit 1 into 2.
+# A local-branch refusal is decided before the fast-forward check, so a stale
+# local branch — behind, or behind and diverged — plus a non-fast-forward
+# --publish SHA used to report one fault and hide the other. Diagnostic only: it
+# never changes the verdict or the exit code, and an unresolvable SHA is simply
+# not reported rather than turning exit 1 into 2.
 report_publish_ff_fault() {
   local sha
   sha=$(git -C "$repo" rev-parse --verify --quiet "$publish^{commit}" 2>/dev/null) || return 0
   if git -C "$repo" merge-base --is-ancestor "$remote_sha" "$sha"; then
-    say "  Also checked: --publish $publish @ ${sha:0:9} IS a fast-forward over"
-    say "  $remote/$line @ ${remote_sha:0:9}. The diverged local branch alone is what got this refused."
+    say "  Also checked: --publish $publish @ ${sha:0:9} descends from or equals"
+    say "  $remote/$line @ ${remote_sha:0:9}. The local branch '$line' alone is what got this refused."
   else
     say "  AND — --publish $publish @ ${sha:0:9} is NOT a fast-forward over"
     say "  $remote/$line @ ${remote_sha:0:9} either. The line moved too, so re-merge"
