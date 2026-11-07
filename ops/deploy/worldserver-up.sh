@@ -269,7 +269,7 @@ rc=0
 if (( rc != 0 )); then
   echo "worldserver-up: REFUSING BOOT — pre-flight failed (exit $rc)." >&2
   echo "worldserver-up: ac-worldserver was not started. Fix the named file(s) or" >&2
-  echo "                  escalate to Scuff (SQL); do not bypass this gate." >&2
+  echo "                  escalate to Scuff (SQL); if the gate named no file, this is an evidence-write failure, not a finding about your SQL. Do not bypass this gate." >&2
   exit "$rc"
 fi
 
