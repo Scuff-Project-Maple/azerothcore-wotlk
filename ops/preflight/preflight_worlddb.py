@@ -1340,6 +1340,367 @@ class Preflight:
             return False
         return self._file_observations(self._resolve_git_path(declared))
 
+    # -- durable last-verified attestation (PRO-300) ---------------------------- #
+
+    # Where a satisfied gate leaves its proof. `missing_ref_evidence()` reads files a
+    # *fetch* writes, which is the right question for "did this clone ever fetch" but
+    # it cannot answer "was this ref ever *verified by this gate*", and `git update-ref -d`
+    # plus `rm FETCH_HEAD` plus `rm -rf .git/logs/refs/remotes` erases all three signals
+    # at once and leaves a never-carried clone byte-identical to a stripped one
+    # (PRO-297 review, the residual PRO-291 could not close). This record lives in the
+    # common dir instead, where none of those three commands reach.
+    ATTESTATION_DIR_NAME = "paperclip-preflight"
+    ATTESTATION_FILE_NAME = "last-verified"
+    ATTESTATION_VERSION = 1
+
+    ATTEST_ABSENT = "absent"        # no record for this ref -> the WARN path is honest
+    ATTEST_RECORDED = "recorded"    # a satisfied boot wrote it for this ref
+    ATTEST_UNTRUSTED = "untrusted"  # a record exists that the gate cannot vouch for
+
+    ATTESTATION_LINE_RE = re.compile(
+        r"^last-verified\s+(\S+)\s*=\s*([0-9a-fA-F]{7,64})\s*@\s*(\S+)$")
+
+    def git_common_dir(self) -> "Path | None":
+        """This tree's git common dir, or None when git will not say.
+
+        The *common* dir and not the work tree: it survives everything the residual
+        deletes, a linked worktree shares it with its siblings, and — the part AC 6
+        depends on — a fresh `git clone` of a remote that never carried the ref gets a
+        common dir with no attestation in it, so the honest answer for that clone is
+        still `absent`. Asking git rather than hardcoding `.git` is the same reason
+        `_reflog_path()` asks: in a worktree the admin dir is not `.git`.
+
+        No answer means no state directory at all, never a guessed one: an attestation
+        written somewhere untrustworthy is worse than none, and a probe nobody answers
+        must not become a finding.
+        """
+        cached = getattr(self, "_git_common_dir_cache", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        rc, cd, _err = self._git(["rev-parse", "--git-common-dir"])
+        value = None
+        if rc == 0 and cd.strip():
+            p = Path(cd.strip())
+            value = p if p.is_absolute() else self.git_root / p
+        self._git_common_dir_cache = value
+        return value
+
+    def attestation_file(self) -> "Path | None":
+        """The last-verified file for this tree, or None when it cannot be placed.
+
+        `--preflight-state-dir` names a directory to hold the record instead of the one
+        under the common dir (a test or an operator running the gate over a tree they do
+        not want written inside); it is read with `getattr` because callers such as
+        `corpus_sweep.py` hand-roll an args object that has no such attribute.
+        """
+        cached = getattr(self, "_attestation_file_cache", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        override = str(getattr(self.a, "preflight_state_dir", "") or "").strip()
+        if override:
+            p = Path(override)
+            # A directory, as its name and its `--help` say, holding one file. The
+            # default location below is a file path, so the two branches have to be
+            # read carefully: an operator who points the flag at a state directory must
+            # not end up with the directory itself overwritten.
+            d = p if p.is_absolute() else self.git_root / p
+            value = d / self.ATTESTATION_FILE_NAME
+        else:
+            common = self.git_common_dir()
+            value = None if common is None else (
+                common / self.ATTESTATION_DIR_NAME / self.ATTESTATION_FILE_NAME)
+        self._attestation_file_cache = value
+        return value
+
+    def remote_url_for_ref(self, ref: str) -> str:
+        """`remote.<name>.url` for the remote `ref` names, or '' when there is none.
+
+        The record is bound to the remote it was earned against, so a record copied in
+        from another clone — the obvious way to fake a satisfied past — is
+        `untrusted` rather than a pass. '' means "cannot compare", not "empty is fine":
+        a clone with no remote configured writes no url line and compares nothing.
+        """
+        if not ref.startswith("refs/remotes/"):
+            return ""
+        remote = ref[len("refs/remotes/"):].partition("/")[0]
+        if not remote:
+            return ""
+        rc, out, _err = self._git(["config", "--get", f"remote.{remote}.url"])
+        if rc != 0:
+            return ""
+        return out.strip()
+
+    # Which check refused an untrusted record, so the caller can tell the shapes a boot
+    # of this gate could never have produced ("junk", "version", "repo", "url") from the
+    # one that is an environment accident ("unreadable"). Only the first group refuses a
+    # ref that is otherwise there; see `upstream_ref()`.
+    ATTEST_CAUSES = ("unreadable", "junk", "version", "repo", "url")
+
+    def attestation_record(self, ref: str) -> tuple[str, str, str, str, str]:
+        """What the last-verified file says about `ref`.
+
+        (status, why, attestedOid, attestedAt, cause) with status in ATTEST_ABSENT /
+        ATTEST_RECORDED / ATTEST_UNTRUSTED, and `cause` one of ATTEST_CAUSES (or ''
+        when nothing refused).
+
+        Untrusted is deliberate and named, because the whole value of the record is
+        that a *satisfied* gate wrote it: a file that is unparsable, unversioned,
+        carries a version this gate does not understand, names a different repo, or
+        names a different remote url is not that. Absent is different in kind — the
+        ref has simply never been verified here, which is the pre-PRO-300 answer and
+        still a WARN (AC 6).
+
+        The order of the checks is the answer to review B1. "This file says nothing
+        about `ref`" is settled before the repo and remote-url bindings are asked, so a
+        record copied in from elsewhere whose lines name only *other* refs cannot turn a
+        clone that honestly never verified this one into a FAIL — the operator's only
+        way out of that was `rm`, which is the act the record is meant to detect. What
+        is still settled first is what a record of ours can never look like: an
+        unparsable line, or a version this gate does not write.
+        """
+        path = self.attestation_file()
+        if path is None:
+            return (self.ATTEST_ABSENT,
+                    "no attestation state directory could be placed for this tree",
+                    "", "", "")
+        if not path.exists():
+            return (self.ATTEST_ABSENT, f"no attestation file at {path}",
+                    "", "", "")
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return (self.ATTEST_UNTRUSTED, f"{path} exists but could not be read ({exc})",
+                    "", "", "unreadable")
+        version: int | None = None
+        repo_line = ""
+        url_line = ""
+        mine: tuple[str, str] | None = None
+        junk: list[str] = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("version "):
+                try:
+                    version = int(s[len("version "):].strip())
+                except ValueError:
+                    junk.append(s)
+                continue
+            if s.startswith("repo "):
+                repo_line = s[len("repo "):].strip()
+                continue
+            if s.startswith("remote url "):
+                url_line = s[len("remote url "):].strip()
+                continue
+            m = self.ATTESTATION_LINE_RE.match(s)
+            if not m:
+                junk.append(s)
+            elif m.group(1) == ref:
+                mine = (m.group(2), m.group(3))
+        if junk:
+            return (self.ATTEST_UNTRUSTED,
+                    f"{path} holds {len(junk)} line(s) this gate cannot parse, "
+                    f"starting {junk[0][:80]!r}", "", "", "junk")
+        if version != self.ATTESTATION_VERSION:
+            # One branch, two sentences. "It does not say what it is" and "it says
+            # something this gate cannot read" are both reasons not to trust the file,
+            # and neither is the same answer as "it holds nothing about this ref".
+            said = ("names no `version`, so this gate cannot know what it is "
+                    "promising" if version is None else
+                    f"is version {version}; this gate writes and reads version "
+                    f"{self.ATTESTATION_VERSION} only")
+            return (self.ATTEST_UNTRUSTED, f"{path} {said}", "", "", "version")
+        # Before the binding checks, on purpose (review B1): a record that holds nothing
+        # about `ref` says nothing about `ref` no matter whose common dir it names, and
+        # reading it as untrusted here would let a foreign file refuse a boot that the
+        # record itself never claimed to cover.
+        if mine is None:
+            return (self.ATTEST_ABSENT,
+                    f"{path} holds no `last-verified` line for {ref}", "", "", "")
+        # A record is only this tree's history if it says it is. `write_attestation()`
+        # refuses to write one it cannot bind for exactly this reason, so a record of
+        # ours always carries both lines and a file that carries neither is not one of
+        # ours (review N5 / the `repo unknown` nit). '' on either side means git could
+        # not say, which is "cannot compare", not "the file is wrong".
+        common = self.git_common_dir()
+        expect_repo = ""
+        if common is not None:
+            try:
+                expect_repo = str(Path(common).resolve())
+            except OSError:
+                expect_repo = str(common)
+        if expect_repo:
+            if not repo_line:
+                return (self.ATTEST_UNTRUSTED,
+                        f"{path} names no `repo`, so this gate cannot tell which "
+                        f"clone it was earned in (this tree is {expect_repo})",
+                        "", "", "repo")
+            try:
+                got_repo = str(Path(repo_line).resolve())
+            except OSError:
+                got_repo = repo_line
+            if got_repo != expect_repo:
+                return (self.ATTEST_UNTRUSTED,
+                        f"{path} was written for repo {repo_line}, not {expect_repo}: "
+                        f"a record earned in another clone is not this one's history",
+                        "", "", "repo")
+        # The url is asked of git only when the record carries one to compare against.
+        # `git config --get` is a local read rather than a network verb, but it is still
+        # a verb the no-network allowlist has to account for, and a record with no url
+        # line has nothing to check it against.
+        want_url = self.remote_url_for_ref(ref) if url_line else ""
+        if want_url and url_line != want_url:
+            # Compared when both sides can name a url, unlike `repo`, which is required:
+            # this gate always knows its common dir (it refuses to write a record it
+            # cannot bind) but a tree may legitimately have no remote configured, and a
+            # record written before `git remote add` is not a forgery.
+            return (self.ATTEST_UNTRUSTED,
+                    f"{path} was written against remote url {url_line}, but this "
+                    f"tree's remote url is {want_url}", "", "", "url")
+        return self.ATTEST_RECORDED, f"attested in {path}", mine[0], mine[1], ""
+
+    def write_attestation(self, ref: str, oid: str) -> tuple[str, str]:
+        """Record "`ref` = `oid` verified now", keeping other refs' lines.
+
+        Returns (detail, timestamp actually written) — the timestamp is empty when
+        nothing was written, so the caller never reports a record it does not have.
+
+
+        Never a finding: the attestation is evidence *for* a later deletion check and
+        must never become a precondition for booting, so a failure to write is an
+        informational note (AC 6). Written via a temp file + `os.replace` because a
+        record truncated by a crash would then fail closed every later boot.
+        """
+        if not ref or not oid:
+            return "nothing to attest", ""
+        path = self.attestation_file()
+        if path is None:
+            return "no attestation state directory could be placed; not written", ""
+        common = self.git_common_dir()
+        repo_line = ""
+        if common is not None:
+            try:
+                repo_line = str(Path(common).resolve())
+            except OSError:
+                repo_line = str(common)
+        if not repo_line:
+            # An unbound record is a liability rather than a memory: `attestation_record()`
+            # reads a record with no `repo` as one it cannot vouch for, so writing one now
+            # would only manufacture the next boot's FAIL. No binding, no record — and the
+            # boot still stands, because this is evidence *for* a later deletion check.
+            return ("could not determine this tree's git common dir; record not written",
+                    "")
+        url_line = self.remote_url_for_ref(ref)
+        keep: list[str] = []
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8",
+                                           errors="replace").splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#") or s.startswith("version "):
+                        continue
+                    if s.startswith("repo ") or s.startswith("remote url "):
+                        continue
+                    m = self.ATTESTATION_LINE_RE.match(s)
+                    if not m or m.group(1) != ref:
+                        keep.append(s)
+            except OSError:
+                keep = []
+        when = datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds")
+        body = [f"# paperclip-preflight last-verified (version {self.ATTESTATION_VERSION})",
+                f"# written by ops/preflight/preflight_worlddb.py when "
+                f"upstreamProvenance.verifiedRef resolved to a remote-tracking "
+                f"commit whose tree the gate could read.",
+                f"# Deleting this file does not restore the ref; it only removes the "
+                f"gate's memory of having verified it.",
+                f"version {self.ATTESTATION_VERSION}",
+                f"repo {repo_line}"]
+        if url_line:
+            body.append(f"remote url {url_line}")
+        body.extend(keep)
+        body.append(f"last-verified {ref} = {oid} @ {when}")
+        tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text("\n".join(body) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return f"could not write {path}: {exc}", ""
+        return f"recorded {ref} = {oid[:12]} @ {when} in {path}", when
+
+    def oid_is_ancestor(self, older: str, newer: str):
+        """True/False from `git merge-base --is-ancestor`, or None if git cannot answer.
+
+        The attestation names one commit; the ref legitimately moves between boots, so
+        "the oid differs" on its own would fault every ordinary `git pull`. What is not
+        ordinary is a remote-tracking ref moved to a commit that does not *contain* the
+        one this gate last verified: a fetch fast-forwards, and only `git update-ref`
+        puts a ref somewhere its previous position is not an ancestor of.
+        """
+        if not older or not newer:
+            return None
+        rc, _out, _err = self._git(["merge-base", "--is-ancestor", older, newer])
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        return None
+
+    def consult_attestation(self, up: dict) -> None:
+        """Read the last-verified record for `up['ref']` into `up`.
+
+        Read-only by design. Writing belongs to the one place that has earned it — the
+        `ok`+remote-tracking path after the tree could be listed — so a ref that is
+        missing, untrustworthy or not a commit can never fabricate a record.
+
+        Two things read here change the *shape* of the run, both of them refusals and
+        neither of them an exemption:
+
+        - a ref whose attested commit is not an ancestor of where it points now, with no
+          reflog to explain the move, is not the history this gate verified, so
+          `upstream_ref()` does not even ask `ls-tree` about it (review N4: never ask a
+          ref the gate does not trust for the list of files it vouches for);
+        - a record that is not one this gate could have written (`cause` in
+          ATTEST_CAUSES, other than `unreadable`) is refused the same way even when the
+          ref is there and peels to a commit — an untrusted record must never act as if
+          it were simply absent on the path that ends in a write, or appending one junk
+          line is all it takes to buy back the exemption and have the forged oid
+          stamped as verified (PRO-300 review, finding 1).
+        """
+        ref = up.get("ref") or ""
+        path = self.attestation_file()
+        status, why, oid, when, cause = self.attestation_record(ref)
+        up["attestation"] = status
+        up["attestationDetail"] = why
+        up["attestedOid"] = oid
+        up["attestedWhen"] = when
+        up["attestationCause"] = cause
+        up["attestationPath"] = "" if path is None else str(path)
+        current = up.get("oid") or ""
+        if status != self.ATTEST_RECORDED or not oid or not current or oid == current:
+            return
+        ancestor = self.oid_is_ancestor(oid, current)
+        if ancestor is True:
+            return
+        # A fetch fast-forwards a remote-tracking ref, and a genuine force-push leaves a
+        # reflog. Nothing else explains a ref whose last verified position is not an
+        # ancestor of where it points now — `git update-ref` putting the tracked ref on
+        # commits of the operator's choosing is exactly that shape.
+        up["oidMismatch"] = {
+            "attested": oid,
+            "current": current,
+            "why": ("git could not answer whether it is an ancestor of it"
+                    if ancestor is None else
+                    "it is not an ancestor of the commit the ref resolves to now"),
+            "explained": self._reflog_observations(
+                self._reflog_path(ref)),
+        }
+
     def upstream_ref_setting(self) -> tuple[str | None, str]:
         """(verifiedRef, refreshCommand) from policy, with a derived fetch hint."""
         cfg = self.p.get("upstreamProvenance")
@@ -1465,7 +1826,9 @@ class Preflight:
 
         Returns {state, ref, refresh, paths, blobs, pathsLower, pathsByLower, detail,
         remoteTracked, remoteDetail, wasTracked, wasTrackedDetail,
-        wasTrackedCertainty, objectType} where state is 'ok'
+        wasTrackedCertainty, objectType, oid, attestation, attestationDetail,
+        attestationCause, attestationRefused, attestedOid, attestedWhen,
+        attestationPath, attestationNote, oidMismatch, treeSkipped} where state is 'ok'
         (`paths` is the set of tree paths, `blobs` maps a tree path to its blob id),
         'unconfigured', 'missing', 'not-a-commit' or 'error'. A missing ref is not an
         error: this must never need the network, and a clone that has not fetched yet
@@ -1487,6 +1850,14 @@ class Preflight:
         name silently resolves refs/heads/origin/Playerbot, the local branch the
         `--author` forger can rewrite. An unanswered question therefore means "not a
         remote-tracking ref", never the default "yes".
+
+        `oid` is the commit `ref` peeled to on the 'ok' path, and the `attestation*`
+        keys carry what the durable last-verified record says about it — see
+        `attestation_record()` and `consult_attestation()` (PRO-300). `oidMismatch` is
+        {attested, current, why, explained} when the ref now names a commit the attested
+        one is not an ancestor of; `explained` is whether the ref's own reflog survives
+        to account for it as a force-push, and when it does not, `treeSkipped` says the
+        tree was never read — `upstream_ref_state()` turns that into a FAIL.
         """
         cached = getattr(self, "_upstream_ref_cache", _UNSET)
         if cached is not _UNSET:
@@ -1496,7 +1867,12 @@ class Preflight:
                "blobs": None, "pathsLower": None, "pathsByLower": None,
                "detail": "", "remoteTracked": True, "remoteDetail": "",
                "wasTracked": False, "wasTrackedDetail": "",
-               "wasTrackedCertainty": "", "objectType": ""}
+               "wasTrackedCertainty": "", "objectType": "", "oid": "",
+               "attestation": "", "attestationDetail": "", "attestationCause": "",
+               "attestationRefused": False,
+               "attestedOid": "", "attestedWhen": "", "attestationPath": "",
+               "attestationNote": "",
+               "oidMismatch": None, "treeSkipped": False}
         if not ref:
             out.update(state="unconfigured",
                        detail="policy has no upstreamProvenance.verifiedRef")
@@ -1516,8 +1892,14 @@ class Preflight:
                 out.update(remoteTracked=False,
                            remoteDetail=f"it resolves to {full.strip()}")
             if out["state"] == "ok":
-                rc, _, err = self._git(["rev-parse", "--verify", "--quiet",
-                                        f"{ref}^{{commit}}"])
+                rc, peeled, err = self._git(["rev-parse", "--verify", "--quiet",
+                                             f"{ref}^{{commit}}"])
+                if rc == 0 and peeled.strip():
+                    # Keep the commit the peel actually resolved: the attestation has to
+                    # name the object this gate trusted, not re-resolve an untrusted name
+                    # afterwards (same reason review N3 pinned the cat-file probe to the
+                    # oid the existence check had already settled on).
+                    out["oid"] = peeled.strip()
                 if rc is None:
                     out.update(state="error", detail=f"git unavailable: {err}", paths=None)
                 elif rc != 0:
@@ -1557,7 +1939,50 @@ class Preflight:
                 existed, why, certainty = self.missing_ref_evidence(ref)
                 out.update(wasTracked=existed, wasTrackedDetail=why,
                            wasTrackedCertainty=certainty if existed else "")
+                # PRO-300: those three signals answer "has this clone ever fetched".
+                # None of them can answer "did this gate ever verify this ref", and
+                # `git update-ref -d` + `rm FETCH_HEAD` + `rm -rf
+                # .git/logs/refs/remotes` erases all three at once, which is the
+                # residual PRO-291 left open. The durable record is asked here, and
+                # read-only: a ref that is not there is never a reason to write one.
+                self.consult_attestation(out)
             if out["state"] == "ok" and out["remoteTracked"]:
+                # PRO-300: ask the durable question before reading anything off the ref.
+                # `ls-tree` is the answer the whole exemption is built on, so it must not
+                # be asked of a ref this gate cannot vouch for — and a ref moved off the
+                # commit it was verified at, with no reflog to call that a force-push,
+                # is exactly such a ref.
+                self.consult_attestation(out)
+                mism = out.get("oidMismatch")
+                if mism and not mism["explained"]:
+                    out["treeSkipped"] = True
+                    out["detail"] = (
+                        f"{ref} resolves to {mism['current'][:12]}, but "
+                        f"{out['attestationPath'] or 'the last-verified record'} "
+                        f"records it verified at {mism['attested'][:12]} on "
+                        f"{out['attestedWhen']} and, since {mism['why']}, this ref "
+                        f"holds no reflog of its own to explain the move")
+                cause = out.get("attestationCause") or ""
+                if (out.get("attestation") == self.ATTEST_UNTRUSTED and cause
+                        and cause != "unreadable"):
+                    # PRO-300 review, finding 1: an untrusted record must not act as if it
+                    # were simply absent on the path that ends in a write. If it did, one
+                    # appended junk line would buy back the exemption and the forged oid
+                    # would then be stamped `last-verified` by this very run. `unreadable`
+                    # is the exception and stays inert — a file the OS will not hand over
+                    # is an environment accident, and this record must never become a
+                    # precondition for booting (AC 6); what the exemption rests on here is
+                    # the tree comparison below, not the record.
+                    out["treeSkipped"] = True
+                    out["attestationRefused"] = True
+                    out["detail"] = (
+                        f"{ref} resolves to {(out.get('oid') or '')[:12]}, but the "
+                        f"last-verified record at "
+                        f"{out.get('attestationPath') or '(unknown)'} is not one this "
+                        f"gate can trust: {out.get('attestationDetail')}. Its tree was "
+                        f"not read and nothing was recorded")
+            if out["state"] == "ok" and out["remoteTracked"] and not out.get(
+                    "treeSkipped"):
                 # `-z` is not cosmetic: without it git quotes every path that is not
                 # plain ASCII, so `2026_01_01_01_érfar.sql` comes back as
                 # "...\\303\\251rfar.sql" and can never equal the on-disk name — a
@@ -1588,6 +2013,21 @@ class Preflight:
                     for n in blobs:
                         lower.setdefault(n.lower(), n)
                     out["pathsByLower"] = lower
+                    # PRO-300: the tree could be read, so this gate is entitled to say
+                    # it verified the ref — and that is what turns a later `.git`
+                    # stripped of every fetch fingerprint into a FAIL instead of the WARN
+                    # a never-carried clone still gets. Written on every satisfied boot,
+                    # which is also how a fast-forwarded or force-pushed ref moves the
+                    # record forward instead of stranding it on an old commit.
+                    note, written_at = self.write_attestation(ref, out["oid"])
+                    out["attestationNote"] = note
+                    if written_at:
+                        # The record this run just wrote *is* the record now, and the
+                        # summary has to say so rather than repeating what was on disk
+                        # when the run started.
+                        out["attestation"] = self.ATTEST_RECORDED
+                        out["attestedOid"] = out["oid"]
+                        out["attestedWhen"] = written_at
         self._upstream_ref_cache = out
         return out
 
@@ -1596,7 +2036,8 @@ class Preflight:
 
         `cause` is the machine-readable reason behind the state so the report can name
         the right recovery: 'verified', 'absent', 'content-diverged', 'case-diverged',
-        'not-remote', 'not-a-commit', 'ref-deleted', 'unreadable', 'uncomparable',
+        'not-remote', 'not-a-commit', 'ref-deleted', 'attested-missing',
+        'attestation-untrusted', 'oid-mismatch', 'unreadable', 'uncomparable',
         'outside-tree', 'unhashable', 'unconfigured', 'missing' or 'missing-allowed'.
 
         Three of these answer the same question — "is the ref there?" — and they are
@@ -1615,6 +2056,29 @@ class Preflight:
         - 'not-a-commit' / REF_INDETERMINATE: the name resolves to a tree, blob or other
           non-commit object. Fail closed. It is not missing, and calling it missing was
           the false statement that kept the exemption.
+        - 'attested-missing' / REF_INDETERMINATE: git cannot find the ref, no fetch
+          fingerprint survives anywhere, and the durable last-verified record says this
+          gate verified the ref at a named commit on a named date. That is exactly the
+          pair PRO-291 could not tell apart — a never-carried clone has no record to
+          lose, so the record is what separates them. Fail closed; the recovery is
+          `refreshCommand`, or `--allow-missing-upstream-ref` to opt into the exemption
+          by typing it (PRO-300).
+        - 'attestation-untrusted' / REF_INDETERMINATE: a record exists and this gate
+          cannot verify it — an unparsable line, a version it does not understand, no
+          `repo` binding at all, or a `repo`/`remote url` naming somewhere else. Two
+          shapes reach it. The ref is missing and the record that would have said it was
+          ever here is unreadable: fail closed, and `--allow-missing-upstream-ref` does
+          not cover it, or corrupting a file would be the cheapest way back to the WARN.
+          Or the ref is *present* and the record that made its word worth taking is not
+          one this gate could have written: fail closed the same way, and `ls-tree` was
+          never asked of it. One exception, deliberate — a file the OS will not hand over
+          is inert on that second path, because the record is evidence for a later
+          deletion check and must never become a precondition for booting (AC 6).
+        - 'oid-mismatch' / REF_INDETERMINATE: the ref is here but names a commit the
+          attested one is not an ancestor of, and holds no reflog to explain the move as a
+          force-push. A fetch fast-forwards a remote-tracking ref, so this is the shape
+          `git update-ref` leaves: a tracked ref pointing at commits of the operator's
+          choosing.
         """
         up = self.upstream_ref()
         ref = up["ref"] or "the configured upstreamProvenance.verifiedRef"
@@ -1660,6 +2124,39 @@ class Preflight:
                             f"opts into the pre-PRO-248 exemption on that answer",
                             "missing-allowed")
                 return (self.REF_INDETERMINATE, verdict, "ref-deleted")
+            attest = up.get("attestation") or ""
+            if attest == self.ATTEST_RECORDED:
+                # PRO-300, the PRO-291 residual. The three signals above prove somebody
+                # fetched; a record proves this gate *verified* the ref, at a named commit
+                # at a named time. A clone with no reflog, no FETCH_HEAD, no sibling
+                # reflog and an attestation is not one that never fetched — it is one
+                # whose fetch fingerprints were removed after the fact.
+                verdict = (f"{ref} is not present locally, but "
+                           f"{up.get('attestationPath') or 'the last-verified record'} "
+                           f"attests that an earlier run of this gate verified it at "
+                           f"{(up.get('attestedOid') or '')[:12]} on "
+                           f"{up.get('attestedWhen')}, while this clone holds no reflog, "
+                           f"no FETCH_HEAD and no sibling reflog either. A clone that "
+                           f"has genuinely never fetched has no attestation to lose, so "
+                           f"this is a stripped one")
+                if self.allow_missing_upstream_ref():
+                    return (self.REF_UNCHECKED,
+                            f"{verdict}; --allow-missing-upstream-ref was passed, which "
+                            f"opts into the pre-PRO-248 exemption on that answer",
+                            "missing-allowed")
+                return (self.REF_INDETERMINATE, verdict, "attested-missing")
+            if attest == self.ATTEST_UNTRUSTED:
+                # Failing closed here rather than falling through to the WARN is the
+                # point: "the record is unreadable" and "there is no record" cannot be
+                # the same sentence, or truncating a file is all it takes to buy back
+                # the exemption the record was blocking.
+                return (self.REF_INDETERMINATE,
+                        f"{ref} is not present locally and the last-verified record for "
+                        f"it is not one this gate can trust: "
+                        f"{up.get('attestationDetail')}. An attestation the gate cannot "
+                        f"verify is not a pass, and it is not the same answer as having "
+                        f"never verified the ref",
+                        "attestation-untrusted")
             return (self.REF_UNCHECKED,
                     f"{ref} is not present locally; run {up['refresh']}", "missing")
         if up["state"] == "not-a-commit":
@@ -1682,6 +2179,36 @@ class Preflight:
                     f"{ref} is not a remote-tracking ref ({up.get('remoteDetail', '')}), "
                     f"so whoever can move it can manufacture this exemption",
                     "not-remote")
+        if up.get("attestationRefused"):
+            # PRO-300 review, finding 1. The ref is present and peels to a commit, so
+            # every PRO-291 check passes; what fails here is the record that made the
+            # ref's word worth taking. A file this gate could not have written is not
+            # entitled to a tree read, and must not be treated as the same answer as
+            # having no record at all on the path that ends in writing one.
+            return (self.REF_INDETERMINATE,
+                    up.get("detail") or (f"the last-verified record for {ref} is not one "
+                                         f"this gate can trust"),
+                    "attestation-untrusted")
+        mism = up.get("oidMismatch")
+        if mism and not mism.get("explained"):
+            # PRO-300: "the ref is there" is not the claim the exemption rests on. The
+            # claim is that this ref *is* the upstream history this gate checked before,
+            # and a ref moved outside the commit it was verified at no longer makes it.
+            # A fetch fast-forwards a remote-tracking ref, so an ordinary `git pull`
+            # between boots is cleared by `oid_is_ancestor()` and never reaches here;
+            # `git update-ref` is what puts a ref where its verified position is not an
+            # ancestor. A real force-push leaves a reflog, so the missing reflog is what
+            # separates the forged move from the legitimate one.
+            return (self.REF_INDETERMINATE,
+                    f"{ref} resolves to {mism['current'][:12]} now, but "
+                    f"{up.get('attestationPath') or 'the last-verified record'} records "
+                    f"this gate verifying {mism['attested'][:12]} on "
+                    f"{up.get('attestedWhen')} and, since {mism['why']}, this ref holds "
+                    f"no reflog of its own either — a fetch would have fast-forwarded "
+                    f"it and a real force-push would have left one, so this reads as "
+                    f"`git update-ref` pointing the tracked ref at commits of the "
+                    f"operator's choosing",
+                    "oid-mismatch")
         try:
             rel = Path(os.path.relpath(path, self.git_root)).as_posix()
         except ValueError:
@@ -1850,6 +2377,84 @@ class Preflight:
                 f"pass --allow-missing-upstream-ref so the exemption is "
                 f"opted into rather than inherited. If this file is company "
                 f"content it belongs in {pending}.",
+                )
+        elif state == self.REF_INDETERMINATE and cause == "attested-missing":
+            # PRO-300, the residual PRO-291 recorded and could not close: after
+            # `git update-ref -d <ref>` plus `rm FETCH_HEAD` plus `rm -rf
+            # .git/logs/refs/remotes`, `.git` is byte-identical to a clone that never
+            # carried the ref, so the directory+author exemption came back on the WARN.
+            # The durable record is the only thing in the tree that those three commands
+            # do not reach, and it names the commit and the date this gate last checked.
+            attested = (up.get("attestedOid") or "")[:12]
+            bad("upstream-ref-attested-missing",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} and the upstream exemption was about to be "
+                f"granted on {ref}, which is not present in this clone: {detail}. "
+                f"The last-verified record at {up.get('attestationPath') or '(unknown)'} "
+                f"is what tells this apart from a clone that never fetched — this "
+                f"gate verified {ref} at `{attested}` on {up.get('attestedWhen')}, "
+                f"and a clone that has never fetched has no such record to delete. "
+                f"Restore the ref with `{up['refresh']}` and re-run; if you are "
+                f"deliberately running without it, pass "
+                f"--allow-missing-upstream-ref so the exemption is opted into "
+                f"rather than inherited. Deleting the record does not restore the "
+                f"ref, and on a clone that still has the ref the next satisfied boot "
+                f"writes it again; if the ref has genuinely gone from the remote as "
+                f"well, say so in review instead of removing the gate's memory of "
+                f"having verified it. If this file is company content it belongs in "
+                f"{pending}.",
+                )
+        elif state == self.REF_INDETERMINATE and cause == "attestation-untrusted":
+            # Fail closed with a named basis. An unverifiable record must not be read as
+            # "no record", because that makes corrupting one the cheapest route back to
+            # the exemption the record was blocking. Two shapes land here and they need
+            # different sentences: the ref is gone and the record that would have said so
+            # is unreadable, or the ref is here and the record behind it is a forgery.
+            path_note = up.get("attestationPath") or "(state file)"
+            if up.get("attestationRefused"):
+                bad("upstream-ref-attestation-untrusted",
+                    f"{f['rel']} is new in the upstream-tagged directory "
+                    f"{db_path} and the upstream exemption was about to be "
+                    f"granted on {ref}, which this clone does resolve, but the record "
+                    f"that makes its word worth taking is not one this gate can trust: "
+                    f"{detail}. The gate will not read an unverifiable record as no "
+                    f"record at all, so it did not ask that ref for a file listing and "
+                    f"did not stamp this boot as verified. Remove the record with "
+                    f"`rm {path_note}` and re-run: a satisfied boot writes a fresh one "
+                    f"naming this tree. Say so in review either way — an untrusted "
+                    f"record is not the same evidence state as a missing one, and only "
+                    f"the missing one is what a never-verified clone looks like. If this "
+                    f"file is company content it belongs in {pending}.",
+                    )
+            else:
+                bad("upstream-ref-attestation-untrusted",
+                    f"{f['rel']} is new in the upstream-tagged directory "
+                    f"{db_path} and the upstream exemption was about to be "
+                    f"granted on {ref}, which is not present in this clone, and the "
+                    f"record that would have said whether it was ever verified here is "
+                    f"not one this gate can trust: {detail}. The gate will not read an "
+                    f"unverifiable record as no record at all. Restore the ref with "
+                    f"`{up['refresh']}` and remove the record with `rm {path_note}` — a "
+                    f"boot does not repair a record it cannot parse, it keeps the lines "
+                    f"it was given — then let the next satisfied boot write a fresh one. "
+                    f"Say so in review, since an absent record is the same evidence "
+                    f"state as never having verified the ref. If this file is company "
+                    f"content it belongs in {pending}.",
+                    )
+        elif state == self.REF_INDETERMINATE and cause == "oid-mismatch":
+            # PRO-300. The ref is present, which is why PRO-291's checks all passed: it
+            # is simply no longer the history this gate verified, and a tree read off a
+            # ref someone pointed elsewhere with `git update-ref` vouches for nothing.
+            bad("upstream-ref-oid-mismatch",
+                f"{f['rel']} is new in the upstream-tagged directory "
+                f"{db_path} and the upstream exemption was about to be "
+                f"granted on {ref}: {detail}. The tracked ref is no longer the "
+                f"commit this gate verified, so whatever its tree says about this "
+                f"file is a claim about a history the gate never checked. Refresh "
+                f"it with `{up['refresh']}` — if the remote genuinely force-pushed, "
+                f"the fetch restores the ref along with the reflog that documents "
+                f"the force-push — and re-run. If this file is company content it "
+                f"belongs in {pending}.",
                 )
         elif state == self.REF_INDETERMINATE:
             bad("unverified-upstream-origin",
@@ -2527,15 +3132,37 @@ class Preflight:
                              "exemptFiles": len(new_files) - checked_files,
                              "upstreamRef": ref_counts}
         ref_note = ""
+        attestation_note = ""
         if ref_counts:
-            ref = self.upstream_ref().get("ref") or "upstream ref unconfigured"
+            up = self.upstream_ref()
+            ref = up.get("ref") or "upstream ref unconfigured"
             ref_note = f"; upstream ref {ref} (" + \
                        ", ".join(f"{k}={v}" for k, v in sorted(ref_counts.items())) + ")"
+            # PRO-300: the operator has to be able to see which of the two answers the
+            # ref verdict rested on — a record this gate wrote, or the absence of one.
+            status = up.get("attestation") or ""
+            if up.get("attestationRefused"):
+                # The summary must not read as a satisfied boot: nothing was recorded
+                # this run and the ref's tree was never read.
+                ref_note += (f", last-verified refused (record untrusted: "
+                             f"{up.get('attestationCause') or 'unknown reason'})")
+            elif status == self.ATTEST_RECORDED:
+                ref_note += (f", last-verified {(up.get('attestedOid') or '')[:12]}"
+                             f"@{up.get('attestedWhen')}")
+            elif status:
+                ref_note += f", last-verified {status}"
+            if up.get("attestationNote"):
+                attestation_note = up["attestationNote"]
         self.r.line("4", f"{checked_files} new file(s) under write policy, {statements} statement(s) "
                          f"inspected; reserved bands "
                          f"creature_template.entry/quest_template.ID>="
                          f"{self._band_min('creature_template', 'entry')}, "
                          f"creature.guid>={self._band_min('creature', 'guid')}{ref_note}")
+        if attestation_note:
+            # Informational, never a finding: failing to write the record must not be
+            # able to stop a boot that the ref itself still justifies (AC 6).
+            self.r.info("4", f"upstream ref attestation: {attestation_note}",
+                        rule="upstream-ref-attestation")
         if checked_files == 0:
             self.r.info("4", "no new company files to policy-check", rule="write-policy")
 
@@ -3233,6 +3860,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "(local history says it was here). Off by default: the boot path "
                          "refuses, and a clone that has genuinely never fetched still "
                          "boots on a WARN without it (PRO-248 review N1).")
+    ap.add_argument("--preflight-state-dir", dest="preflight_state_dir", default=None,
+                    help="directory holding the durable last-verified attestation for "
+                         "upstreamProvenance.verifiedRef (default: "
+                         "<git common dir>/paperclip-preflight/last-verified). The "
+                         "attestation is what lets a later boot tell a ref that was "
+                         "verified and then deleted from a clone that never carried it "
+                         "(PRO-300); it is never a precondition for booting, and a "
+                         "missing one is still a WARN.")
     ap.add_argument("--policy-all", action="store_true",
                     help="same as --strict-all but keeps the origin note")
     ap.add_argument("--clean-dead-ref-max-count", type=int, default=3)
