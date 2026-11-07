@@ -3156,38 +3156,63 @@ CHECK_TITLES = {
 
 
 def _emit(stream, text: str) -> None:
-    r"""Write a report block to a stream; never let the codec eat the verdict.
+    r"""Write a report block to a stream; never let presentation cost the verdict.
 
     What `print()` survives is the operator's locale, not the gate's. `dirty_paths()`
     decodes `git status` with `surrogateescape` (PRO-301 review B1/B2) so a path that
     is not valid UTF-8 arrives here as a lone surrogate, and a stream with a strict
-    error handler refuses to encode one: the `UnicodeEncodeError` lands between
-    `render()` and the `--json` write, so the boot is still refused (rc != 0) but the
-    operator gets a traceback instead of the reason, and the machine-readable payload
-    is never written at all (PRO-308 QA finding B). A gate that fails closed while
+    error handler refuses to encode one: the `UnicodeEncodeError` landed between
+    `render()` and the `--json` write, so the boot was still refused (rc != 0) but the
+    operator got a traceback instead of the reason, and the machine-readable payload
+    was never written at all (PRO-308 QA finding B). A gate that fails closed while
     withholding why is the worst shape this file can be in, so escape whatever the
     codec refuses — `backslashreplace` renders `qa_raw\udcff.sql` as visible ASCII
     the operator can still identify — and keep going to the verdict line.
+
+    The whole body is guarded, `flush()` included, because the other half of the rule
+    is that nothing in here may raise back into `main()`: a stream that refuses the
+    write outright — a pipe closed early, a full device, a console that will not take
+    it — is a presentation failure, and presentation does not get to cost the exit
+    code or the payload on disk (PRO-313 review B1). Name the failure on the fallback
+    stream and return normally. What this does *not* make safe is `render()` itself,
+    which is why `main()` writes the payload before it calls `_emit` at all.
     """
     encoding = getattr(stream, "encoding", None) or "utf-8"
     try:
-        stream.write(text + "\n")
-    except UnicodeEncodeError:
-        stream.write(text.encode(encoding, "backslashreplace").decode(encoding,
-                                                                       "backslashreplace"))
-        stream.write("\n")
-    stream.flush()
+        try:
+            stream.write(text + "\n")
+        except UnicodeEncodeError:
+            stream.write(text.encode(encoding, "backslashreplace").decode(encoding,
+                                                                           "backslashreplace"))
+            stream.write("\n")
+        stream.flush()
+    except Exception as exc:
+        label = getattr(stream, "name", None) or repr(stream)
+        try:
+            sys.__stderr__.write(f"preflight: could not write the report to {label}: "
+                                 f"{type(exc).__name__}: {exc}\n")
+            sys.__stderr__.flush()
+        except Exception:
+            pass
 
 
 def _write_json_payload(path, payload: dict) -> None:
     """Write the machine-readable verdict, byte-safe whatever a path name holds.
 
-    `ensure_ascii` is load-bearing, not stylistic (PRO-308 QA finding B): it is what
-    keeps a surrogate-bearing path name — the price of `surrogateescape` in
+    `ensure_ascii` is the load-bearing flag, not `encoding` (PRO-308 QA finding B): it
+    is what keeps a surrogate-bearing path name — the price of `surrogateescape` in
     `dirty_paths()` — out of the encoded stream, so the payload still lands on a
     locale whose codec cannot hold the byte. Do not "fix" this to
     `ensure_ascii=False` for prettier JSON; that re-opens the hole, and the caller
     would then have a traceback where its evidence should be.
+
+    `encoding="utf-8"` is the weaker half and should be read that way: with
+    `ensure_ascii=True` the text is already pure ASCII, so dropping it is invisible
+    today. What it buys is that the payload is the *same bytes* on every host — it
+    stops the file's encoding from following the operator's default locale, which is
+    the first thing that would bite whoever relaxes `ensure_ascii`. The property that
+    is actually pinned by a test is the pair: a C-locale host still gets a payload it
+    can read back (PRO-313 review, non-blocking M5).
     """
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True,
                                       ensure_ascii=True),
@@ -3217,6 +3242,33 @@ def render(report: Report, args) -> str:
     out.append("RESULT: " + ("FAIL — boot refused" if report.failed else "PASS")
                + f" ({report.data.get('elapsed_s', 0)}s)")
     return "\n".join(out)
+
+
+def _render_or_say_why(report: Report, args) -> str:
+    """Render the printed verdict, and if rendering itself breaks, say so.
+
+    `render()` is the thing that explains the refusal, so an exception escaping it
+    puts us back at PRO-308 finding B's shape — a traceback where the reason should
+    be (PRO-313 review B1, state S3). By the time `main()` calls this the exit code is
+    already decided and the payload is already on disk, so the worst remaining failure
+    is a terminal that says nothing. A degraded line that still names the failing
+    checks beats that, and the names come straight off the report rather than through
+    any of the formatting that just failed.
+    """
+    try:
+        return render(report, args)
+    except Exception as exc:
+        lines = [
+            "PRO-179 world-DB updater pre-flight",
+            f"RESULT: {'FAIL — boot refused' if report.failed else 'PASS'}",
+            f"!! render() raised {type(exc).__name__}: {exc}; the findings are listed "
+            "unformatted below and the --json payload is unaffected",
+        ]
+        for f in report.findings:
+            if f.severity in ("FAIL", "WARN"):
+                where = f"{f.file}: " if f.file else ""
+                lines.append(f"    !! [{f.check}] {f.severity} {where}{f.rule}: {f.message}")
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -3308,8 +3360,15 @@ def main(argv=None) -> int:
         return EXIT_ERROR
 
     report.data["elapsed_s"] = round(time.monotonic() - t0, 1)
-    if not args.json_only:
-        _emit(sys.stdout, render(report, args))
+
+    # Evidence before presentation (PRO-313 review B1). The payload is the durable
+    # half: it is what the deploy path reads back, what survives into the audit log,
+    # and what nobody can regenerate once the scratch schema is dropped — the terminal
+    # echo can always be re-derived by re-running. So the payload is written first, and
+    # the two halves are held apart from each other: a stdout the operator's codec (or
+    # kernel) refuses must not cost the payload, which is finding B one layer down, and
+    # a payload we cannot write must not cost the printed verdict either.
+    payload_error = None
     if args.json_out:
         payload = {
             "result": "fail" if report.failed else "pass",
@@ -3318,9 +3377,21 @@ def main(argv=None) -> int:
             "sections": report.sections,
             "findings": [f.__dict__ for f in report.findings],
         }
-        # The verdict is the product, so both halves of it must survive an operator
-        # whose locale cannot encode what `git` reported (PRO-308 QA finding B).
-        _write_json_payload(args.json_out, payload)
+        try:
+            _write_json_payload(args.json_out, payload)
+        except Exception as exc:
+            payload_error = (f"preflight: could not write the --json payload to "
+                             f"{args.json_out}: {type(exc).__name__}: {exc}")
+    if not args.json_only:
+        _emit(sys.stdout, _render_or_say_why(report, args))
+    if payload_error:
+        # The boot path asks for the payload and trusts it as the evidence, so a run
+        # that produced no evidence file refuses the boot rather than reporting
+        # whatever rc the checks happened to reach.
+        _emit(sys.stderr, payload_error)
+        _emit(sys.stderr, "preflight: the requested evidence payload is missing, so "
+                          "the boot is refused")
+        return EXIT_ERROR
     return rc
 
 

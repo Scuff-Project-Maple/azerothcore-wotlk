@@ -3375,18 +3375,301 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             # "tidies" it away re-opens the hole on a locale that cannot hold the byte.
             self.assertFalse(json.dumps(self._payload(r), ensure_ascii=False).isascii())
 
+    class _ReportingStream:
+        """A text stream with the deploy host's shape and a refusal we can arm.
+
+        Deliberately not an `io.TextIOBase` subclass: that base owns `encoding` and
+        will not let a stand-in set one. `write_through=True` means the bytes are in
+        `buffer` without a flush, so the stream can still be read back after it starts
+        refusing.
+        """
+
+        def __init__(self, encoding="ascii", errors="strict", refuse=None,
+                     error=None):
+            self.encoding = encoding
+            self.errors = errors
+            self.refuse = refuse
+            self.error = error if error is not None else BrokenPipeError(32, "Broken pipe")
+            self.buffer = io.BytesIO()
+            self.inner = io.TextIOWrapper(self.buffer, encoding=encoding, errors=errors,
+                                          write_through=True)
+
+        def write(self, s):
+            if self.refuse == "write":
+                raise self.error
+            return self.inner.write(s)
+
+        def flush(self):
+            if self.refuse == "flush":
+                raise self.error
+            self.inner.flush()
+
+        def value(self) -> bytes:
+            return self.buffer.getvalue()
+
+    def _drive_main(self, stdout, stderr, *, render_raises=False, json_target="default",
+                    expect_raises=False):
+        """Run the real `main()` with the gate stubbed and the operator's streams swapped.
+
+        `main()` had no test before this class, which is why the first version of these
+        pins reached for `inspect.getsource`. A source-text ordering assertion cannot
+        tell you which half loses when the other one throws, and it pins the shape that
+        caused finding B in the first place (PRO-313 review B1). This drives the real
+        function and measures both halves.
+        """
+        import sys
+        import types
+        import preflight_worlddb as P
+
+        raw = self.RAW
+
+        class StubPreflight:
+            def __init__(self, args, policy, report):
+                self.args, self.policy, self.report = args, policy, report
+                self.sql_root = Path(args.compose_root) / "data" / "sql"
+
+            def run(self):
+                self.report.fail("3",
+                                 f"{raw} is upstream-provenanced at HEAD but has "
+                                 "uncommitted changes, so it is checked against the "
+                                 "write policy",
+                                 file=raw, rule="dirty-worktree")
+                return P.EXIT_FAIL
+
+        def boom(report, args):
+            raise RuntimeError("fixture: render() blew up")
+
+        original = (P.Preflight, P.render, sys.stdout, sys.stderr, sys.__stderr__)
+        P.Preflight = StubPreflight
+        if render_raises:
+            P.render = boom
+        # `sys.__stderr__` is where `_emit` names a presentation failure; capture it so
+        # the suite stays readable and the notice itself is assertable.
+        fallback = self._ReportingStream()
+        sys.stdout, sys.stderr, sys.__stderr__ = stdout, stderr, fallback
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tree = Path(td) / "tree"
+                (tree / "data" / "sql").mkdir(parents=True)
+                policy = Path(td) / "policy.json"
+                policy.write_text("{}")
+                if json_target == "default":
+                    out_path = Path(td) / "verdict.json"
+                elif json_target == "missing-dir":
+                    out_path = Path(td) / "no-such-dir" / "verdict.json"
+                else:
+                    out_path = None
+                argv = ["--compose-root", str(tree), "--policy", str(policy)]
+                if out_path is not None:
+                    argv += ["--json", str(out_path)]
+                rc = None
+                raised = None
+                try:
+                    rc = P.main(argv)
+                except BaseException as exc:      # a fixture may raise one on purpose
+                    if not expect_raises:
+                        raise
+                    raised = type(exc).__name__
+                payload = None
+                if out_path is not None and out_path.is_file():
+                    payload = out_path.read_bytes()
+        finally:
+            P.Preflight, P.render, sys.stdout, sys.stderr, sys.__stderr__ = original
+        return types.SimpleNamespace(rc=rc, raised=raised, payload=payload,
+                                      out=stdout.value(), err=stderr.value(),
+                                      fallback=fallback.value())
+
+    def test_the_payload_survives_a_stdout_that_refuses_to_flush(self):
+        """PRO-313 review B1 state S2: the printed half must not cost the evidence.
+
+        `_emit`'s `flush()` used to sit outside its own guard, so a stream that refused
+        the flush took the payload with it — finding B one layer down.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(refuse="flush"),
+                               self._ReportingStream())
+        self.assertIsNotNone(res.payload,
+                             "the terminal refused us and the machine-readable verdict "
+                             "went with it, which is finding B again")
+        self.assertEqual(P.EXIT_FAIL, res.rc)
+        back = json.loads(res.payload.decode("ascii"))
+        self.assertEqual("fail", back["result"])
+        self.assertEqual(self.RAW, back["findings"][0]["file"])
+        note = res.fallback.decode("ascii")
+        self.assertIn("could not write the report", note,
+                      "a swallowed presentation failure is as useless as a traceback")
+        self.assertIn("BrokenPipeError", note)
+
+    def test_a_signal_during_presentation_still_leaves_the_evidence_written(self):
+        """Ordering is the last line of defence, so pin it by behaviour, not by spelling.
+
+        `_emit` guards everything but `BaseException` — a Ctrl-C or a `SystemExit` is
+        not ours to swallow — and `_render_or_say_why` guards `render()`. So the failure
+        that can still escape the presentation half is one we deliberately let through.
+        Writing the payload first is what makes that survivable; the old
+        `assertLess(src.index("_emit…"), src.index("_write_json_payload"))` only
+        pretended to protect it, and forbade the fix (PRO-313 review B1).
+        """
+        class Escape(self._ReportingStream):
+            def write(self, s):
+                raise KeyboardInterrupt("fixture: Ctrl-C during the report")
+
+        res = self._drive_main(Escape(), self._ReportingStream(), expect_raises=True)
+        self.assertEqual("KeyboardInterrupt", res.raised,
+                         "a signal is not ours to swallow; if this stops escaping, this "
+                         "test has stopped testing the ordering")
+        self.assertIsNotNone(res.payload,
+                             "presentation was still holding the evidence hostage")
+        self.assertEqual(self.RAW, json.loads(res.payload.decode("ascii"))["findings"][0]["file"])
+        self.assertIsNone(res.rc)
+
+    def test_a_stream_that_refuses_the_write_at_all_still_does_not_raise(self):
+        """Presentation failures are named on a fallback stream, never re-raised."""
+        import sys
+        from preflight_worlddb import _emit
+        for refuse, landed in (("write", b""), ("flush", b"verdict text\n")):
+            stream = self._ReportingStream(refuse=refuse)
+            fallback = self._ReportingStream()
+            original = sys.__stderr__
+            sys.__stderr__ = fallback
+            try:
+                _emit(stream, "verdict text")      # must not raise
+            finally:
+                sys.__stderr__ = original
+            self.assertEqual(landed, stream.value(),
+                             f"the {refuse} refusal changed what reached the stream")
+            note = fallback.value().decode("ascii")
+            self.assertIn("could not write the report", note)
+            self.assertIn("BrokenPipeError", note)
+            self.assertIn("_ReportingStream", note,
+                          "the operator cannot chase a failure that names no stream")
+
+    def test_a_fallback_stream_that_refuses_too_still_does_not_raise(self):
+        """The last resort has to be a last resort."""
+        import sys
+        from preflight_worlddb import _emit
+        original = sys.__stderr__
+        sys.__stderr__ = self._ReportingStream(refuse="write")
+        try:
+            _emit(self._ReportingStream(refuse="write"), "verdict text")
+        finally:
+            sys.__stderr__ = original
+
+    def test_the_printed_verdict_and_the_payload_both_land_on_a_strict_stream(self):
+        """Both halves, in the shape PRO-308 measured — not one at a time."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream())
+        text = res.out.decode("ascii")
+        self.assertIn("RESULT: FAIL", text)
+        self.assertIn("dirty-worktree", text, "the verdict arrived without its reason")
+        self.assertIn("qa_raw", text)
+        self.assertIn("\\udcff", text, "the offending name was dropped, not escaped")
+        self.assertIsNotNone(res.payload)
+        self.assertTrue(res.payload.isascii(),
+                        "a non-ASCII byte in the payload makes the write depend on the "
+                        "host locale again, which is the whole finding")
+        self.assertEqual(self.RAW, json.loads(res.payload.decode("ascii"))["findings"][0]["file"])
+        # Negative control: the fixture really is the shape under test — the same text
+        # written the way `main()` used to write it still raises.
+        probe = self._ReportingStream()
+        with self.assertRaises(UnicodeEncodeError):
+            probe.write("data/sql/x/\udcff.sql\n")
+
+    def test_a_payload_we_cannot_write_costs_the_boot_but_not_the_verdict(self):
+        """PRO-313 review B1 state S4, reversed: the halves are held apart."""
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="missing-dir")
+        self.assertIn("RESULT: FAIL", res.out.decode("ascii"),
+                      "the payload half took the printed verdict with it")
+        self.assertIsNone(res.payload)
+        err = res.err.decode("ascii")
+        self.assertIn("could not write the --json payload", err)
+        self.assertIn("boot is refused", err)
+        self.assertEqual(P.EXIT_ERROR, res.rc,
+                         "a run that was asked for evidence and produced none must not "
+                         "let the boot through on the checks' own rc")
+
+    def test_a_render_failure_still_names_the_failing_check(self):
+        """PRO-313 review B1 state S3: a `render()` crash is not a licence for silence."""
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True)
+        text = res.out.decode("ascii")
+        self.assertIn("RESULT: FAIL", text)
+        self.assertIn("render() raised RuntimeError", text)
+        self.assertIn("dirty-worktree", text,
+                      "the degraded path has to name the finding, not just apologise")
+        self.assertIsNotNone(res.payload, "the evidence half is independent of the echo")
+        self.assertEqual(P.EXIT_FAIL, res.rc, "a presentation fallback must not change the verdict")
+
     def test_main_reports_through_the_surviving_paths(self):
-        """The unit tests above pass even if `main()` goes back to bare `print()`."""
+        """The one source-text pin that earns its keep: no bare `print()` in `main()`."""
         import inspect
         from preflight_worlddb import main
         src = inspect.getsource(main)
         self.assertNotIn("print(", src,
                          "a bare print() in main() puts the verdict back at the mercy "
                          "of the operator's stdout error handler (PRO-308 QA finding B)")
-        self.assertIn("_emit(sys.stdout, render(report, args))", src)
-        self.assertIn("_write_json_payload(args.json_out, payload)", src)
-        self.assertLess(src.index("_emit(sys.stdout"), src.index("_write_json_payload"),
-                        "the payload write is the one the traceback used to eat")
+
+    def test_the_payload_write_does_not_inherit_the_host_default_encoding(self):
+        """PRO-313 review M5: `encoding` is unobservable while `ensure_ascii` holds.
+
+        With `ensure_ascii=True` the serialised text is already pure ASCII, so no bytes
+        on disk can distinguish `encoding="utf-8"` from nothing — M5 survived the suite
+        for exactly that reason. The property worth pinning is the call contract: the
+        payload must never fall back to the host's default locale, which is what would
+        bite whoever relaxes `ensure_ascii`. So pin the call, and say plainly that this
+        is the weaker half.
+        """
+        import preflight_worlddb as P
+        calls = {}
+        original = P.Path.write_text
+
+        def spy(self, data, encoding=None, errors=None, newline=None):
+            calls["encoding"] = encoding
+            calls["ascii"] = data.isascii()
+            return len(data)
+
+        P.Path.write_text = spy
+        try:
+            P._write_json_payload(Path("never-written.json"), self._payload(self._report()))
+        finally:
+            P.Path.write_text = original
+        self.assertEqual("utf-8", calls.get("encoding"),
+                         "the payload followed the host's default encoding, so the file "
+                         "is no longer the same bytes on every host")
+        self.assertTrue(calls.get("ascii"),
+                        "ensure_ascii is the load-bearing half and it came off")
+
+    def test_the_payload_is_readable_on_a_c_locale_host(self):
+        """The environment-real version of the payload pin: a host with no usable locale."""
+        import os
+        import subprocess
+        import sys
+        code = (
+            "import json, pathlib, sys;"
+            "sys.path.insert(0, sys.argv[1]);"
+            "from preflight_worlddb import _write_json_payload;"
+            "raw = 'data/sql/qa_raw\\udcff.sql';"
+            "out = pathlib.Path(sys.argv[2]);"
+            "_write_json_payload(out, {'result': 'fail',"
+            " 'findings': [{'file': raw, 'message': 'caf' + chr(233)}]});"
+            "data = out.read_bytes();"
+            "assert data.isascii(), 'non-ASCII bytes: %r' % data[:80];"
+            "back = json.loads(data.decode('ascii'));"
+            "assert back['findings'][0]['file'] == raw, back;"
+            "assert back['findings'][0]['message'] == 'caf' + chr(233), back;"
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        env.update({"LC_ALL": "C", "LANG": "C",
+                    "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"})
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "verdict.json"
+            proc = subprocess.run([sys.executable, "-c", code, str(HERE), str(out)],
+                                  env=env, capture_output=True, text=True)
+            self.assertEqual(0, proc.returncode,
+                             f"a C-locale host could not write the payload: {proc.stderr}")
+            self.assertTrue(out.read_bytes().isascii())
 
 
 class TestTheGateCompilesQuietly(unittest.TestCase):
