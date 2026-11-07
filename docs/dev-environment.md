@@ -716,9 +716,14 @@ modules + confs), `docs/custom-class-template.md`, and the PRO-10 Warden
 seed. The clone must reach at least `ae1d9e5d0` (PRO-9 mod-unbound
 patch vendor — the pinned-base variant below pulls the snapshot from
 there, so it must contain the staged `unbound-core-access.patch`).
-While the execution workspace is ahead of the fork, sync it first —
-`git push origin Playerbot` from the execution workspace (pushes go through
-the company's managed GitHub identity, [PRO-7](/PRO/issues/PRO-7)).
+While the execution workspace is ahead of the fork, sync it first — publish
+the merge commit by explicit SHA from a detached worktree off
+`origin/Playerbot`, never a local branch by name
+(`git push origin <merge-sha>:refs/heads/Playerbot`, guarded by
+`scripts/merge-guard.sh`; rule:
+[content-playbook §5.4](content-playbook.md#54-merge), PRO-319/PRO-320).
+Pushes go through the company's managed GitHub identity,
+[PRO-7](/PRO/issues/PRO-7).
 
 ```bash
 git clone --branch=Playerbot https://github.com/Scuff-Project-Maple/azerothcore-wotlk.git azerothcore
