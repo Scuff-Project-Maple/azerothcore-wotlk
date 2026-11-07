@@ -4541,13 +4541,21 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 policy.write_text("{}")
                 if json_target == "default":
                     out_path = Path(td) / "verdict.json"
+                    json_arg = str(out_path)
                 elif json_target == "missing-dir":
                     out_path = Path(td) / "no-such-dir" / "verdict.json"
+                    json_arg = str(out_path)
+                elif json_target == "empty":
+                    # `--json ""` as an operator's `GATE_ARGS=(--json "$VAR")` yields it:
+                    # the flag is there, the path is not, so nothing may claim a file.
+                    out_path = Path(td) / "verdict.json"
+                    json_arg = ""
                 else:
                     out_path = None
+                    json_arg = None
                 argv = ["--compose-root", str(tree), "--policy", str(policy)]
-                if out_path is not None:
-                    argv += ["--json", str(out_path)]
+                if json_arg is not None:
+                    argv += ["--json", json_arg]
                 rc = None
                 raised = None
                 try:
@@ -4796,6 +4804,33 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertIn("is on disk", text)
         self.assertIn("--json payload", text)
 
+    def test_the_degraded_verdict_does_not_call_a_blank_json_target_a_payload(self):
+        """PRO-341 review B1: `--json ""` skips the write, so it may not claim the disk.
+
+        `main()` gated the write on truthiness and this note on `is None`. The wrapper
+        forwards unrecognised operator arguments verbatim, so an operator's
+        `--json "$TARGET"` with a blank `$TARGET` arrives here as an empty path, and
+        that run printed `the --json payload at  is on disk` while nothing was written.
+        Same class as PRO-325 NB2 (an absent thing asserted as present), one layer up,
+        and on the line an operator reads while the boot is being refused.
+
+        The rc is deliberately not pinned here: a blank `--json` still leaves
+        `payload_error` None, so it does not reach the evidence-missing refusal either.
+        That half predates this branch and is tracked separately; pinning `EXIT_FAIL`
+        now would make the follow-up look like a regression when it lands.
+        """
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="empty")
+        self.assertIsNone(res.payload, "fixture: a blank --json must write nothing")
+        text = res.out.decode("ascii")
+        self.assertIn("render() raised RuntimeError", text,
+                      "the fixture stopped exercising the degraded line")
+        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertNotIn("on disk", text,
+                         "the line still asserts evidence that was never written")
+        self.assertNotIn("unaffected", text)
+        self.assertNotIn("None", text, "a blank path must not leak as the word None")
+
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
     """PRO-325 NB1: `_emit` can guard its own flush; nothing guards the interpreter's.
@@ -4843,6 +4878,44 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         )
         return subprocess.run([sys.executable, "-c", code, str(HERE)], env=self._env(),
                               capture_output=True, text=True, **kwargs)
+
+    # The real `main()` under a terminal that will not have it. `{stdout_setup}` is the
+    # one thing the two end-to-end pins differ on, so the stub exists once.
+    _MAIN_DRIVER = '''
+        import pathlib
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        import preflight_worlddb as P
+
+
+        class StubPreflight:
+            def __init__(self, args, policy, report):
+                self.args, self.policy, self.report = args, policy, report
+                self.sql_root = pathlib.Path(args.compose_root) / "data" / "sql"
+
+            def run(self):
+                self.report.fail("3", "fixture: refused on purpose",
+                                 file="x.sql", rule="dirty-worktree")
+                return P.EXIT_FAIL
+
+
+        P.Preflight = StubPreflight
+        td = pathlib.Path(sys.argv[2])
+        (td / "tree" / "data" / "sql").mkdir(parents=True)
+        (td / "policy.json").write_text("{{}}")
+        {stdout_setup}
+        sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
+                         str(td / "policy.json"), "--json", str(td / "verdict.json")]))
+    '''
+
+    def _drive_real_main(self, driver, td):
+        import subprocess
+        import sys
+        import textwrap
+        script = Path(td) / "driver.py"
+        script.write_text(textwrap.dedent(driver))
+        return subprocess.run([sys.executable, str(script), str(HERE), str(td)],
+                              env=self._env(), capture_output=True, text=True)
 
     def test_the_reproduction_is_real_a_refusing_stdout_costs_120_without_the_fix(self):
         """Negative control, and the PRO-325 capture reproduced rather than restated.
@@ -4917,50 +4990,62 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         failed closed. That is why this is diagnosability work and not safety work — but
         the gate documents three exit codes and a fourth arriving from the interpreter is
         the difference between `Fix the named file(s)` and a wild goose chase.
+
+        The destination assertion is PRO-341 review N2: `main()` labels the channel it
+        aimed at (`<stdout>`), and that is not the thing the operator has to go and fix.
+        The notice has to name the device that refused, which is `/dev/full` here.
         """
-        import subprocess
-        import sys
-        import textwrap
         import preflight_worlddb as P
-        driver = textwrap.dedent('''
-            import pathlib
-            import sys
-            sys.path.insert(0, sys.argv[1])
-            import preflight_worlddb as P
-
-
-            class StubPreflight:
-                def __init__(self, args, policy, report):
-                    self.args, self.policy, self.report = args, policy, report
-                    self.sql_root = pathlib.Path(args.compose_root) / "data" / "sql"
-
-                def run(self):
-                    self.report.fail("3", "fixture: refused on purpose",
-                                     file="x.sql", rule="dirty-worktree")
-                    return P.EXIT_FAIL
-
-
-            P.Preflight = StubPreflight
-            td = pathlib.Path(sys.argv[2])
-            (td / "tree" / "data" / "sql").mkdir(parents=True)
-            (td / "policy.json").write_text("{}")
-            sys.stdout = open("/dev/full", "w")       # the operator's terminal refuses us
-            sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
-                             str(td / "policy.json"), "--json", str(td / "verdict.json")]))
-        ''')
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup='sys.stdout = open("/dev/full", "w")   # terminal refuses us')
         with tempfile.TemporaryDirectory() as td:
-            script = Path(td) / "driver.py"
-            script.write_text(driver)
-            proc = subprocess.run([sys.executable, str(script), str(HERE), str(td)],
-                                  env=self._env(), capture_output=True, text=True)
+            proc = self._drive_real_main(driver, td)
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"the gate exited a code it does not document: "
                              f"rc={proc.returncode} stderr={proc.stderr}")
             self.assertNotIn("Exception ignored", proc.stderr)
+            self.assertIn("could not write the report to <stdout> (/dev/full)", proc.stderr,
+                          "the notice names a channel, not the destination that refused; "
+                          "an operator cannot act on `<stdout>`")
             payload = Path(td) / "verdict.json"
             self.assertTrue(payload.is_file(),
                             "the evidence still has to survive a terminal that will not take it")
             self.assertEqual("fail", json.loads(payload.read_bytes().decode("ascii"))["result"])
+
+    def test_the_real_main_names_the_closed_fd_1_it_has_to_report_through(self):
+        """PRO-341 review N4: the production pairing — `main()`'s label plus a `None` stream.
+
+        `1>&-` is the PRO-325 `extraA` shape, and until now the only test of it called
+        `_emit` directly with no label, which is not how `main()` ever calls it. With the
+        label in play the channel is `<stdout>` and the stream object is `None`, so the
+        sentence has to carry both: what was aimed at, and that nothing is attached.
+        """
+        import shlex
+        import subprocess
+        import sys
+        import textwrap
+        import preflight_worlddb as P
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup="pass   # fd 1 was closed by the shell before the interpreter ran")
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "driver.py"
+            script.write_text(textwrap.dedent(driver))
+            shell = (f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+                     f"{shlex.quote(str(HERE))} {shlex.quote(str(td))} 1>&-")
+            proc = subprocess.run(["/bin/sh", "-c", shell], env=self._env(),
+                                  capture_output=True, text=True)
+            self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                             f"a closed fd 1 changed the verdict too: rc={proc.returncode} "
+                             f"stderr={proc.stderr}")
+            self.assertNotIn("Exception ignored", proc.stderr)
+            self.assertNotIn("report to None", proc.stderr,
+                             "the operator is reading the word None where a destination belongs")
+            self.assertIn("could not write the report to <stdout> (nothing is attached to it)",
+                          proc.stderr,
+                          "the production line must say both what was aimed at and what is "
+                          "missing; fd 2 is how the notice still gets out")
+            self.assertTrue((Path(td) / "verdict.json").is_file(),
+                            "the evidence still has to survive a terminal that is not there")
 
     def test_a_closed_fd_1_is_named_instead_of_rendered_as_none(self):
         """PRO-325 NB2 (`extraA`): `1>&-` leaves `sys.stdout` None, and `repr(None)` is 'None'.
@@ -5001,6 +5086,9 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         self.assertIsNone(retired.close())
         self.assertIsNone(retired.writelines(["a", "b"]))
         self.assertFalse(retired.isatty())
+        self.assertTrue(getattr(retired, "closed", False),
+                        "flush_std_files() skips a stream that reports itself closed; "
+                        "without this the rc guarantee rests only on flush() staying inert")
         self.assertEqual("<stdout>", retired.name)
         self.assertEqual("utf-8", retired.encoding)
         for name in ("encoding", "errors"):
@@ -5052,6 +5140,34 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         self.assertNotEqual("None", label)
         self.assertNotIn("None", label)
         self.assertIn("not open", label)
+
+    def test_the_note_and_the_label_are_call_site_obligations(self):
+        """PRO-341 review N1 + N5: neither sentence may be defaulted at the callee.
+
+        `label` used to be `_emit`'s third positional and `payload_note` used to default
+        to a claim about a payload nobody had checked. Both defaults let a caller stay
+        silent and still print something authoritative about a destination. Keyword-only
+        is what forces the caller to state what it means; `payload_note` is additionally
+        required, because `main()` is the only caller and it always knows the truth.
+        """
+        import inspect
+        import preflight_worlddb as P
+
+        label_param = inspect.signature(P._emit).parameters["label"]
+        self.assertIs(inspect.Parameter.KEYWORD_ONLY, label_param.kind,
+                      "a positional label invites a caller to pass the stream twice "
+                      "and mean something else entirely")
+        with self.assertRaises(TypeError):
+            P._emit(None, "verdict text", "<stdout>")
+
+        note_param = inspect.signature(P._render_or_say_why).parameters["payload_note"]
+        self.assertIs(inspect.Parameter.KEYWORD_ONLY, note_param.kind)
+        self.assertIs(inspect.Parameter.empty, note_param.default,
+                      "a defaulted payload note is how PRO-341 B1 got written")
+        with self.assertRaises(TypeError):
+            P._render_or_say_why(object(), object())
+        with self.assertRaises(TypeError):
+            P._render_or_say_why(object(), object(), "the --json payload at  is on disk")
 
 
 class TestTheGateCompilesQuietly(unittest.TestCase):
