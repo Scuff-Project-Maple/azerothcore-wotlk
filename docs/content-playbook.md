@@ -516,6 +516,9 @@ scripts/merge-guard.sh <branch>                  # refuse if refs/heads/<branch>
 scripts/merge-guard.sh --publish <sha> <branch>  # + require <sha> to fast-forward origin/<branch>
 ```
 
+Full flag list (`--repo PATH`, `--remote NAME`, `--publish SHA`, `--allow-ahead`)
+and exit codes (0 safe / 1 refused / 2 usage or not a repo): `scripts/merge-guard.sh --help`.
+
 Exit 0 means publishing as prescribed is safe; exit 1 means it refused and
 printed the safe command instead. `--allow-ahead` downgrades "local branch
 carries local-only commits" to a warning and is not for the integration

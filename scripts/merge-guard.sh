@@ -84,13 +84,31 @@ safe_pattern() {
   local sha=${1:-<merge-sha>}
   echo
   say "Safe pattern (never a local branch by name):"
-  say "  git fetch origin"
+  say "  git fetch $remote"
   say "  git worktree add <scratch> --detach $remote/$line"
   say "  # merge there, then publish the resulting commit by explicit SHA:"
   say "  scripts/merge-guard.sh --publish $sha $line"
-  say "  git push origin $sha:refs/heads/$line"
+  say "  git push $remote $sha:refs/heads/$line"
   say "Publish that SHA only. Never --all / --mirror / --tags: the archive/*"
   say "tags kept for PRO-319's abandoned local line stay local."
+}
+
+# A local-branch refusal is decided before the fast-forward check, so a diverged
+# branch plus a non-fast-forward --publish SHA used to report one fault and hide
+# the other. Diagnostic only: it never changes the verdict or the exit code, and
+# an unresolvable SHA is simply not reported rather than turning exit 1 into 2.
+report_publish_ff_fault() {
+  local sha
+  sha=$(git -C "$repo" rev-parse --verify --quiet "$publish^{commit}" 2>/dev/null) || return 0
+  if git -C "$repo" merge-base --is-ancestor "$remote_sha" "$sha"; then
+    say "  Also checked: --publish $publish @ ${sha:0:9} IS a fast-forward over"
+    say "  $remote/$line @ ${remote_sha:0:9}. The diverged local branch alone is what got this refused."
+  else
+    say "  AND — --publish $publish @ ${sha:0:9} is NOT a fast-forward over"
+    say "  $remote/$line @ ${remote_sha:0:9} either. The line moved too, so re-merge"
+    say "  in a fresh detached worktree before publishing anything."
+  fi
+  return 0
 }
 
 if ! remote_sha=$(git -C "$repo" rev-parse --verify --quiet "$remote_ref^{commit}"); then
@@ -120,11 +138,11 @@ if ! local_sha=$(git -C "$repo" rev-parse --verify --quiet "$local_ref^{commit}"
       say "  $publish is already the tip of $remote/$line — nothing to publish."
     else
       say "  $publish is a fast-forward over $remote/$line — safe to publish:"
-      say "  git push origin ${publish_sha}:refs/heads/$line"
+      say "  git push $remote ${publish_sha}:refs/heads/$line"
     fi
   else
     say "  publish by explicit SHA, never by branch name:"
-    say "  git push origin <merge-sha>:refs/heads/$line"
+    say "  git push $remote <merge-sha>:refs/heads/$line"
   fi
   exit 0
 fi
@@ -165,11 +183,11 @@ if [[ $ahead -eq 0 && $behind -eq 0 ]]; then
       say "  $publish is already the tip of $remote/$line — nothing to publish."
     else
       say "  $publish is a fast-forward over $remote/$line — safe to publish:"
-      say "  git push origin ${publish_sha}:refs/heads/$line"
+      say "  git push $remote ${publish_sha}:refs/heads/$line"
     fi
   else
     say "  publish the merge commit by SHA from the detached worktree:"
-    say "  git push origin <merge-sha>:refs/heads/$line"
+    say "  git push $remote <merge-sha>:refs/heads/$line"
   fi
   exit 0
 fi
@@ -206,12 +224,17 @@ if [[ $verdict == refuse ]]; then
   say "Why: a local branch is a snapshot. Publishing it by name can drop commits"
   say "the line already has, or publish unreviewed work — and the 'Fast-forward'"
   say "git prints makes that look like a clean merge (PRO-319)."
+  if [[ -n $publish ]]; then
+    report_publish_ff_fault
+  fi
   safe_pattern "${publish:-<merge-sha>}"
   exit 1
 fi
 
 warn "local '$line' $reason — it is not what gets published by a SHA push, but"
 warn "  it is the habit that produced PRO-319. Realign it: git branch -f $line $remote/$line"
+say "  local   $local_ref @ ${local_sha:0:9}"
+say "  line    $remote_ref @ ${remote_sha:0:9}"
 if [[ -n $publish ]]; then
   publish_sha=$(git -C "$repo" rev-parse --verify --quiet "$publish^{commit}" \
     || { echo "merge-guard: --publish: not a commit: $publish" >&2; exit 2; })
@@ -224,10 +247,10 @@ if [[ -n $publish ]]; then
   fi
   say "ok — $publish is a fast-forward over $remote/$line @ ${remote_sha:0:9}"
   say "  publish it, and only it:"
-  say "  git push origin ${publish_sha}:refs/heads/$line"
+  say "  git push $remote ${publish_sha}:refs/heads/$line"
   exit 0
 fi
 say "ok — nothing refused for a SHA publish, but no --publish SHA was given"
 say "  publish by explicit SHA, never by branch name:"
-say "  git push origin <merge-sha>:refs/heads/$line"
+say "  git push $remote <merge-sha>:refs/heads/$line"
 exit 0
