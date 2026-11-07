@@ -1941,7 +1941,7 @@ class Preflight:
         return "unknown", f"unrecognised directory origin {dir_origin!r} for {f['dir']['db_path']}"
 
     def dirty_paths(self) -> set | None:
-        """Work-tree-modified paths, lower-cased and posix-normalised; None if unknown.
+        r"""Work-tree-modified paths, lower-cased and posix-normalised; None if unknown.
 
         Provenance is read from HEAD (`git_author_origin`), so a file that
         upstream-provenances cleanly but was hand-edited in the work tree keeps
@@ -3155,6 +3155,45 @@ CHECK_TITLES = {
 }
 
 
+def _emit(stream, text: str) -> None:
+    r"""Write a report block to a stream; never let the codec eat the verdict.
+
+    What `print()` survives is the operator's locale, not the gate's. `dirty_paths()`
+    decodes `git status` with `surrogateescape` (PRO-301 review B1/B2) so a path that
+    is not valid UTF-8 arrives here as a lone surrogate, and a stream with a strict
+    error handler refuses to encode one: the `UnicodeEncodeError` lands between
+    `render()` and the `--json` write, so the boot is still refused (rc != 0) but the
+    operator gets a traceback instead of the reason, and the machine-readable payload
+    is never written at all (PRO-308 QA finding B). A gate that fails closed while
+    withholding why is the worst shape this file can be in, so escape whatever the
+    codec refuses — `backslashreplace` renders `qa_raw\udcff.sql` as visible ASCII
+    the operator can still identify — and keep going to the verdict line.
+    """
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        stream.write(text + "\n")
+    except UnicodeEncodeError:
+        stream.write(text.encode(encoding, "backslashreplace").decode(encoding,
+                                                                       "backslashreplace"))
+        stream.write("\n")
+    stream.flush()
+
+
+def _write_json_payload(path, payload: dict) -> None:
+    """Write the machine-readable verdict, byte-safe whatever a path name holds.
+
+    `ensure_ascii` is load-bearing, not stylistic (PRO-308 QA finding B): it is what
+    keeps a surrogate-bearing path name — the price of `surrogateescape` in
+    `dirty_paths()` — out of the encoded stream, so the payload still lands on a
+    locale whose codec cannot hold the byte. Do not "fix" this to
+    `ensure_ascii=False` for prettier JSON; that re-opens the hole, and the caller
+    would then have a traceback where its evidence should be.
+    """
+    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True,
+                                      ensure_ascii=True),
+                          encoding="utf-8")
+
+
 def render(report: Report, args) -> str:
     out = []
     out.append("PRO-179 world-DB updater pre-flight")
@@ -3248,7 +3287,7 @@ def main(argv=None) -> int:
     args.compose_file = args.compose_file or []
     policy_path = Path(args.policy)
     if not policy_path.is_file():
-        print(f"preflight: policy file not found: {policy_path}", file=sys.stderr)
+        _emit(sys.stderr, f"preflight: policy file not found: {policy_path}")
         return EXIT_ERROR
     policy = json.loads(policy_path.read_text())
     if args.live_db is None:
@@ -3265,12 +3304,12 @@ def main(argv=None) -> int:
         report.data["sql_root"] = str(pf.sql_root)
         rc = pf.run()
     except OperationalError as exc:
-        print(f"preflight: operational error: {exc}", file=sys.stderr)
+        _emit(sys.stderr, f"preflight: operational error: {exc}")
         return EXIT_ERROR
 
     report.data["elapsed_s"] = round(time.monotonic() - t0, 1)
     if not args.json_only:
-        print(render(report, args))
+        _emit(sys.stdout, render(report, args))
     if args.json_out:
         payload = {
             "result": "fail" if report.failed else "pass",
@@ -3279,7 +3318,9 @@ def main(argv=None) -> int:
             "sections": report.sections,
             "findings": [f.__dict__ for f in report.findings],
         }
-        Path(args.json_out).write_text(json.dumps(payload, indent=2, sort_keys=True))
+        # The verdict is the product, so both halves of it must survive an operator
+        # whose locale cannot encode what `git` reported (PRO-308 QA finding B).
+        _write_json_payload(args.json_out, payload)
     return rc
 
 

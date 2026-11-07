@@ -86,6 +86,16 @@ its original path as the *following* field, not as `"old -> new"`, and both side
 The output is decoded with `surrogateescape` so a path that is not valid UTF-8 at all comes back
 byte-for-byte. Do not tidy any of those away.
 
+That last choice is what makes such a name *count* as dirty, and it also puts a lone surrogate into
+the report — so the reporting layer has to be able to carry it (PRO-308 QA finding B). Whether
+`print()` survives one is the operator's locale, not the gate's: on the deploy host a
+`UnicodeEncodeError` landed between `render()` and the `--json` write, and the boot was refused with
+a traceback, no stated reason and no payload. `_emit()` therefore escapes what the stream's codec
+refuses (`backslashreplace`, so the name is still identifiable) and `_write_json_payload()` pins
+`ensure_ascii=True` plus an explicit `encoding="utf-8"`. A gate that fails closed while withholding
+why is the worst shape it can be in; both are pinned by tests, including one that reads `main()` and
+forbids a bare `print()`.
+
 ### The third tag: the tracked upstream ref (PRO-248)
 
 Directory tag plus author tag is a claim about **history**, and history metadata is cheap to

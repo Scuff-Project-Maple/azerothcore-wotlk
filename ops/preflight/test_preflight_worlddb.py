@@ -3294,5 +3294,130 @@ class TestTheCiWorkflowMatchesItsDocumentation(unittest.TestCase):
                              "README re-adopted a CI claim about a check that does not exist: %r" % gone)
 
 
+class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
+    """PRO-308 QA finding B: the report layer may not lose the verdict it produced.
+
+    `dirty_paths()` decodes `git status` with `surrogateescape` (PRO-301 review B1/B2)
+    precisely so a path that is not valid UTF-8 counts as dirty instead of reading
+    clean. The price is that the name reaches the report as a lone surrogate, and
+    whether that survives the trip to a human is a property of the operator's locale,
+    not of the gate. On the deploy host it did not survive: `print(render(...))` raised
+    `UnicodeEncodeError: 'utf-8' codec can't encode character '\\udcff'` between the
+    verdict and the `--json` write, so the boot was refused (rc=1, correctly) while the
+    operator got a traceback, no reason, and no payload.
+
+    A gate that fails closed and withholds why is the worst shape this file can be in.
+    These pin the answer rather than the symptom, and each carries a negative control
+    proving the fixture is still the shape under test — the box these run on answers
+    `surrogateescape` for stdout by default, which would let the regression back in.
+    """
+
+    RAW = "data/sql/updates/db_world/2026_11_04_00_qa_raw\udcff.sql"
+
+    def _report(self) -> Report:
+        r = Report()
+        r.fail("3", f"{self.RAW} is upstream-provenanced at HEAD but has uncommitted "
+                    "changes, so it is checked against the write policy",
+               file=self.RAW, rule="dirty-worktree")
+        r.data["elapsed_s"] = 0.1
+        return r
+
+    def _payload(self, r: Report) -> dict:
+        """The same dict `main()` builds, so the payload test cannot drift from it."""
+        return {"result": "fail" if r.failed else "pass",
+                "data": r.data,
+                "sections": r.sections,
+                "findings": [f.__dict__ for f in r.findings]}
+
+    def _strict_stream(self):
+        """A stream with a strict error handler — the deploy host's shape, forced."""
+        buf = io.BytesIO()
+        return io.TextIOWrapper(buf, encoding="utf-8", errors="strict"), buf
+
+    def test_a_strict_stdout_that_refuses_the_name_still_gets_the_verdict(self):
+        from preflight_worlddb import _emit, render
+        r = self._report()
+        text = render(r, build_arg_parser().parse_args(["--compose-root", "/nonexistent"]))
+        stream, buf = self._strict_stream()
+        with self.assertRaises(UnicodeEncodeError):
+            stream.write(text + "\n")
+        self.assertEqual(b"", buf.getvalue(),
+                         "the fixture stopped being the shape this test is about")
+        stream, buf = self._strict_stream()
+        _emit(stream, text)
+        written = buf.getvalue().decode("utf-8", "backslashreplace")
+        self.assertIn("RESULT: FAIL", written,
+                      "the codec swallowed the verdict, which is finding B")
+        self.assertIn("dirty-worktree", written,
+                      "the verdict arrived without the reason for it")
+        self.assertIn("qa_raw", written)
+        self.assertIn("\\udcff", written,
+                      "the offending name was dropped rather than escaped; an operator "
+                      "has to be able to identify the file it is about")
+
+    def test_the_json_payload_lands_when_a_path_name_is_not_utf_8(self):
+        from preflight_worlddb import _write_json_payload
+        r = self._report()
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "verdict.json"
+            _write_json_payload(out, self._payload(r))
+            self.assertTrue(out.is_file(), "the machine-readable verdict was never written")
+            raw = out.read_bytes()
+            self.assertTrue(raw.isascii(),
+                            "a non-ASCII byte in the payload is what makes the write "
+                            "depend on the locale again")
+            self.assertIn(b"\\udcff", raw)
+            back = json.loads(raw.decode("ascii"))
+            self.assertEqual("fail", back["result"])
+            self.assertEqual(self.RAW, back["findings"][0]["file"],
+                             "the escape lost the name instead of preserving it")
+            # Negative control: the flag is load-bearing, not stylistic. Anyone who
+            # "tidies" it away re-opens the hole on a locale that cannot hold the byte.
+            self.assertFalse(json.dumps(self._payload(r), ensure_ascii=False).isascii())
+
+    def test_main_reports_through_the_surviving_paths(self):
+        """The unit tests above pass even if `main()` goes back to bare `print()`."""
+        import inspect
+        from preflight_worlddb import main
+        src = inspect.getsource(main)
+        self.assertNotIn("print(", src,
+                         "a bare print() in main() puts the verdict back at the mercy "
+                         "of the operator's stdout error handler (PRO-308 QA finding B)")
+        self.assertIn("_emit(sys.stdout, render(report, args))", src)
+        self.assertIn("_write_json_payload(args.json_out, payload)", src)
+        self.assertLess(src.index("_emit(sys.stdout"), src.index("_write_json_payload"),
+                        "the payload write is the one the traceback used to eat")
+
+
+class TestTheGateCompilesQuietly(unittest.TestCase):
+    """PRO-308 QA finding C: a SyntaxWarning here is a warning nobody reads, forever.
+
+    PRO-301's `dirty_paths()` docstring wrote `` `\\` `` and `\\"` in prose. Python kept
+    the invalid escape but warned on it on every import, and warned *silently* on the
+    valid one — `\\"` arrived as `"`, quietly rewriting the C-quoted example the docstring
+    exists to show. Both are fixed by making it raw; this pins the class, not the one
+    docstring, because the next piece of prose about git quoting will want a backslash
+    too and preflight logs are read by eye.
+    """
+
+    def test_the_module_compiles_without_syntax_warnings(self):
+        import warnings
+        src = (HERE / "preflight_worlddb.py").read_text()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SyntaxWarning)
+            try:
+                compile(src, "preflight_worlddb.py", "exec")
+            except SyntaxWarning as exc:
+                self.fail(f"a warning the CI log will attribute to nothing: {exc}")
+
+    def test_the_dirty_paths_docstring_still_shows_the_quoted_form(self):
+        doc = Preflight.dirty_paths.__doc__
+        self.assertIsNotNone(doc)
+        self.assertIn('we\\"ird.sql', doc,
+                      "the raw flag changed the C-quoted example the docstring is about")
+        self.assertIn("`\\`", doc)
+        self.assertNotIn("\udcff", doc, "a prose docstring is not a place for a surrogate")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
