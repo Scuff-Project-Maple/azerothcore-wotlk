@@ -4492,7 +4492,38 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         def value(self) -> bytes:
             return self.buffer.getvalue()
 
+    class _HostileFinding:
+        """A finding that raises the moment the presentation layer reads it.
+
+        `fail()/warn()/info()` cannot produce one, which is exactly why PRO-324 NB1 was
+        non-blocking; the degraded path still has to survive it, because the degraded
+        path is a guard and a guard that raises back into `main()` is the defect it
+        exists to cover. `severity` stays readable so `report.failed` — which `main()`
+        needs for the payload and this class needs for the header — still answers; the
+        attributes only the *listing* touches are the ones that blow up.
+        """
+
+        def __init__(self):
+            self.severity = "FAIL"
+
+        @property
+        def check(self):
+            raise RuntimeError("fixture: .check is unreadable")
+
+        @property
+        def file(self):
+            raise RuntimeError("fixture: .file is unreadable")
+
+        @property
+        def rule(self):
+            raise RuntimeError("fixture: .rule is unreadable")
+
+        @property
+        def message(self):
+            raise RuntimeError("fixture: .message is unreadable")
+
     def _drive_main(self, stdout, stderr, *, render_raises=False, json_target="default",
+                    stub_rc=None, stub_findings=True, hostile_report=False,
                     expect_raises=False):
         """Run the real `main()` with the gate stubbed and the operator's streams swapped.
 
@@ -4501,12 +4532,28 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         tell you which half loses when the other one throws, and it pins the shape that
         caused finding B in the first place (PRO-313 review B1). This drives the real
         function and measures both halves.
+
+        `stub_rc` is what the gate's own checks return (PRO-324 NB3): with it pinned to
+        `EXIT_FAIL` every payload case ran on an already-failing run, so the one shape
+        that changes what boots — checks pass, `--json` asked for, payload unwritable —
+        was untested. `stub_findings=False` makes that stub honest about a passing run
+        instead of pairing an rc of 0 with a FAIL finding. `hostile_report` adds
+        `_HostileFinding` for the NB1 pins.
+
+        The `_render_or_say_why` wrapper is the ordering pin (PRO-324 NB1 corollary).
+        It asks the presentation half, at the moment it runs, whether the evidence half
+        already landed — which is the property the ordering exists to buy. Hoisting the
+        `_emit(sys.stdout, _render_or_say_why(...))` call above the payload write used to
+        survive the suite, because the ordering rested on that function never raising;
+        now that it genuinely cannot, the ordering gets a test of its own rather than
+        inheriting one.
         """
         import sys
         import types
         import preflight_worlddb as P
 
         raw = self.RAW
+        hostile_cls = self._HostileFinding
 
         class StubPreflight:
             def __init__(self, args, policy, report):
@@ -4514,18 +4561,30 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 self.sql_root = Path(args.compose_root) / "data" / "sql"
 
             def run(self):
-                self.report.fail("3",
-                                 f"{raw} is upstream-provenanced at HEAD but has "
-                                 "uncommitted changes, so it is checked against the "
-                                 "write policy",
-                                 file=raw, rule="dirty-worktree")
-                return P.EXIT_FAIL
+                if stub_findings:
+                    self.report.fail("3",
+                                     f"{raw} is upstream-provenanced at HEAD but has "
+                                     "uncommitted changes, so it is checked against the "
+                                     "write policy",
+                                     file=raw, rule="dirty-worktree")
+                if hostile_report:
+                    self.report.findings.append(hostile_cls())
+                return P.EXIT_FAIL if stub_rc is None else stub_rc
 
         def boom(report, args):
             raise RuntimeError("fixture: render() blew up")
 
-        original = (P.Preflight, P.render, sys.stdout, sys.stderr, sys.__stderr__)
+        seen = {}
+        real_render_or_say_why = P._render_or_say_why
+
+        def spy_render_or_say_why(report, args, payload_error=None):
+            seen["payload_existed"] = out_path is not None and out_path.is_file()
+            return real_render_or_say_why(report, args, payload_error)
+
+        original = (P.Preflight, P.render, P._render_or_say_why,
+                    sys.stdout, sys.stderr, sys.__stderr__)
         P.Preflight = StubPreflight
+        P._render_or_say_why = spy_render_or_say_why
         if render_raises:
             P.render = boom
         # `sys.__stderr__` is where `_emit` names a presentation failure; capture it so
@@ -4559,10 +4618,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 if out_path is not None and out_path.is_file():
                     payload = out_path.read_bytes()
         finally:
-            P.Preflight, P.render, sys.stdout, sys.stderr, sys.__stderr__ = original
+            (P.Preflight, P.render, P._render_or_say_why,
+             sys.stdout, sys.stderr, sys.__stderr__) = original
         return types.SimpleNamespace(rc=rc, raised=raised, payload=payload,
                                       out=stdout.value(), err=stderr.value(),
-                                      fallback=fallback.value())
+                                      fallback=fallback.value(),
+                                      payload_existed_at_render=seen.get("payload_existed"))
 
     def test_the_payload_survives_a_stdout_that_refuses_to_flush(self):
         """PRO-313 review B1 state S2: the printed half must not cost the evidence.
@@ -4686,6 +4747,213 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                       "the degraded path has to name the finding, not just apologise")
         self.assertIsNotNone(res.payload, "the evidence half is independent of the echo")
         self.assertEqual(P.EXIT_FAIL, res.rc, "a presentation fallback must not change the verdict")
+
+    # ---- PRO-324 re-review, non-blocking NB1-NB4 -------------------------- #
+
+    def test_the_degraded_line_says_the_payload_was_already_written(self):
+        """PRO-324 NB2, shape 1: the payload really is on disk when this line prints."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True)
+        text = res.out.decode("ascii")
+        self.assertIn("the --json payload was written before this line", text)
+        self.assertNotIn("unaffected", text,
+                         "the old unconditional claim is back: it asserted a payload "
+                         "this run had not proved anything about")
+        self.assertIsNotNone(res.payload)
+        self.assertTrue(res.payload_existed_at_render,
+                        "the line says the evidence landed first; the ordering is what "
+                        "makes that true, so check it too")
+
+    def test_the_degraded_line_says_no_payload_was_requested(self):
+        """PRO-324 NB2, shape 2: with no `--json` there is no payload to be unaffected."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target=None)
+        text = res.out.decode("ascii")
+        self.assertIn("no --json payload was requested", text)
+        self.assertNotIn("unaffected", text)
+        self.assertNotIn("--json payload was written", text,
+                         "a run that wrote no payload must not claim it did")
+        self.assertIsNone(res.payload)
+
+    def test_the_degraded_line_says_the_payload_failed_too(self):
+        """PRO-324 NB2, shape 3 — the double fault the reviewer measured.
+
+        Payload unwritable *and* `render()` crashed: `main()` is about to return
+        `EXIT_ERROR` because the payload is missing, so stdout may not tell the operator
+        the payload is fine.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="missing-dir")
+        text = res.out.decode("ascii")
+        self.assertIn("the --json payload could not be written either", text)
+        self.assertNotIn("unaffected", text,
+                         "the degraded line called the payload unaffected on the one "
+                         "shape where it is the reason the boot is refused")
+        self.assertNotIn("was written before this line", text)
+        self.assertIsNone(res.payload)
+        self.assertEqual(P.EXIT_ERROR, res.rc)
+        err = res.err.decode("ascii")
+        self.assertIn("could not write the --json payload", err)
+        self.assertIn("boot is refused", err)
+
+    def test_checks_that_pass_still_refuse_the_boot_when_the_payload_cannot_be_written(self):
+        """PRO-324 NB3: the case that actually changes what boots.
+
+        Every earlier payload-failure case ran on a stub that always returned
+        `EXIT_FAIL`, so the refusal was invisible — the boot was already being refused
+        for another reason. Here the checks pass, and only the missing evidence refuses
+        the boot; without the `EXIT_ERROR` this run would boot on rc 0.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               stub_rc=P.EXIT_OK, stub_findings=False,
+                               json_target="missing-dir")
+        self.assertIn("RESULT: PASS", res.out.decode("ascii"),
+                      "the fixture stopped being a passing run")
+        self.assertIsNone(res.payload)
+        self.assertEqual(P.EXIT_ERROR, res.rc,
+                         "checks passed and the operator asked for evidence that never "
+                         "landed; that is a refusal, not a boot")
+        self.assertNotEqual(P.EXIT_OK, res.rc)
+        err = res.err.decode("ascii")
+        self.assertIn("could not write the --json payload", err)
+        self.assertIn("boot is refused", err)
+        self.assertIn("not a finding about your SQL", err,
+                      "PRO-324 NB4: a filesystem failure must not be routed into the "
+                      "SQL lane by the message that follows it")
+
+    def test_a_report_that_raises_while_being_read_still_prints_the_verdict(self):
+        """PRO-324 NB1: the degraded listing is a guard, so its own body is guarded too.
+
+        Before the fix the loop and the join sat outside any `try`, so this report —
+        unreadable where only the *listing* needs it — escaped `_render_or_say_why` into
+        `main()` and the run died at rc 1 with no verdict on stdout at all.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               hostile_report=True)
+        self.assertIsNone(res.raised)
+        text = res.out.decode("ascii")
+        self.assertIn("PRO-179 world-DB updater pre-flight", text)
+        self.assertIn("RESULT: FAIL", text,
+                      "the verdict was lost with the listing that failed to print it")
+        self.assertIn("boot refused", text)
+        self.assertNotIn("unformatted below", text,
+                         "the listing did not survive, so this is the last resort and "
+                         "not the degraded path — the two must not be conflated")
+        self.assertIsNotNone(res.payload, "the evidence half is independent of the echo")
+        self.assertEqual(P.EXIT_FAIL, res.rc)
+
+    def test_the_double_fault_still_prints_the_verdict_and_the_payload_notice(self):
+        """PRO-324 NB1, the reviewer's measured shape: nothing at all was said.
+
+        An unreadable report *and* an unwritable payload. The unguarded fallback used to
+        raise back into `main()`, which cost both the printed verdict and the
+        `payload_error` notice that `main()` prints after this call.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               hostile_report=True, json_target="missing-dir")
+        self.assertIsNone(res.raised)
+        text = res.out.decode("ascii")
+        self.assertIn("PRO-179 world-DB updater pre-flight", text)
+        self.assertIn("RESULT:", text)
+        err = res.err.decode("ascii")
+        self.assertIn("could not write the --json payload", err,
+                      "the notice that only prints after `_render_or_say_why` returns "
+                      "never printed, which was the other half of the finding")
+        self.assertIn("boot is refused", err)
+        self.assertEqual(P.EXIT_ERROR, res.rc)
+
+    def test_the_payload_is_on_disk_before_the_presentation_half_runs(self):
+        """PRO-324 NB1 corollary: the ordering is pinned by behaviour, on both paths.
+
+        Hoisting `_render_or_say_why()` above the payload write survived the old suite,
+        because the ordering was only ever guaranteed by that function never raising. It
+        cannot raise now, so the ordering needs its own pin: ask the presentation half,
+        at the moment it runs, whether the evidence half already landed.
+        """
+        for shape, kwargs in (("primary", {}), ("degraded", {"render_raises": True})):
+            with self.subTest(shape=shape):
+                res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                                       **kwargs)
+                self.assertTrue(res.payload_existed_at_render,
+                                f"{shape} path presented the verdict before the evidence "
+                                f"was on disk; the halves have to be written in that order")
+                self.assertIsNotNone(res.payload)
+
+    def test_a_finding_with_no_rule_is_not_printed_as_none(self):
+        """PRO-324 NB5 (taken): both render sites guard `f.rule` like they guard `f.file`."""
+        import preflight_worlddb as P
+        from preflight_worlddb import _render_or_say_why, render
+        args = build_arg_parser().parse_args(["--compose-root", "/nonexistent"])
+        r = Report()
+        r.fail("4", "unbounded DELETE without a WHERE", file="data/sql/x.sql")
+        r.warn("4", "OR in WHERE")
+        text = render(r, args)
+        self.assertIn("unbounded DELETE without a WHERE", text)
+        self.assertIn("OR in WHERE", text)
+        self.assertNotIn("None:", text, "the primary path printed the word None:")
+        original = P.render
+        P.render = lambda rep, a: (_ for _ in ()).throw(RuntimeError("fixture"))
+        try:
+            degraded = _render_or_say_why(r, args, None)
+        finally:
+            P.render = original
+        self.assertIn("unbounded DELETE without a WHERE", degraded)
+        self.assertIn("[4] FAIL data/sql/x.sql: unbounded DELETE without a WHERE", degraded)
+        self.assertIn("[4] WARN OR in WHERE", degraded)
+        self.assertNotIn("None:", degraded, "the degraded path drifted from the primary one")
+
+    def test_a_report_whose_verdict_cannot_be_read_still_gets_a_header(self):
+        """PRO-324 NB1, the last resort itself: even the `RESULT:` line may not raise.
+
+        The header is not free — `report.failed` reads the findings — so a report that
+        is unreadable all the way down has to be answered with a literal, or the guard
+        has the same hole it exists to close. Driven directly because `main()` cannot
+        build its payload from a report that hostile either; the property under test is
+        this function's contract, which is that it returns a string.
+        """
+        import preflight_worlddb as P
+        from preflight_worlddb import _render_or_say_why
+
+        class Unreadable:
+            @property
+            def failed(self):
+                raise RuntimeError("fixture: .failed is unreadable")
+
+            @property
+            def findings(self):
+                raise RuntimeError("fixture: .findings is unreadable")
+
+        args = build_arg_parser().parse_args(["--compose-root", "/nonexistent"])
+        original = P.render
+        P.render = lambda rep, a: (_ for _ in ()).throw(RuntimeError("fixture"))
+        try:
+            text = _render_or_say_why(Unreadable(), args,
+                                      "preflight: could not write the --json payload")
+        finally:
+            P.render = original
+        self.assertIn("PRO-179 world-DB updater pre-flight", text)
+        self.assertIn("RESULT: unreadable", text)
+        self.assertNotIn("unformatted below", text)
+
+    def test_the_refusal_comment_does_not_claim_the_boot_path_asks_for_the_payload(self):
+        """PRO-324 NB4: the comment is what the next reader trusts, so pin its claim.
+
+        It used to say the boot path asks for the payload and trusts it as the evidence.
+        `ops/deploy/worldserver-up.sh` does not pass `--json` at all — it is an operator
+        opt-in — so that sentence sends the next reader looking for a flag that is not
+        there. Behaviour cannot catch a comment, which is the one case where a source
+        text pin earns its keep alongside the `print()` pin below.
+        """
+        import inspect
+        from preflight_worlddb import main
+        src = inspect.getsource(main)
+        self.assertNotIn("The boot path asks for the payload", src)
+        self.assertIn("opt-in", src)
+        self.assertIn("an operator who does ask for the payload", src)
 
     def test_main_reports_through_the_surviving_paths(self):
         """The one source-text pin that earns its keep: no bare `print()` in `main()`."""

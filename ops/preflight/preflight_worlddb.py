@@ -3968,6 +3968,16 @@ def _write_json_payload(path, payload: dict) -> None:
                           encoding="utf-8")
 
 
+def _rule_prefix(f) -> str:
+    """`rule` is optional on a Finding, so print it only when it exists (PRO-324 NB5).
+
+    The same line already guards `f.file`; an unguarded `f.rule` printed the word
+    `None:` in front of a finding that has no rule, on both the primary and the
+    degraded path. Both sites use this so they cannot drift apart again.
+    """
+    return f"{f.rule}: " if f.rule else ""
+
+
 def render(report: Report, args) -> str:
     out = []
     out.append("PRO-179 world-DB updater pre-flight")
@@ -3984,17 +3994,34 @@ def render(report: Report, args) -> str:
         for text in report.sections.get(key, []):
             out.append("    " + text)
         for f in fails:
-            out.append(f"    !! {f.rule}: {f.message}")
+            out.append(f"    !! {_rule_prefix(f)}{f.message}")
         for f in warns:
-            out.append(f"    ~  {f.rule}: {f.message}")
+            out.append(f"    ~  {_rule_prefix(f)}{f.message}")
         out.append("")
     out.append("RESULT: " + ("FAIL — boot refused" if report.failed else "PASS")
                + f" ({report.data.get('elapsed_s', 0)}s)")
     return "\n".join(out)
 
 
-def _render_or_say_why(report: Report, args) -> str:
-    """Render the printed verdict, and if rendering itself breaks, say so.
+def _payload_fortune(args, payload_error) -> str:
+    """What this run may honestly claim about the `--json` payload (PRO-324 NB2).
+
+    The first degraded line ended with "the --json payload is unaffected" no matter what
+    had happened. Two of the three shapes that covers are false: when nobody asked for a
+    payload there is no payload to be unaffected, and on the double fault the payload is
+    the one thing that is missing — `main()` is about to refuse the boot for want of it
+    while stdout tells the operator it is fine. The caller knows which of the three
+    happened, so the caller says it.
+    """
+    if payload_error:
+        return "the --json payload could not be written either"
+    if getattr(args, "json_out", None):
+        return "the --json payload was written before this line"
+    return "no --json payload was requested"
+
+
+def _render_or_say_why(report: Report, args, payload_error=None) -> str:
+    r"""Render the printed verdict, and if rendering itself breaks, say so.
 
     `render()` is the thing that explains the refusal, so an exception escaping it
     puts us back at PRO-308 finding B's shape — a traceback where the reason should
@@ -4003,21 +4030,44 @@ def _render_or_say_why(report: Report, args) -> str:
     is a terminal that says nothing. A degraded line that still names the failing
     checks beats that, and the names come straight off the report rather than through
     any of the formatting that just failed.
+
+    The degraded listing is itself a guard, which makes it subject to the same rule it
+    exists to enforce: no line of it may raise back into `main()`. It used to be able
+    to — the loop and the join sat outside any `try`, so a report whose finding raises
+    on attribute access lost the printed verdict *and* the `payload_error` notice that
+    `main()` prints after this returns (PRO-324 NB1). Everything that touches the
+    report is now inside a guard, and the last resort reads nothing at all: the two-line
+    `PRO-179 … / RESULT: …` header, which is the minimum an operator needs to know that
+    the gate ran and what it decided.
+
+    `payload_error` is passed in for the same reason (PRO-324 NB2): the degraded line
+    may only state what this run actually proved about the payload — see
+    `_payload_fortune`.
     """
     try:
         return render(report, args)
     except Exception as exc:
-        lines = [
-            "PRO-179 world-DB updater pre-flight",
-            f"RESULT: {'FAIL — boot refused' if report.failed else 'PASS'}",
-            f"!! render() raised {type(exc).__name__}: {exc}; the findings are listed "
-            "unformatted below and the --json payload is unaffected",
+        failure = exc
+    try:
+        result = "FAIL — boot refused" if report.failed else "PASS"
+    except Exception:
+        result = "unreadable — the report could not be read"
+    header = ["PRO-179 world-DB updater pre-flight", f"RESULT: {result}"]
+    try:
+        lines = header + [
+            f"!! render() raised {type(failure).__name__}: {failure}; the findings are "
+            f"listed unformatted below; {_payload_fortune(args, payload_error)}",
         ]
         for f in report.findings:
             if f.severity in ("FAIL", "WARN"):
                 where = f"{f.file}: " if f.file else ""
-                lines.append(f"    !! [{f.check}] {f.severity} {where}{f.rule}: {f.message}")
+                lines.append(
+                    f"    !! [{f.check}] {f.severity} {where}{_rule_prefix(f)}{f.message}")
         return "\n".join(lines)
+    except Exception:
+        # The listing broke too. Say the verdict and nothing else rather than nothing:
+        # this is the last resort, so it must not read the report at all.
+        return "\n".join(header)
 
 
 # --------------------------------------------------------------------------- #
@@ -4140,14 +4190,16 @@ def main(argv=None) -> int:
             payload_error = (f"preflight: could not write the --json payload to "
                              f"{args.json_out}: {type(exc).__name__}: {exc}")
     if not args.json_only:
-        _emit(sys.stdout, _render_or_say_why(report, args))
+        _emit(sys.stdout, _render_or_say_why(report, args, payload_error))
     if payload_error:
-        # The boot path asks for the payload and trusts it as the evidence, so a run
-        # that produced no evidence file refuses the boot rather than reporting
-        # whatever rc the checks happened to reach.
+        # `--json` is an operator opt-in — the shipped boot wrapper does not pass it —
+        # but an operator who does ask for the payload trusts it as the evidence. So a
+        # run that was asked for evidence and produced none refuses the boot rather than
+        # reporting whatever rc the checks happened to reach.
         _emit(sys.stderr, payload_error)
-        _emit(sys.stderr, "preflight: the requested evidence payload is missing, so "
-                          "the boot is refused")
+        _emit(sys.stderr, "preflight: the requested evidence payload is missing, so the "
+                          "boot is refused; this is an evidence-write failure, not a "
+                          "finding about your SQL")
         return EXIT_ERROR
     return rc
 

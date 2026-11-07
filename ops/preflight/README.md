@@ -100,8 +100,13 @@ Escaping the codec is not the whole of it, though. **Evidence before presentatio
 B1): `main()` writes the `--json` payload *first* and prints afterwards, and each half is held apart
 from the other. `_emit()` guards the whole body including `flush()`, naming a refused write on the
 fallback stream instead of raising — a pipe closed early is not a verdict; `_render_or_say_why()`
-degrades to listing the findings if `render()` itself blows up; and a payload we cannot write refuses
-the boot with `EXIT_ERROR` rather than letting it through on the checks' own rc. The rule behind all
+degrades to listing the findings if `render()` itself blows up, and the degraded listing is guarded
+too, so a report that raises while it is being read still prints the two-line
+`PRO-179 … / RESULT: …` header instead of losing the verdict (PRO-324 NB1); that line names the
+payload's actual outcome — written, not requested, or also unwritable — rather than claiming it is
+unaffected (PRO-324 NB2); and a payload we cannot write refuses the boot with `EXIT_ERROR` rather
+than letting it through on the checks' own rc, which only bites an operator who asked for `--json`
+(PRO-324 NB4). The rule behind all
 three: the payload is the half nobody can regenerate once the scratch schema is dropped, and the
 terminal echo is the half you can re-derive by re-running. `main()` still carries no bare `print()`.
 
