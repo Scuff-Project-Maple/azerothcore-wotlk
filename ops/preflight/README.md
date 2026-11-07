@@ -115,7 +115,10 @@ an interpreter accident instead of the finding that refused the boot. So a strea
 `_RetiredStream` that absorbs everything, which is what leaves the interpreter nothing to fail on.
 The exit status stays the three documented above, and `TestTheGateHoldsItsOwnRc` runs the refusals in
 subprocesses against a real `/dev/full`, a real early-closed pipe and a real closed fd 1, because
-interpreter teardown is not observable from inside a fixture.
+interpreter teardown is not observable from inside a fixture. The same class pins the other PRO-325
+observation: with fd 1 closed, `sys.stdout` is `None` and the old label printed the word `None` where
+a destination belongs; an absent thing is now named as absent, including on the degraded render line,
+which says "no --json payload requested" rather than claiming a payload nobody asked for.
 
 ### The third tag: the tracked upstream ref (PRO-248)
 

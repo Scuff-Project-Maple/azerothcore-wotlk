@@ -3903,6 +3903,11 @@ CHECK_TITLES = {
     "5": "dry run on scratch clone",
 }
 
+# The one wording for "nobody asked for a machine-readable report". PRO-325 NB2 found an
+# absent thing rendered as a bare `None`; the fix is a phrase, so it belongs in a constant
+# rather than in two f-strings that can drift apart.
+NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
+
 
 class _RetiredStream:
     r"""A sink that absorbs anything written to a stream the kernel already refused.
@@ -4101,7 +4106,7 @@ def render(report: Report, args) -> str:
     return "\n".join(out)
 
 
-def _render_or_say_why(report: Report, args) -> str:
+def _render_or_say_why(report: Report, args, payload_note=None) -> str:
     """Render the printed verdict, and if rendering itself breaks, say so.
 
     `render()` is the thing that explains the refusal, so an exception escaping it
@@ -4111,15 +4116,25 @@ def _render_or_say_why(report: Report, args) -> str:
     is a terminal that says nothing. A degraded line that still names the failing
     checks beats that, and the names come straight off the report rather than through
     any of the formatting that just failed.
+
+    The clause about the payload is a claim, so it has to come from whoever knows it:
+    `main()` passes `payload_note` after the write has been attempted. Asked for a
+    payload we could not write, the degraded line must not say the payload is fine; not
+    asked for one at all, it must not imply one exists (PRO-325 NB2's shape again — an
+    absent thing rendered as a bare `None`). `NO_JSON_PAYLOAD_NOTE` is the single
+    wording for the absent case so this line and any future one cannot drift apart.
     """
     try:
         return render(report, args)
     except Exception as exc:
+        if payload_note is None:
+            payload_note = (f"the --json payload at {args.json_out} is unaffected"
+                            if getattr(args, "json_out", None) else NO_JSON_PAYLOAD_NOTE)
         lines = [
             "PRO-179 world-DB updater pre-flight",
             f"RESULT: {'FAIL — boot refused' if report.failed else 'PASS'}",
             f"!! render() raised {type(exc).__name__}: {exc}; the findings are listed "
-            "unformatted below and the --json payload is unaffected",
+            f"unformatted below and {payload_note}",
         ]
         for f in report.findings:
             if f.severity in ("FAIL", "WARN"):
@@ -4248,7 +4263,13 @@ def main(argv=None) -> int:
             payload_error = (f"preflight: could not write the --json payload to "
                              f"{args.json_out}: {type(exc).__name__}: {exc}")
     if not args.json_only:
-        _emit(sys.stdout, _render_or_say_why(report, args), label="<stdout>")
+        if args.json_out is None:
+            payload_note = NO_JSON_PAYLOAD_NOTE
+        elif payload_error:
+            payload_note = f"the --json payload at {args.json_out} was NOT written"
+        else:
+            payload_note = f"the --json payload at {args.json_out} is on disk"
+        _emit(sys.stdout, _render_or_say_why(report, args, payload_note), label="<stdout>")
     if payload_error:
         # The boot path asks for the payload and trusts it as the evidence, so a run
         # that produced no evidence file refuses the boot rather than reporting

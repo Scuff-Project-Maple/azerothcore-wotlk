@@ -21,6 +21,7 @@ from pathlib import Path
 from preflight_worlddb import (
     MySQL, Preflight, REGION_NAME_STOPWORDS, Report, _ident_parts, _schema_of, mask_sql,
     parse_statement, split_qualified, split_statements, build_arg_parser, write_targets,
+    NO_JSON_PAYLOAD_NOTE,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -4755,6 +4756,45 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             self.assertEqual(0, proc.returncode,
                              f"a C-locale host could not write the payload: {proc.stderr}")
             self.assertTrue(out.read_bytes().isascii())
+
+
+    # -- what the degraded line claims about the payload (PRO-335 §2) ---------- #
+
+    def test_the_degraded_verdict_says_no_json_payload_was_requested(self):
+        """PRO-325 NB2's shape, one layer up: an absent thing must be said, not `None`d.
+
+        The degraded line used to end `...and the --json payload is unaffected` on every
+        path, including the one where nobody asked for a payload — a claim about a file
+        that does not exist and was never requested. The operator reading a failed boot
+        is the audience; `NO_JSON_PAYLOAD_NOTE` is the single wording for the absent case.
+        """
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="none")
+        text = res.out.decode("ascii")
+        self.assertIn("render() raised RuntimeError", text)
+        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertNotIn("unaffected", text,
+                         "the degraded line still promises a payload nobody asked for")
+        self.assertNotIn("None", text, "the absent payload is rendered as a word, not None")
+
+    def test_the_degraded_verdict_does_not_call_an_unwritten_payload_unaffected(self):
+        """The same sentence on the path that asked for a payload and did not get one."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="missing-dir")
+        self.assertIsNone(res.payload, "fixture: the payload was supposed to fail")
+        text = res.out.decode("ascii")
+        self.assertIn("was NOT written", text)
+        self.assertNotIn("unaffected", text,
+                         "the line that explains the failure also denies the evidence exists")
+
+    def test_the_degraded_verdict_still_points_at_the_payload_it_wrote(self):
+        """Positive control: the truthful claim survives when the payload really is there."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True)
+        self.assertIsNotNone(res.payload)
+        text = res.out.decode("ascii")
+        self.assertIn("is on disk", text)
+        self.assertIn("--json payload", text)
 
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
