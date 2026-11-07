@@ -1295,6 +1295,47 @@ class Preflight:
     # reason a pathological file cannot make this probe read forever (review N4).
     _OBSERVATION_READ_CAP = 1 << 16
 
+    _OBSERVATION_NOT_A_FILE = {
+        stat.S_IFIFO: "a fifo",
+        stat.S_IFDIR: "a directory",
+        stat.S_IFSOCK: "a socket",
+        stat.S_IFBLK: "a block device",
+        stat.S_IFCHR: "a character device",
+    }
+
+    def _read_bounded(self, path: Path) -> tuple[str, str]:
+        """Read at most one capped chunk of a regular file: `(text, why_not)`.
+
+        `why_not` is non-empty only when nothing at all could be read, and it is a
+        sentence for the operator rather than a machine value — every caller answers
+        "untrusted"/False with it, none branches on it.
+
+        The read is bounded, and that is the whole reason this is one function rather
+        than two `open()` calls (PRO-301 review N4 for the fetch fingerprints; PRO-300
+        review finding 1 for the last-verified record, which was a bare `read_text()`
+        and so could be made to hang a boot forever). Every other probe here goes
+        through `_git(..., timeout=60)`. A bare `open()` on a path git reports blocks
+        the boot indefinitely on a fifo nobody is writing to — silently, holding the
+        single-writer lease, with the server never starting — and no `except OSError`
+        ever fires, because the thing that never returns is the kernel. So `stat`
+        answers first, anything that is not a regular file is answered without being
+        opened at all, and at most one capped chunk is ever read.
+        """
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            return "", f"could not be inspected ({exc})"
+        if not stat.S_ISREG(st.st_mode):
+            kind = self._OBSERVATION_NOT_A_FILE.get(
+                stat.S_IFMT(st.st_mode), "not a regular file")
+            return "", f"is {kind}, not a regular file this gate may read"
+        try:
+            with open(path, "rb") as fh:
+                chunk = fh.read(self._OBSERVATION_READ_CAP)
+        except OSError as exc:
+            return "", f"could not be read ({exc})"
+        return chunk.decode("utf-8", errors="replace"), ""
+
     def _file_observations(self, path: Path) -> bool:
         """Does the file at `path` hold anything other than whitespace?
 
@@ -1304,26 +1345,12 @@ class Preflight:
         applies to `FETCH_HEAD` (review N2): `exists()` alone was buying the word
         "fetched" from an empty file, one level up from the reflog the review named.
 
-        The read is bounded (review N4). Every other probe here goes through
-        `_git(..., timeout=60)`; a bare `open()` on a path git reports would block the
-        boot indefinitely on a fifo at `.git/logs/<ref>` — silently, holding the
-        single-writer lease, with the server never starting. So `stat` answers first,
-        anything that is not a regular file answers False, and at most one capped chunk
-        is ever read. An unreadable file answers False, because the claim the gate then
-        withholds is its own.
+        The read itself is `_read_bounded()`'s business; what this probe adds is the
+        answer for the cases it cannot read. An unreadable file, a fifo, or a directory
+        all answer False, because the claim the gate then withholds is its own.
         """
-        try:
-            st = os.stat(path)
-        except OSError:
-            return False
-        if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
-            return False
-        try:
-            with open(path, "rb") as fh:
-                chunk = fh.read(self._OBSERVATION_READ_CAP)
-        except OSError:
-            return False
-        return bool(chunk.strip())
+        text, _why_not = self._read_bounded(path)
+        return bool(text.strip())
 
     def _reflog_observations(self, declared: str) -> bool:
         """Does the reflog at `declared` hold at least one entry?
@@ -1359,6 +1386,17 @@ class Preflight:
 
     ATTESTATION_LINE_RE = re.compile(
         r"^last-verified\s+(\S+)\s*=\s*([0-9a-fA-F]{7,64})\s*@\s*(\S+)$")
+
+    @staticmethod
+    def _is_one_line(value: str) -> bool:
+        """Can `value` sit at the end of a record line without becoming two lines?
+
+        The record is a line protocol, so a field that contains a newline is not a long
+        field — it is an extra line the gate never decided to write (PRO-300 review
+        finding 2). Both bindings come from outside this file (a `git config` value, a
+        path git reported), so both are asked before they reach the page.
+        """
+        return "\n" not in value and "\r" not in value
 
     def git_common_dir(self) -> "Path | None":
         """This tree's git common dir, or None when git will not say.
@@ -1436,6 +1474,107 @@ class Preflight:
     # ref that is otherwise there; see `upstream_ref()`.
     ATTEST_CAUSES = ("unreadable", "junk", "version", "repo", "url")
 
+    def _parse_attestation_text(self, raw: str, ref: str) -> dict:
+        """The fields of a record body: version, repo, url, `ref`'s line, junk lines.
+
+        Parsing only — it decides nothing. Both readers come through here so the strict
+        read in `attestation_record()` and the pre-write read in `write_attestation()`
+        cannot drift into answering different questions about the same bytes, which is
+        how a foreign record got laundered into a bound one (PRO-300 review finding 4).
+        """
+        parsed: dict = {"version": None, "repo": "", "url": "", "mine": None,
+                        "junk": []}
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("version "):
+                try:
+                    parsed["version"] = int(s[len("version "):].strip())
+                except ValueError:
+                    parsed["junk"].append(s)
+                continue
+            if s.startswith("repo "):
+                parsed["repo"] = s[len("repo "):].strip()
+                continue
+            if s.startswith("remote url "):
+                parsed["url"] = s[len("remote url "):].strip()
+                continue
+            m = self.ATTESTATION_LINE_RE.match(s)
+            if not m:
+                parsed["junk"].append(s)
+            elif m.group(1) == ref:
+                parsed["mine"] = (m.group(2), m.group(3))
+        return parsed
+
+    def _expected_record_repo(self) -> str:
+        """What a record of ours has to name in its `repo` line, '' when git cannot say."""
+        common = self.git_common_dir()
+        if common is None:
+            return ""
+        try:
+            return str(Path(common).resolve())
+        except OSError:
+            return str(common)
+
+    def _record_version_refusal(self, parsed: dict) -> tuple[str, str]:
+        """(cause, why) when the body does not say it is a version this gate writes.
+
+        One branch, two sentences. "It does not say what it is" and "it says something
+        this gate cannot read" are both reasons not to trust the file, and neither is
+        the same answer as "it holds nothing about this ref".
+        """
+        version = parsed["version"]
+        if version == self.ATTESTATION_VERSION:
+            return ("", "")
+        said = ("names no `version`, so this gate cannot know what it is "
+                "promising" if version is None else
+                f"is version {version}; this gate writes and reads version "
+                f"{self.ATTESTATION_VERSION} only")
+        return ("version", said)
+
+    def _record_binding_refusal(self, parsed: dict, ref: str) -> tuple[str, str]:
+        """(cause, why) when the body is not bound to *this* tree; ('', '') when it is.
+
+        A record is only this tree's history if it says it is. `write_attestation()`
+        refuses to write one it cannot bind for exactly this reason, so a record of ours
+        always carries both lines and a file that carries neither is not one of ours
+        (review N5 / the `repo unknown` nit). PRO-300 review finding 5: the `repo` line
+        is required unconditionally now rather than only when this gate can name its own
+        common dir, because `--preflight-state-dir` lets a record be placed where git
+        will not say — and requiring it costs nothing, since the writer never emits a
+        record without one.
+
+        '' from git means "cannot compare", not "the file is wrong". The url is asked of
+        git only when the record carries one to compare against: `git config --get` is a
+        local read rather than a network verb, but it is still a verb the no-network
+        allowlist has to account for. Unlike `repo`, a missing url line is not a
+        refusal — a tree may legitimately have no remote configured, and a record
+        written before `git remote add` is not a forgery.
+        """
+        expect_repo = self._expected_record_repo()
+        repo_line = parsed["repo"]
+        if not repo_line:
+            return ("repo", "names no `repo`, so this gate cannot tell which clone it "
+                            "was earned in"
+                            + (f" (this tree is {expect_repo})" if expect_repo else ""))
+        try:
+            got_repo = str(Path(repo_line).resolve())
+        except OSError:
+            got_repo = repo_line
+        if expect_repo and got_repo != expect_repo:
+            return ("repo", f"was written for repo {repo_line}, not {expect_repo}: a "
+                            f"record earned in another clone is not this one's history")
+        url_line = parsed["url"]
+        want_url = self.remote_url_for_ref(ref) if url_line else ""
+        if want_url and url_line != want_url:
+            # Compared when both sides can name a url, unlike `repo`, which is required:
+            # this gate always knows its common dir (it refuses to write a record it
+            # cannot bind) but a tree may legitimately have no remote configured.
+            return ("url", f"was written against remote url {url_line}, but this "
+                           f"tree's remote url is {want_url}")
+        return ("", "")
+
     def attestation_record(self, ref: str) -> tuple[str, str, str, str, str]:
         """What the last-verified file says about `ref`.
 
@@ -1444,11 +1583,11 @@ class Preflight:
         when nothing refused).
 
         Untrusted is deliberate and named, because the whole value of the record is
-        that a *satisfied* gate wrote it: a file that is unparsable, unversioned,
-        carries a version this gate does not understand, names a different repo, or
-        names a different remote url is not that. Absent is different in kind — the
-        ref has simply never been verified here, which is the pre-PRO-300 answer and
-        still a WARN (AC 6).
+        that a *satisfied* gate wrote it: a file that cannot be read at all, is not a
+        regular file, is unparsable, is unversioned, carries a version this gate does
+        not understand, names a different repo, or names a different remote url is not
+        that. Absent is different in kind — the ref has simply never been verified here,
+        which is the pre-PRO-300 answer and still a WARN (AC 6).
 
         The order of the checks is the answer to review B1. "This file says nothing
         about `ref`" is settled before the repo and remote-url bindings are asked, so a
@@ -1466,97 +1605,31 @@ class Preflight:
         if not path.exists():
             return (self.ATTEST_ABSENT, f"no attestation file at {path}",
                     "", "", "")
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return (self.ATTEST_UNTRUSTED, f"{path} exists but could not be read ({exc})",
+        # Bounded, and answered without ever opening anything that is not a regular
+        # file — the shape that let a fifo at this path hang the boot (review finding 1).
+        raw, why_not = self._read_bounded(path)
+        if why_not:
+            return (self.ATTEST_UNTRUSTED, f"{path} exists but {why_not}",
                     "", "", "unreadable")
-        version: int | None = None
-        repo_line = ""
-        url_line = ""
-        mine: tuple[str, str] | None = None
-        junk: list[str] = []
-        for line in raw.splitlines():
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            if s.startswith("version "):
-                try:
-                    version = int(s[len("version "):].strip())
-                except ValueError:
-                    junk.append(s)
-                continue
-            if s.startswith("repo "):
-                repo_line = s[len("repo "):].strip()
-                continue
-            if s.startswith("remote url "):
-                url_line = s[len("remote url "):].strip()
-                continue
-            m = self.ATTESTATION_LINE_RE.match(s)
-            if not m:
-                junk.append(s)
-            elif m.group(1) == ref:
-                mine = (m.group(2), m.group(3))
-        if junk:
+        parsed = self._parse_attestation_text(raw, ref)
+        if parsed["junk"]:
             return (self.ATTEST_UNTRUSTED,
-                    f"{path} holds {len(junk)} line(s) this gate cannot parse, "
-                    f"starting {junk[0][:80]!r}", "", "", "junk")
-        if version != self.ATTESTATION_VERSION:
-            # One branch, two sentences. "It does not say what it is" and "it says
-            # something this gate cannot read" are both reasons not to trust the file,
-            # and neither is the same answer as "it holds nothing about this ref".
-            said = ("names no `version`, so this gate cannot know what it is "
-                    "promising" if version is None else
-                    f"is version {version}; this gate writes and reads version "
-                    f"{self.ATTESTATION_VERSION} only")
-            return (self.ATTEST_UNTRUSTED, f"{path} {said}", "", "", "version")
+                    f"{path} holds {len(parsed['junk'])} line(s) this gate cannot "
+                    f"parse, starting {parsed['junk'][0][:80]!r}", "", "", "junk")
+        cause, said = self._record_version_refusal(parsed)
+        if cause:
+            return (self.ATTEST_UNTRUSTED, f"{path} {said}", "", "", cause)
         # Before the binding checks, on purpose (review B1): a record that holds nothing
         # about `ref` says nothing about `ref` no matter whose common dir it names, and
         # reading it as untrusted here would let a foreign file refuse a boot that the
         # record itself never claimed to cover.
-        if mine is None:
+        if parsed["mine"] is None:
             return (self.ATTEST_ABSENT,
                     f"{path} holds no `last-verified` line for {ref}", "", "", "")
-        # A record is only this tree's history if it says it is. `write_attestation()`
-        # refuses to write one it cannot bind for exactly this reason, so a record of
-        # ours always carries both lines and a file that carries neither is not one of
-        # ours (review N5 / the `repo unknown` nit). '' on either side means git could
-        # not say, which is "cannot compare", not "the file is wrong".
-        common = self.git_common_dir()
-        expect_repo = ""
-        if common is not None:
-            try:
-                expect_repo = str(Path(common).resolve())
-            except OSError:
-                expect_repo = str(common)
-        if expect_repo:
-            if not repo_line:
-                return (self.ATTEST_UNTRUSTED,
-                        f"{path} names no `repo`, so this gate cannot tell which "
-                        f"clone it was earned in (this tree is {expect_repo})",
-                        "", "", "repo")
-            try:
-                got_repo = str(Path(repo_line).resolve())
-            except OSError:
-                got_repo = repo_line
-            if got_repo != expect_repo:
-                return (self.ATTEST_UNTRUSTED,
-                        f"{path} was written for repo {repo_line}, not {expect_repo}: "
-                        f"a record earned in another clone is not this one's history",
-                        "", "", "repo")
-        # The url is asked of git only when the record carries one to compare against.
-        # `git config --get` is a local read rather than a network verb, but it is still
-        # a verb the no-network allowlist has to account for, and a record with no url
-        # line has nothing to check it against.
-        want_url = self.remote_url_for_ref(ref) if url_line else ""
-        if want_url and url_line != want_url:
-            # Compared when both sides can name a url, unlike `repo`, which is required:
-            # this gate always knows its common dir (it refuses to write a record it
-            # cannot bind) but a tree may legitimately have no remote configured, and a
-            # record written before `git remote add` is not a forgery.
-            return (self.ATTEST_UNTRUSTED,
-                    f"{path} was written against remote url {url_line}, but this "
-                    f"tree's remote url is {want_url}", "", "", "url")
+        cause, said = self._record_binding_refusal(parsed, ref)
+        if cause:
+            return (self.ATTEST_UNTRUSTED, f"{path} {said}", "", "", cause)
+        mine = parsed["mine"]
         return self.ATTEST_RECORDED, f"attested in {path}", mine[0], mine[1], ""
 
     def write_attestation(self, ref: str, oid: str) -> tuple[str, str]:
@@ -1576,13 +1649,7 @@ class Preflight:
         path = self.attestation_file()
         if path is None:
             return "no attestation state directory could be placed; not written", ""
-        common = self.git_common_dir()
-        repo_line = ""
-        if common is not None:
-            try:
-                repo_line = str(Path(common).resolve())
-            except OSError:
-                repo_line = str(common)
+        repo_line = self._expected_record_repo()
         if not repo_line:
             # An unbound record is a liability rather than a memory: `attestation_record()`
             # reads a record with no `repo` as one it cannot vouch for, so writing one now
@@ -1590,12 +1657,35 @@ class Preflight:
             # boot still stands, because this is evidence *for* a later deletion check.
             return ("could not determine this tree's git common dir; record not written",
                     "")
+        if not self._is_one_line(repo_line):
+            # PRO-300 review finding 2. A binding with an embedded newline is not one
+            # field — it is a second record line wearing the first one's clothes, and the
+            # strict reader would then refuse the record this run just wrote. There is no
+            # honest way to shorten a common dir, so this one is simply unbindable.
+            return ("this tree's git common dir cannot be written as a one-line "
+                    "binding; record not written", "")
         url_line = self.remote_url_for_ref(ref)
+        if not self._is_one_line(url_line):
+            # The same hazard on the other binding, with a cheaper answer: dropping the
+            # url line costs one comparison, not one record, because `attestation_record()`
+            # reads a missing url line as "nothing to compare" and never as a forgery.
+            url_line = ""
         keep: list[str] = []
         if path.exists():
-            try:
-                for line in path.read_text(encoding="utf-8",
-                                           errors="replace").splitlines():
+            raw, _why_not = self._read_bounded(path)
+            # Only a record this gate could have written is entitled to have its history
+            # carried forward (PRO-300 review finding 4). Before this, the pre-write read
+            # was a second and laxer reader of the same bytes: a foreign file that had
+            # answered `absent` under review B1 — because it names another `repo` — had
+            # its lines adopted beneath *this* tree's bindings, so after a `verifiedRef`
+            # rename this clone could be accused of deleting a ref it never verified.
+            # The two readers now ask one question, asked in `_record_binding_refusal()`.
+            parsed = self._parse_attestation_text(raw, ref)
+            vcause, _vwhy = self._record_version_refusal(parsed)
+            bcause, _bwhy = ("", "") if vcause else self._record_binding_refusal(
+                parsed, ref)
+            if not vcause and not bcause:
+                for line in raw.splitlines():
                     s = line.strip()
                     if not s or s.startswith("#") or s.startswith("version "):
                         continue
@@ -1604,8 +1694,6 @@ class Preflight:
                     m = self.ATTESTATION_LINE_RE.match(s)
                     if not m or m.group(1) != ref:
                         keep.append(s)
-            except OSError:
-                keep = []
         when = datetime.datetime.now(datetime.timezone.utc).isoformat(
             timespec="seconds")
         body = [f"# paperclip-preflight last-verified (version {self.ATTESTATION_VERSION})",
@@ -1963,7 +2051,7 @@ class Preflight:
                         f"{out['attestedWhen']} and, since {mism['why']}, this ref "
                         f"holds no reflog of its own to explain the move")
                 cause = out.get("attestationCause") or ""
-                if (out.get("attestation") == self.ATTEST_UNTRUSTED and cause
+                if (out.get("attestation") == self.ATTEST_UNTRUSTED
                         and cause != "unreadable"):
                     # PRO-300 review, finding 1: an untrusted record must not act as if it
                     # were simply absent on the path that ends in a write. If it did, one
@@ -1973,6 +2061,12 @@ class Preflight:
                     # is an environment accident, and this record must never become a
                     # precondition for booting (AC 6); what the exemption rests on here is
                     # the tree comparison below, not the record.
+                    #
+                    # The test is `cause != "unreadable"` rather than `cause and cause !=
+                    # "unreadable"` (review NIT 6): every untrusted return names a cause
+                    # today, so the extra truthiness test guarded nothing, and it left the
+                    # gate fail-*open* — a future return that forgot one would have been
+                    # silently inert instead of refusing.
                     out["treeSkipped"] = True
                     out["attestationRefused"] = True
                     out["detail"] = (
@@ -2028,6 +2122,15 @@ class Preflight:
                         out["attestation"] = self.ATTEST_RECORDED
                         out["attestedOid"] = out["oid"]
                         out["attestedWhen"] = written_at
+                        if out.get("attestationCause") == "unreadable":
+                            # PRO-300 review, finding 3. AC 6 says an unreadable record
+                            # must not stop this boot; it does not say the run may be
+                            # silent about it. Replacing the status with RECORDED is
+                            # honest about the record that exists *now*, but on its own
+                            # it buried the one fact the operator needs: the record that
+                            # was on disk was never read, and this run overwrote it. The
+                            # renderer turns this flag into one WARN.
+                            out["attestationPriorUnreadable"] = True
         self._upstream_ref_cache = out
         return out
 
@@ -3133,6 +3236,7 @@ class Preflight:
                              "upstreamRef": ref_counts}
         ref_note = ""
         attestation_note = ""
+        unreadable_note = ""
         if ref_counts:
             up = self.upstream_ref()
             ref = up.get("ref") or "upstream ref unconfigured"
@@ -3153,6 +3257,17 @@ class Preflight:
                 ref_note += f", last-verified {status}"
             if up.get("attestationNote"):
                 attestation_note = up["attestationNote"]
+            if up.get("attestationPriorUnreadable"):
+                # PRO-300 review, finding 3. The record that was on disk could not be
+                # read, and this run — satisfied on the strength of the tree, not of the
+                # record — rewrote it. Saying only `last-verified <oid>@<when>` there
+                # would report a continuity this run never actually read.
+                unreadable_note = (
+                    f"the last-verified record at "
+                    f"{up.get('attestationPath') or '(unknown)'} could not be read this "
+                    f"run ({up.get('attestationDetail')}); the record now there was "
+                    f"written fresh from what this gate read off {ref}, so this run is "
+                    f"not evidence that the record it replaced was sound")
         self.r.line("4", f"{checked_files} new file(s) under write policy, {statements} statement(s) "
                          f"inspected; reserved bands "
                          f"creature_template.entry/quest_template.ID>="
@@ -3163,6 +3278,13 @@ class Preflight:
             # able to stop a boot that the ref itself still justifies (AC 6).
             self.r.info("4", f"upstream ref attestation: {attestation_note}",
                         rule="upstream-ref-attestation")
+        if unreadable_note:
+            # A WARN and not a FAIL for the same AC 6 reason — a file the OS will not
+            # hand over is an environment accident, and `rm` of the record is already the
+            # honest escape hatch this design documents. It is not *nothing*, though:
+            # without this line the run reads as an ordinary verified boot.
+            self.r.warn("4", f"upstream ref attestation: {unreadable_note}",
+                        rule="upstream-ref-attestation-unreadable")
         if checked_files == 0:
             self.r.info("4", "no new company files to policy-check", rule="write-policy")
 

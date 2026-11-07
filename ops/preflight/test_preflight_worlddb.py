@@ -2453,9 +2453,20 @@ class TestUpstreamRefProvenance(unittest.TestCase):
             if verb in allowed:
                 return False
             rest = self._git_argv(argv)
-            return not (verb == "config" and len(rest) == 3 and rest[1] == "--get"
-                        and rest[2].startswith("remote.")
-                        and rest[2].endswith(".url"))
+            if verb == "config":
+                return not (len(rest) == 3 and rest[1] == "--get"
+                            and rest[2].startswith("remote.")
+                            and rest[2].endswith(".url"))
+            if verb == "merge-base":
+                # PRO-300 review NIT 7: `oid_is_ancestor()` asks git this, and it was the
+                # one verb the gate is known to ask that this loop had never reached, so
+                # an allowlist that simply listed `merge-base` would have been an
+                # unexercised allowance. Admitted by shape instead — `--is-ancestor`
+                # pinned in its own position and exactly two object names after it — and
+                # pinned as *asked* by the attestation scenario below.
+                return not (len(rest) == 4 and rest[1] == "--is-ancestor"
+                            and rest[2] and rest[3])
+            return True
         for label, ref, prep, build in (
                 ("verified", "refs/remotes/origin/Playerbot",
                  lambda d: self._git(d, "update-ref", "refs/remotes/origin/Playerbot",
@@ -2470,6 +2481,18 @@ class TestUpstreamRefProvenance(unittest.TestCase):
                                       "HEAD"),
                             self._git(d, "update-ref", "-d",
                                       "refs/remotes/origin/Playerbot")),
+                 self._repo),
+                ("attestation-oid-mismatch", "refs/remotes/origin/Playerbot",
+                 lambda d: (self._git(d, "update-ref", "refs/remotes/origin/Playerbot",
+                                      "HEAD"),
+                            self._attest(d),
+                            self._forge_ref_move(d)),
+                 self._repo),
+                ("attestation-stripped", "refs/remotes/origin/Playerbot",
+                 lambda d: (self._git(d, "update-ref", "refs/remotes/origin/Playerbot",
+                                      "HEAD"),
+                            self._attest(d),
+                            self._virgin(d)),
                  self._repo),
                 ("not-a-commit", None, lambda d: None, self._repo),
         ):
@@ -2487,6 +2510,20 @@ class TestUpstreamRefProvenance(unittest.TestCase):
                     f"while deciding {label}")
                 self.assertTrue(any(c[:1] == ["rev-parse"] for c in seen),
                                 "the probes never ran, so this checked nothing")
+                if label == "attestation-oid-mismatch":
+                    # PRO-300 review NIT 7: an allowlist entry the loop has never been
+                    # seen to ask for is coverage the loop does not have. This scenario
+                    # is what makes the `merge-base` allowance above mean something.
+                    self.assertTrue(
+                        any(self._git_verb(c) == "merge-base" for c in seen),
+                        "the attestation never reached `oid_is_ancestor()`, so the "
+                        "merge-base allowance was covering nothing")
+                if label == "attestation-stripped":
+                    self.assertIn(
+                        "upstream-ref-attested-missing",
+                        [x.rule for x in pf.r.findings if x.severity == "FAIL"],
+                        "the record never reached the boot decision, so this scenario "
+                        "exercised no attestation probe at all")
                 if label == "verified":
                     self.assertFalse(pf.r.failed,
                                      "a genuine upstream pull was refused offline")
@@ -3335,6 +3372,200 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertIn("upstream-ref-unverified", warns)
         self.assertFalse(pf.r.failed)
         self.assertTrue([c for c in calls if c[:2] == ["rev-parse", "--git-common-dir"]])
+
+
+    # --- PRO-300 review: the record read itself, and the writes it feeds ---------- #
+
+    def test_a_fifo_at_the_record_path_cannot_hang_the_boot(self):
+        # PRO-300 review, finding 1 — the blocking one. The record used to be read with
+        # a bare `read_text()`, and `open()` on a fifo nobody is writing to blocks in
+        # the kernel: no `OSError`, so no `unreadable` cause, no timeout, and no boot —
+        # a gate that never returns while it holds the single-writer lease. That is the
+        # hazard PRO-301 review N4 closed for the fetch fingerprints in
+        # `_file_observations()`; this reader had been left behind by the same rule the
+        # README states generally. The clock is the failure mode, exactly as in the
+        # PRO-301 review N4 test for the reflog: the bug is a hang rather than a wrong
+        # answer, so without the stat-first guard this dies on the signal instead of on
+        # an assertion.
+        import os
+        import signal
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        pf = self._pf(d)
+        path = pf.attestation_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(path))
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+
+        def on_alarm(signum, frame):
+            raise AssertionError(
+                "the last-verified read blocked on a non-regular file")
+
+        previous = signal.signal(signal.SIGALRM, on_alarm)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        signal.alarm(10)
+        try:
+            up = pf.upstream_ref()
+        finally:
+            signal.alarm(0)
+        # The read answered `unreadable` and stayed inert. The *status* ends up
+        # `recorded`, because this satisfied run then wrote a fresh record over the fifo
+        # — the finding-3 path, and the reason the cause and the detail are what carry
+        # the answer here rather than the status.
+        self.assertEqual("unreadable", up["attestationCause"], up["attestationDetail"])
+        self.assertIn("fifo", up["attestationDetail"])
+        self.assertTrue(up.get("attestationPriorUnreadable"),
+                        "the record written over an unreadable one was reported as an "
+                        "ordinary verified boot")
+        # Inert, as AC 6 requires: what earns the boot is the tree, not the record.
+        self.assertFalse(up["attestationRefused"],
+                         "an unreadable record refused a boot it does not disprove")
+        self.assertFalse(up.get("treeSkipped"))
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_VERIFIED, "verified"), (state, cause), detail)
+
+    def test_a_record_replaced_after_being_unreadable_says_so(self):
+        # PRO-300 review, finding 3. The README promised that a run which could not
+        # read the record says so; on the path that then *writes* one it did not — the
+        # status was overwritten with `recorded` and the summary printed an ordinary
+        # `last-verified <oid>@<when>`, which is a sentence about a continuity this run
+        # never actually read. AC 6 still forbids the FAIL. It does not buy the silence.
+        import os
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        pf = self._pf(d)
+        path = pf.attestation_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(str(path))
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        self._run(pf, self._file(d, p))
+        warns = [(x.rule, x.message) for x in pf.r.findings if x.severity == "WARN"]
+        named = [m for r, m in warns if r == "upstream-ref-attestation-unreadable"]
+        self.assertTrue(named,
+                        f"an unreadable record was rewritten in silence: {warns}")
+        self.assertIn(str(path), named[0])
+        fails, _ = self._outcomes(pf)
+        self.assertEqual([], [r for r, _ in fails],
+                          "the WARN about an unreadable record turned into a FAIL")
+        self.assertFalse(pf.r.failed)
+
+    def test_a_multiline_remote_url_never_becomes_a_second_record_line(self):
+        # PRO-300 review, finding 2. `write_attestation()` interpolated
+        # `remote.<name>.url` raw, so a url holding a newline wrote a second
+        # `last-verified` line the gate never decided to attest. The record then failed
+        # this gate's own strict read: a self-inflicted `attestation-untrusted` FAIL on
+        # a boot where the operator changed nothing, with `rm <record>` — destroying the
+        # evidence — as the only printed remedy.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        smuggled = ("https://example.invalid/acro.git\nlast-verified "
+                    + self.ATTEST_REF + " = " + "1" * 40 + " @ "
+                    + "2020-01-01T00:00:00+00:00")
+        self._git(d, "config", "remote.origin.url", smuggled)
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual("ok", up["state"])
+        body = pf.attestation_file().read_text()
+        lines = [ln for ln in body.splitlines() if ln.startswith("last-verified")]
+        self.assertEqual(1, len(lines),
+                         f"the record holds a line this gate never attested: {body!r}")
+        self.assertIn(f"last-verified {self.ATTEST_REF} = ", lines[0])
+        self.assertNotIn("remote url", body,
+                         "a url that cannot fit one line was written anyway")
+        # The boot that matters: nothing has changed for the operator, so the next boot
+        # must not be the one that discovers the record is unreadable to its own author.
+        pf2 = self._pf(d)
+        up2 = pf2.upstream_ref()
+        self.assertEqual("recorded", up2["attestation"], up2["attestationDetail"])
+        self.assertEqual("", up2["attestationCause"])
+        self._run(pf2, self._file(d, p))
+        fails, _ = self._outcomes(pf2)
+        self.assertEqual([], [r for r, _ in fails],
+                          f"a boot was refused by the gate's own record: {fails}")
+
+    def test_a_record_this_gate_did_not_write_contributes_no_lines(self):
+        # PRO-300 review, finding 4. The strict reader correctly answers `absent` for a
+        # foreign record whose lines name only another ref and whose `repo` is another
+        # clone (review B1). The *pre-write* reader used to be a second, laxer reader of
+        # the same bytes and carried those foreign lines forward beneath *this* tree's
+        # bindings — so "a satisfied boot starts a fresh history" was false, and after
+        # a `verifiedRef` rename this clone could be failed for deleting a ref it had
+        # never verified.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        other = self._repo()
+        path = self._attest(d, ref="refs/remotes/origin/Other",
+                            repo=str((other / ".git").resolve()))
+        self.assertIn("refs/remotes/origin/Other", path.read_text())
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual("recorded", up["attestation"], up["attestationDetail"])
+        body = path.read_text()
+        self.assertNotIn("refs/remotes/origin/Other", body,
+                         "foreign lines were laundered into a record bound to this "
+                         f"clone: {body!r}")
+        self.assertIn(f"last-verified {self.ATTEST_REF} = ", body)
+        self.assertIn(f"repo {(d / '.git').resolve()}", body)
+
+    def test_an_unbound_record_is_untrusted_even_under_a_state_dir_override(self):
+        # PRO-300 review, finding 5. `--preflight-state-dir` removes the record's
+        # dependence on the common dir, and the `repo` line was required only *when git
+        # could name that dir* — so with the override plus an unanswered
+        # `--git-common-dir`, a file holding nothing but `version 1` and a
+        # `last-verified` line was read as this clone's verified history. The line is
+        # required unconditionally now, which costs nothing: `write_attestation()`
+        # already refuses to emit a record without one.
+        import tempfile
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, state_dir, ignore_errors=True)
+        (state_dir / "last-verified").write_text(
+            f"version 1\nlast-verified {self.ATTEST_REF} = "
+            f"{self._git(d, 'rev-parse', self.ATTEST_REF)} @ "
+            f"2020-01-01T00:00:00+00:00\n", encoding="utf-8")
+        pf = self._pf(d)
+        pf.a.preflight_state_dir = str(state_dir)
+        self._stub_git_shapes(pf, common_dir=(128, "", "stub"))
+        status, why, _oid, _when, cause = pf.attestation_record(self.ATTEST_REF)
+        self.assertEqual((pf.ATTEST_UNTRUSTED, "repo"), (status, cause), why)
+        state, detail, rcause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"),
+                         (state, rcause), detail)
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-attestation-untrusted", [r for r, _ in fails],
+                      "a record with no binding at all bought the upstream exemption")
+        self.assertTrue(pf.r.failed)
+
+    def test_an_untrusted_record_with_no_cause_still_refuses_the_tree_read(self):
+        # Review NIT 6. The ok-path refusal used to require a truthy `cause` as well as
+        # the untrusted status. Every untrusted return names a cause today, so that
+        # extra test guarded nothing — and it set the default the wrong way round, since
+        # a future return that forgot one would have been silently inert rather than
+        # refused. The mutation is made by hand precisely because nothing produces this
+        # shape in the wild yet.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_06_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        pf = self._pf(d)
+        seen = self._watch_git_verbs(pf)
+        pf.attestation_record = lambda ref: (pf.ATTEST_UNTRUSTED,
+                                             "a cause-less refusal", "", "", "")
+        up = pf.upstream_ref()
+        self.assertTrue(up.get("treeSkipped"),
+                        "an untrusted record with no cause was treated as no record")
+        self.assertTrue(up.get("attestationRefused"))
+        self.assertEqual([], [c for c in seen if self._git_verb(c) == "ls-tree"],
+                         "the tree of a ref the gate does not trust was read anyway")
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"),
+                         (state, cause), detail)
 
 
 class TestPolicyAuditPinsProvenance(unittest.TestCase):
