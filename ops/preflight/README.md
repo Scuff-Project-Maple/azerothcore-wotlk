@@ -105,6 +105,18 @@ the boot with `EXIT_ERROR` rather than letting it through on the checks' own rc.
 three: the payload is the half nobody can regenerate once the scratch schema is dropped, and the
 terminal echo is the half you can re-derive by re-running. `main()` still carries no bare `print()`.
 
+Guarding the write is not the end of the guard, though (PRO-325 NB1, PRO-335). The bytes a refusing
+device would not take are still sitting in the stream's buffer when `main()` returns, and CPython
+flushes `sys.stdout` and `sys.stderr` again during shutdown; a failure there exits **120**, a code
+this gate does not document. `ops/deploy/worldserver-up.sh` reads any non-zero rc as a refusal, so
+the boot was still refused — the damage was that `REFUSING BOOT … (exit 120)` points an operator at
+an interpreter accident instead of the finding that refused the boot. So a stream that refused
+`_emit()` is retired on the way out: flushed, closed, and replaced on `sys.stdout`/`sys.stderr` by a
+`_RetiredStream` that absorbs everything, which is what leaves the interpreter nothing to fail on.
+The exit status stays the three documented above, and `TestTheGateHoldsItsOwnRc` runs the refusals in
+subprocesses against a real `/dev/full`, a real early-closed pipe and a real closed fd 1, because
+interpreter teardown is not observable from inside a fixture.
+
 ### The third tag: the tracked upstream ref (PRO-248)
 
 Directory tag plus author tag is a claim about **history**, and history metadata is cheap to
