@@ -171,12 +171,29 @@ or applies SQL — read-only inspection commands do not need it.
 >
 > - **Any worldserver boot** (the common case):
 >   `bash ops/deploy/worldserver-up.sh` — gate, then `docker compose up -d
->   ac-worldserver`. Recognised compose flags are forwarded, so
+>   --no-deps ac-worldserver`. Recognised compose flags are forwarded, so
 >   `bash ops/deploy/worldserver-up.sh --force-recreate` and
 >   `COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.loadtest.override.yml \
 >   bash ops/deploy/worldserver-up.sh` stay gated (`-f/--file` and
 >   `-p/--project-name` are forwarded to compose *and* to the gate, so the gate
 >   reads the same files compose will).
+>   **The boot is `--no-deps` by default (PRO-306 B1).** `ac-db-import` and
+>   `ac-client-data-init` are `service_completed_successfully` dependencies of
+>   `ac-worldserver`, so an unqualified `up -d ac-worldserver` re-creates both
+>   one-offs on every boot and re-runs the world-DB updater against the **live**
+>   `acore_world` — inside a run the runbook describes as "gate passed, read-only
+>   checks" (observed on all five PRO-299/PRO-303 boots; same shape as
+>   [PRO-292](/PRO/issues/PRO-292)). The wrapper now asserts what compose used to
+>   do implicitly — `ac-database` running and healthy, `acore_world.updates` /
+>   `updates_include` already populated, `ac-client-data` volume present and the
+>   last `ac-client-data-init` exited 0 — prints those as `[dep 1..3]`, prints a
+>   `BOOT MODE:` line naming the mode it ran in, and prints
+>   `acore_world.updates` rows before and after so a silent import cannot hide.
+>   Where you **want** the one-offs (first import on a cold stack, or after a SQL
+>   change you want the updater to apply), say so: `--with-one-offs` (or
+>   `BOOT_MODE=with-one-offs`), and the log then states the boot is not read-only.
+>   `--no-deps` itself is refused as an argument — the mode must always be
+>   something the log names.
 > - **Anything the wrapper genuinely cannot express** — `up -d --build`,
 >   `docker compose restart` — run the gate alone first and boot only if it
 >   PASSes: `PREFLIGHT_CHECK_ONLY=1 bash ops/deploy/worldserver-up.sh`
@@ -617,6 +634,27 @@ has none) and the stock ready marker:
 docker logs ac-worldserver | grep "ready..."
 ```
 
+> **A `docker logs` count is a lifetime counter, not a boot measurement
+> (PRO-306 B2).** `docker compose up -d ac-worldserver` is a **no-op** for a
+> container that is already running, so `docker logs ac-worldserver | grep -c
+> FATAL` after such a command reports the whole container lifetime — PRO-303
+> caught exactly that: a run reported `LOG_FATAL count: 0` for a container that
+> had been `Up 50 minutes`. The boot-path flags exist so this cannot be read
+> wrong again:
+>
+> ```bash
+> bash ops/deploy/worldserver-up.sh --force-recreate --require-ready
+> ```
+>
+> The wrapper then prints its own `BOOT_T0`, the container's `StartedAt`,
+> `restarts`, a **since-boot** `LOG_FATAL` count next to the lifetime one, the
+> `acore_world.updates` row count before and after the boot, and a `BOOT
+> VERDICT:` line. It **fails** if `--force-recreate` was asked for and
+> `StartedAt` did not move, so a lifetime counter can no longer be presented as
+> a fresh boot. `--require-ready` additionally waits for the `…(worldserver-daemon)
+> ready...` banner and exits non-zero without it; `--strict-boot` turns a
+> since-boot `FATAL` into a non-zero exit instead of only reporting it.
+
 **Verified on the live host (2026-10-27 00:53 UTC, running `rev.
 34d6f4b0e8c7+`, boot started 2026-10-26T23:52:43Z):**
 
@@ -641,6 +679,19 @@ also showed `custom class registry ready: 1 template(s) active (0 removed
 after DBC validation)`, `CustomClasses.Enabled = true`, and ~1500 random
 playerbots. The Mentor template (900001) loaded from the world DB without
 rejection in both boots.
+
+> **A boot record that names only the banner rev proves nothing about the tree
+> (PRO-306 B5).** The block above — and every PRO-299/PRO-303 boot record —
+> quotes `AzerothCore rev. 34d6f4b0e8c7+`, which is the **binary**: the deployed
+> `acore/ac-wotlk-worldserver:master` image was built `2026-10-25T22:08:07Z`, and
+> on the compose root `git rev-list --count 34d6f4b0e8c7..HEAD` was **80** when
+> PRO-306 checked it while the tree itself sat at `8f960d0ba`. So those records
+> certify an October binary against a November tree rev. Until the deploy-pin
+> policy on [PRO-306](/PRO/issues/PRO-306) is decided and the manifest it
+> proposes is committed, a verified boot must record **both** identities by hand:
+> `git -C /mnt/data/wow-server rev-parse HEAD` and
+> `docker image inspect acore/ac-wotlk-worldserver:master --format '{{.Created}}'`
+> next to the banner line.
 
 ### Worldserver console vs in-game GM commands
 
