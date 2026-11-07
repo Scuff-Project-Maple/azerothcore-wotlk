@@ -3361,6 +3361,39 @@ class TestBootPathPRO306(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("cancel each other", proc.stdout)
 
+    def test_compose_base_is_not_prefixed_with_a_second_docker_compose(self):
+        # `COMPOSE_BASE` already *is* `docker compose [-f …] [-p …]`. Prefixing
+        # it again makes compose answer with its usage text and exit 1, and
+        # because the helper is called from an assignment under `set -e`, the
+        # whole wrapper died between two log lines with nothing to explain it.
+        src = self._source()
+        self.assertNotIn('docker compose "${COMPOSE_BASE[@]}"', src,
+                         "COMPOSE_BASE already contains `docker compose`; doubling it "
+                         "makes every helper fail with compose's usage text")
+
+    def test_no_head_pipeline_inside_the_wrapper(self):
+        # `set -euo pipefail` + `| head -n 1` is a silent-death machine: once the
+        # producer writes more than the head consumes it takes SIGPIPE, the
+        # assignment fails, and `set -e` ends the script with no output.
+        code = "\n".join(l for l in self._source().splitlines()
+                         if not l.lstrip().startswith("#"))
+        self.assertNotIn("| head -n 1", code,
+                         "take the first line with a parameter expansion instead of `| head -n 1`")
+
+    def test_dependency_check_only_is_documented_and_reachable(self):
+        proc = self._run(["--help"])
+        self.assertIn("DEPENDENCY_CHECK_ONLY", proc.stdout)
+        src = self._source()
+        self.assertIn('DEPENDENCY_CHECK_ONLY:-0', src)
+        self.assertIn("Nothing was created or started", src)
+
+    def test_helper_failures_refuse_instead_of_dying_quietly(self):
+        src = self._source()
+        self.assertIn("cannot ask compose about", src,
+                      "a compose helper failure must be named, not returned into set -e")
+        # The database service specifically: without this the dependency gate can
+        # end the script between two log lines.
+        self.assertIn('cannot ask compose about $DB_SERVICE', src)
     def test_recreate_env_and_flag_are_the_same_request_after_double_dash(self):
         # PRO-179 NB-1 keeps benign post-`--` flags forwarded; PRO-306 B2 adds
         # that they must also be *seen*, so the two spellings cannot disagree.

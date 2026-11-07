@@ -95,6 +95,9 @@
 #   BOOT_MODE             `no-deps` (default) or `with-one-offs`; same meaning as
 #                          the flags. no-deps is what makes the runbook's
 #                          "read-only boot" claim true (PRO-306 B1).
+#   DEPENDENCY_CHECK_ONLY=1  run the gate and the dependency gate, then stop:
+#                          nothing is created or started. The lease is still
+#                          required, because the gate reads the live database.
 #   RECREATE=1            shorthand for --force-recreate (PRO-306 B2)
 #   REQUIRE_READY=1       wait for the ready banner and fail if it never appears
 #   STRICT_BOOT=1         fail if any FATAL line appears since this boot
@@ -399,7 +402,20 @@ compose_ps_q() {
   # `docker compose ps -q <service>` — empty when the service has no container
   # in this project. stdin is closed because `compose ps` is not a reader and a
   # caller piping this script into `ssh 'bash -s'` has nothing else to lose.
-  docker compose "${COMPOSE_BASE[@]}" ps -a -q "$1" </dev/null 2>/dev/null | head -n 1
+  #
+  # COMPOSE_BASE already *is* `docker compose [-f …] [-p …]`, so it must not be
+  # prefixed with a literal `docker compose` as well: an earlier revision of this
+  # helper did exactly that, compose answered with its usage text and exit 1, and
+  # because the caller assigns from this function under `set -e` the script died
+  # between two log lines with no explanation at all (PRO-306). Failure is
+  # reported here instead of returned quietly, and the callers refuse loudly.
+  local out
+  if ! out="$("${COMPOSE_BASE[@]}" ps -a -q "$1" </dev/null)"; then
+    echo "worldserver-up: cannot ask compose about service '$1' (see the compose output above)." >&2
+    return 1
+  fi
+  out="${out//$'\r'/}"
+  printf '%s' "${out%%$'\n'*}"
 }
 
 db_scalar() {
@@ -409,11 +425,16 @@ db_scalar() {
   # and </dev/null because `docker compose exec -T … mysql` otherwise eats the
   # caller's stdin (the PRO-306 host gotcha, stdin-eating variant).
   local db="$1" sql="$2" out
-  out="$(docker compose "${COMPOSE_BASE[@]}" exec -T -e "MYSQL_PWD=${DB_PASSWORD}" \
+  # `|| true` and `2>&1` together on purpose: a failing client must not kill the
+  # script through `set -e` — the caller decides what an unreadable ledger means
+  # — and the client's own error text is the only clue to what went wrong, so it
+  # travels back in the value rather than being dropped on the floor.
+  out="$("${COMPOSE_BASE[@]}" exec -T -e "MYSQL_PWD=${DB_PASSWORD}" \
         "$DB_SERVICE" mysql --no-defaults -u "$DB_USER" --default-character-set=utf8mb4 \
-        -N -B "$db" -e "$sql" </dev/null 2>/dev/null || true)"
+        -N -B "$db" -e "$sql" </dev/null 2>&1 || true)"
   out="${out//$'\r'/}"
-  printf '%s' "$out" | tr -d '[:space:]'
+  out="$(printf '%s' "$out" | tr -d '[:space:]')"
+  printf '%s' "${out:0:200}"
 }
 
 assert_dependencies() {
@@ -425,7 +446,8 @@ assert_dependencies() {
   local require_ledger="$1" id status health rows inc vol init_id initrc="none"
   note "dependency gate (asserting by hand what depends_on used to do silently)"
 
-  id="$(compose_ps_q "$DB_SERVICE")"
+  id="$(compose_ps_q "$DB_SERVICE")" \
+    || refuse "cannot ask compose about $DB_SERVICE. The dependency gate has to read the stack to say anything about it; an unreadable stack is not a booted one."
   if [[ -z "$id" ]]; then
     refuse "$DB_SERVICE has no container in this project. Bring the database up first (docs/dev-environment.md#build--run); with BOOT_MODE=$BOOT_MODE nothing here creates it."
   fi
@@ -444,7 +466,11 @@ assert_dependencies() {
 
   rows="$(db_scalar acore_world 'SELECT COUNT(*) FROM updates')"
   inc="$(db_scalar acore_world 'SELECT COUNT(*) FROM updates_include')"
-  LEDGER_ROWS_BEFORE="$rows"
+  # Only a real number may become the "before" side of the ledger comparison;
+  # a client error text in that slot would later read as a changed ledger.
+  if [[ "$rows" =~ ^[0-9]+$ ]]; then
+    LEDGER_ROWS_BEFORE="$rows"
+  fi
   if [[ ! "$rows" =~ ^[0-9]+$ ]]; then
     if [[ "$require_ledger" == "1" ]]; then
       refuse "cannot read acore_world.updates (got '$rows'). BOOT_MODE=no-deps promises the updater will not be run by this boot, so it also has to prove the ledger is already there."
@@ -459,14 +485,29 @@ assert_dependencies() {
     note "  [dep 2] updater ledger already imported: acore_world.updates rows=$rows updates_include rows=$inc"
   fi
 
-  vol="$(docker volume ls -q --filter "name=ac-client-data" </dev/null 2>/dev/null | head -n 1)"
+  # No `| head -n 1`: under `set -euo pipefail` a `head` that closes the pipe
+  # early turns the producer into a SIGPIPE failure, and an assignment that
+  # fails kills the script with no output at all.
+  local vol_raw=""
+  if ! vol_raw="$(docker volume ls -q --filter "name=ac-client-data" </dev/null)"; then
+    if [[ "$require_ledger" == "1" ]]; then
+      refuse "cannot list docker volumes, so this boot cannot confirm ac-client-data exists. BOOT_MODE=no-deps starts no ac-client-data-init to create it."
+    fi
+  fi
+  vol_raw="${vol_raw//$'\r'/}"
+  vol="${vol_raw%%$'\n'*}"
   if [[ -z "$vol" ]]; then
     if [[ "$require_ledger" == "1" ]]; then
       refuse "no ac-client-data volume exists. BOOT_MODE=no-deps starts no ac-client-data-init, and ac-worldserver mounts that volume read-only — boot with --with-one-offs to populate it first."
     fi
     note "  [dep 3] no ac-client-data volume yet; ac-client-data-init will create it"
   else
-    init_id="$(compose_ps_q ac-client-data-init)"
+    init_id=""
+    if ! init_id="$(compose_ps_q ac-client-data-init)"; then
+      if [[ "$require_ledger" == "1" ]]; then
+        refuse "cannot ask compose about ac-client-data-init, so the last exit code of the one-off that fills ac-client-data cannot be verified."
+      fi
+    fi
     if [[ -n "$init_id" ]]; then
       initrc="$(docker inspect --format '{{.State.ExitCode}}' "$init_id" </dev/null 2>/dev/null || echo unknown)"
       if [[ "$initrc" != "0" ]]; then
@@ -572,6 +613,15 @@ else
   assert_dependencies 0
 fi
 
+# The dependency gate is the part of a boot that reads the live stack, so it is
+# also the part worth rehearsing on its own: `DEPENDENCY_CHECK_ONLY=1` answers
+# "would this boot be allowed" without creating or starting anything, which is
+# what a verification pass needs before it dares a --force-recreate (PRO-306).
+if [[ "${DEPENDENCY_CHECK_ONLY:-0}" == "1" ]]; then
+  note "DEPENDENCY_CHECK_ONLY=1 — gate and dependency gate above are the whole run. Nothing was created or started."
+  exit 0
+fi
+
 COMPOSE_CMD=("${COMPOSE_BASE[@]}" up -d)
 if [[ "$BOOT_MODE" == "no-deps" ]]; then
   COMPOSE_CMD+=(--no-deps)
@@ -598,7 +648,10 @@ if (( rc != 0 )); then
 fi
 
 # --- B2: prove which boot these numbers belong to --------------------------- #
-ws_id="$(compose_ps_q ac-worldserver)"
+# `|| ws_id=""` rather than letting the helper's failure reach `set -e`: the
+# boot has already happened by this point, and a report that dies halfway is
+# how a stack ends up running with no recorded numbers at all.
+ws_id="$(compose_ps_q ac-worldserver)" || ws_id=""
 ready="not-checked"
 fatal_since="not-counted"
 fatal_total="not-counted"
