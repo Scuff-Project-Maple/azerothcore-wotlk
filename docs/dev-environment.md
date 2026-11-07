@@ -186,7 +186,8 @@ or applies SQL — read-only inspection commands do not need it.
 >   [PRO-292](/PRO/issues/PRO-292)). The wrapper now asserts what compose used to
 >   do implicitly — `ac-database` running and healthy, `acore_world.updates` /
 >   `updates_include` already populated, `ac-client-data` volume present and the
->   last `ac-client-data-init` exited 0 — prints those as `[dep 1..3]`, prints a
+>   last `ac-client-data-init` container exists, is not still running, and exited 0
+  — prints those as `[dep 1..3]`, prints a
 >   `BOOT MODE:` line naming the mode it ran in, and prints
 >   `acore_world.updates` rows before and after so a silent import cannot hide.
 >   Where you **want** the one-offs (first import on a cold stack, or after a SQL
@@ -217,9 +218,13 @@ and client-data are independent of the world updater):
 ```bash
 cd <repo root>                       # = /mnt/data/wow-server on the host
 docker compose build                 # builds all images; starts no container
-docker compose up -d ac-database     # one-shot ac-db-import loads the base schema
-# wait until ac-database is healthy and ac-db-import has finished
-bash ops/deploy/worldserver-up.sh    # gate, then up -d ac-worldserver
+docker compose up -d ac-database     # the database only — this starts NO one-off
+# wait until ac-database reports healthy
+bash ops/deploy/worldserver-up.sh --with-one-offs
+                                     # gate, then up -d ac-worldserver *with*
+                                     # ac-db-import + ac-client-data-init, which a
+                                     # cold stack needs for the base schema and
+                                     # the client data
 docker compose up -d ac-authserver   # independent of the world updater
 ```
 
@@ -229,7 +234,7 @@ worldserver start is gated:
 
 ```bash
 docker compose build ac-worldserver
-bash ops/deploy/worldserver-up.sh    # gate, then up -d ac-worldserver (new image)
+bash ops/deploy/worldserver-up.sh    # gate, then up -d --no-deps ac-worldserver (new image)
 ```
 
 If compose does not recreate on the new image and you must force it, forward
@@ -244,8 +249,42 @@ gate, not `docker compose start`:
 
 ```bash
 docker compose stop ac-worldserver               # fine — updater does not run
-bash ops/deploy/worldserver-up.sh                # gate, then up -d ac-worldserver
+bash ops/deploy/worldserver-up.sh                # gate, then up -d --no-deps ac-worldserver
 ```
+
+### The `ac-client-data-init` one-off and its `modules.sh` line (PRO-306 B4)
+
+`apps/docker/Dockerfile` runs the client-data download as
+`source /azerothcore/apps/installer/includes/functions.sh &&
+inst_download_client_data`, which bypasses
+`apps/installer/includes/includes.sh` — the only place upstream ever sets
+`AC_PATH_INSTALLER`. Unguarded, the module-manager `source` at
+`apps/installer/includes/functions.sh:146` therefore resolved to
+`/includes/modules-manager/modules.sh` and every client-data start printed
+
+```
+/azerothcore/apps/installer/includes/functions.sh: line 146:
+/includes/modules-manager/modules.sh: No such file or directory
+```
+
+before `Data v20.0 already installed` and **exit 0**. Cosmetic today, and
+exactly the kind of line that hides a real failure later. The file is upstream
+AzerothCore, and this is one of the rare cases where patching it is the right
+call: the guard leaves the `AC_PATH_INSTALLER`-set branch byte-identical, so the
+normal installer path is untouched and a future upstream edit to that single
+line conflicts loudly instead of silently.
+
+The fix is to **skip** the source, not to make the path resolve:
+`modules.sh` sources the installer's other includes, which reach for
+`$AC_PATH_DEPS/...` (`bash-lib`, `joiner`, `semver_bash`), and the client-data
+image ships only `apps/` — resolving the path would trade one missing-file
+error for three. `inst_download_client_data` needs none of it (only `DATAPATH`,
+`curl`, `unzip`). If you change this file, keep that property.
+
+Note this container runs image `acore/ac-wotlk-client-data:master`, built at
+provisioning time, so an edit here is only visible after that image is
+rebuilt — and since PRO-306 B1 a normal gated boot no longer runs it at all
+(`BOOT MODE: no-deps`).
 
 ### Keep the compose overrides in sync (pre-boot assertion)
 
@@ -653,7 +692,15 @@ docker logs ac-worldserver | grep "ready..."
 > `StartedAt` did not move, so a lifetime counter can no longer be presented as
 > a fresh boot. `--require-ready` additionally waits for the `…(worldserver-daemon)
 > ready...` banner and exits non-zero without it; `--strict-boot` turns a
-> since-boot `FATAL` into a non-zero exit instead of only reporting it.
+> since-boot `FATAL` into a non-zero exit instead of only reporting it, and
+> fails the same way when it **could not count** (`docker logs` unreadable — a
+> missing number is not zero FATALs). Because a check that cannot run is not a
+> check that passed, `--require-ready` and `--strict-boot` are **refused
+> together with `--no-start`**: `--no-start` creates the container without
+> starting it, so neither the banner nor a since-boot count can exist.
+> Exit codes are `2` bad usage, `3` the stack refused the boot, `4` the boot
+> happened but may not be called clean (missing container, `--no-deps` ledger
+> moved or unreadable, `--strict-boot`/`--require-ready` unmet).
 
 **Verified on the live host (2026-10-27 00:53 UTC, running `rev.
 34d6f4b0e8c7+`, boot started 2026-10-26T23:52:43Z):**
@@ -684,11 +731,30 @@ rejection in both boots.
 > (PRO-306 B5).** The block above — and every PRO-299/PRO-303 boot record —
 > quotes `AzerothCore rev. 34d6f4b0e8c7+`, which is the **binary**: the deployed
 > `acore/ac-wotlk-worldserver:master` image was built `2026-10-25T22:08:07Z`, and
-> on the compose root `git rev-list --count 34d6f4b0e8c7..HEAD` was **80** when
-> PRO-306 checked it while the tree itself sat at `8f960d0ba`. So those records
-> certify an October binary against a November tree rev. Until the deploy-pin
-> policy on [PRO-306](/PRO/issues/PRO-306) is decided and the manifest it
-> proposes is committed, a verified boot must record **both** identities by hand:
+> on the compose root it is 80 commits behind. Raw output from the deploy host
+> on 2026-11-07, which is what the numbers above come from:
+>
+> ```console
+> scuff-dev@pve-wow-dev:/mnt/data/wow-server$ git rev-parse HEAD
+> 8f960d0ba80c68d3300659d24b3bb484bde24c68
+> scuff-dev@pve-wow-dev:/mnt/data/wow-server$ git rev-parse --abbrev-ref HEAD
+> Playerbot
+> scuff-dev@pve-wow-dev:/mnt/data/wow-server$ git rev-list --count 34d6f4b0e8c7..HEAD
+> 80
+> scuff-dev@pve-wow-dev:/mnt/data/wow-server$ docker image inspect \
+>     acore/ac-wotlk-worldserver:master --format '{{.Created}}'
+> 2026-10-25T22:08:07.349445992Z
+> ```
+>
+> So those records certify an October binary against a November tree rev. **The
+> deploy-pin policy is still undecided** — [PRO-306](/PRO/issues/PRO-306)
+> carries the proposal (pin the deploy tree *and* the build identity to a
+> reviewed rev, recorded in a committed `ops/deploy/deploy-manifest.json`) as a
+> pending decision for Scuff (CTO). Pinning the tree alone would not fix it
+> either, because the tree and the running binary can disagree as above — a
+> manifest has to carry the build identity too. Until that decision lands, the
+> interim rule is the one below: a verified boot records **both** identities by
+> hand:
 > `git -C /mnt/data/wow-server rev-parse HEAD` and
 > `docker image inspect acore/ac-wotlk-worldserver:master --format '{{.Created}}'`
 > next to the banner line.
@@ -1028,7 +1094,12 @@ boot. Live-file md5s and commit pattern: [PRO-31](/PRO/issues/PRO-31)
   boot step around what the gate read: `-f/--file`, `--env-file` and
   `-p/--project-name` after a bare `--` (pass them before `--`), `--compose-root`
   and `--gate` (set `COMPOSE_ROOT`/`PYTHON` instead, so the gate and the `cd`
-  cannot disagree), and `--no-boot-path-check` unless `PREFLIGHT_CHECK_ONLY=1`.
+  cannot disagree), `--no-deps` (the dependency mode is the wrapper's to choose
+  and name in the log — the default is `up -d --no-deps ac-worldserver`, and
+  `--with-one-offs` is the way to ask compose for `ac-db-import` and
+  `ac-client-data-init`), `--require-ready` or `--strict-boot` together with
+  `--no-start`, any unrecognised `--no-*`/`--force-*` shape after a bare `--`,
+  and `--no-boot-path-check` unless `PREFLIGHT_CHECK_ONLY=1`.
   A restart that changes **no** SQL can skip the slow half of the gate — the
   scratch clone plus up to `--data-copy-max-rows` rows copied per referenced
   table — with `bash ops/deploy/worldserver-up.sh --no-dry-run`; it prints a

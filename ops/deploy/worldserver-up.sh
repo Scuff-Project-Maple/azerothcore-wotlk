@@ -80,7 +80,36 @@
 #   --no-deps / --no-deps=*  the boot path owns dependency handling, so the mode
 #                            can never be something the log does not name
 #                            (use --with-one-offs for the compose-driven path)
+#   --require-ready, --strict-boot (or REQUIRE_READY=1 / STRICT_BOOT=1) together
+#                            with --no-start: --no-start creates the container
+#                            without starting it, so there can be no ready
+#                            banner and no since-boot FATAL count. A check that
+#                            cannot run must be refused, not skipped, because
+#                            the caller's exit code is the verification (B-1).
+#   --require-ready or --strict-boot with a non-numeric --ready-timeout, and a
+#                            non-numeric FRESH_SLOP_SECONDS: both were used in
+#                            arithmetic after the boot had already started, so
+#                            a typo died post-boot with rc=1 — not one of the
+#                            documented codes — before the ready wait and the
+#                            ledger evidence were ever produced.
+#   --no-* / --force-* after a bare `--` that this script does not explicitly
+#                            record (so `-- --force-rec`, `-- --no-star`): the
+#                            fresh-boot verdict depends on knowing whether a
+#                            recreate was asked for, and that must not rest on
+#                            trusting compose's own parser to reject a typo.
+#                            Exact names (--force-recreate, --no-recreate,
+#                            --no-start) and a small cosmetic allowlist
+#                            (--no-color, --no-ansi, --no-build, --no-aliases,
+#                            --no-anon, --no-log-prefix) stay allowed.
 #
+# Exit codes: 0 ok · 2 bad usage (refused command line) · 3 the stack refused
+# the boot (dependency gate) · 4 the container was started but the run may not
+# be called a clean boot: no worldserver container, --force-recreate that did
+# not move StartedAt, a since-boot FATAL line or an unreadable FATAL count
+# under --strict-boot, a missing ready banner under --require-ready, or — in
+# BOOT_MODE=no-deps only — acore_world.updates rows that changed or could not
+# be read on both sides (that mode's contract is that this boot ran no updater).
+# docker compose's own exit code is passed through unchanged.
 # `--no-start` stays allowed (it is a real compose workflow) but the run is then
 # labelled NOT A BOOT: no ready-banner wait, no fresh-boot verdict, and the
 # FATAL counts are lifetime ones.
