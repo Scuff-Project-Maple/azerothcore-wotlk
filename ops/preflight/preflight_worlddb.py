@@ -3908,6 +3908,15 @@ CHECK_TITLES = {
 # rather than in two f-strings that can drift apart.
 NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
 
+# Names that identify the *channel* rather than the destination, so a comparison against
+# `main()`'s label can never tell us whether we learned anything. CPython builds the three
+# std streams itself from the inherited descriptors and stamps them with these literals,
+# and a shell redirect happens before the interpreter starts — measured on 3.12.3,
+# `sys.stdout.name` is the string `'<stdout>'` whether fd 1 is a terminal, a pipe, or
+# `/dev/full` (PRO-354). So `_stream_label`'s answer is only trustworthy when it is *not*
+# one of these.
+CHANNEL_ONLY_STREAM_NAMES = frozenset({"<stdin>", "<stdout>", "<stderr>"})
+
 
 class _RetiredStream:
     r"""A sink that absorbs anything written to a stream the kernel already refused.
@@ -4019,6 +4028,65 @@ def _stream_label(stream) -> str:
     return repr(stream)
 
 
+def _descriptor_destination(fd: int) -> str | None:
+    r"""Ask the kernel where `fd` points, or say nothing.
+
+    Returns None whenever there is no *name* to give — no `/proc` (macOS, some containers),
+    a closed or unreadable descriptor, or an anonymous inode. Every one of those is a "the
+    descriptor cannot help" answer, and the caller keeps the wording the object itself
+    supplied rather than inventing one. This runs from inside a failure handler, so it is
+    not allowed to raise.
+    """
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
+    if not os.path.isabs(target):
+        # `/proc` renders an anonymous inode as `pipe:[123456]`, `socket:[6789]` or
+        # `anon_inode:[eventfd]`, and none of those is a path. An inode number is not
+        # somewhere an operator can go and fix, so PRO-341 review N2's rule — name the
+        # destination only when it adds something — leaves an ordinary pipe unnamed, which
+        # is what keeps an early-closed pipe reading exactly like PRO-325's `extraD`.
+        return None
+    return target
+
+
+def _stream_destination(stream) -> str:
+    r"""Name the destination a write to `stream` actually lands in.
+
+    `_stream_label` answers "what does this Python object call itself", which is the right
+    question for a stream Python opened — `open("/dev/full", "w").name` really is
+    `/dev/full` — and the wrong one for a descriptor the shell redirected before the
+    interpreter started. PRO-354: under a real `> /dev/full`, `sys.stdout.name` is still the
+    literal `'<stdout>'`, so `_emit`'s "say it only when it adds something" test compared
+    `<stdout>` with `<stdout>`, suppressed the parenthetical as noise, and left the operator
+    with a sentence that reads exactly like any other stdout failure. The device that
+    refused the boot — the one thing the notice exists to name — never appeared.
+
+    So when the object's own answer is a channel name, ask the descriptor instead, which is
+    the same question asked from the side that actually knows. The two paths converge on one
+    string: an in-process `open("/dev/full")` and a shell `> /dev/full` now both render
+    `(/dev/full)`, so they cannot drift apart the way PRO-354's two paths did.
+
+    A pipe stays unnamed: `/proc` renders it as `pipe:[123456]`, an inode number is not a
+    destination, and PRO-341 review N2 was right that the parenthetical has to earn its
+    place.
+    """
+    label = _stream_label(stream)
+    if label not in CHANNEL_ONLY_STREAM_NAMES:
+        return label
+    fileno = getattr(stream, "fileno", None)
+    if not callable(fileno):
+        return label
+    try:
+        fd = fileno()
+    except Exception:
+        # A stream that cannot say which descriptor it writes through is back to being
+        # identified by its object, which is all `_stream_label` ever had to offer.
+        return label
+    return _descriptor_destination(fd) or label
+
+
 def _emit(stream, text: str, *, label=None) -> None:
     r"""Write a report block to a stream; never let presentation cost the verdict.
 
@@ -4064,7 +4132,14 @@ def _emit(stream, text: str, *, label=None) -> None:
         # `/dev/full` points at the thing that actually refused. Say it only when it adds
         # something — an ordinary pipe reports `<stdout>` either way, and a parenthetical
         # that repeats the label is noise, not information.
-        real = _stream_label(stream)
+        #
+        # PRO-354: asking `_stream_label` for that "something" was the bug. It asks the
+        # Python object, and after a shell redirect the object's name is still the literal
+        # `<stdout>`, so the comparison was `<stdout> != <stdout>`, the branch suppressed
+        # itself, and the device name was never emitted — while the PRO-341 pin kept passing
+        # because its fixture used an in-process `open("/dev/full", "w")`, whose `name`
+        # really is `/dev/full`. Ask the descriptor when the object cannot help.
+        real = _stream_destination(stream)
         if real and real != name:
             name = f"{name} ({real})"
     try:
