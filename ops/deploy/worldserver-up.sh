@@ -429,6 +429,15 @@ case "$BOOT_MODE" in
   *) die "BOOT_MODE must be 'no-deps' or 'with-one-offs' (got '$BOOT_MODE')" ;;
 esac
 
+if [[ "$REQUIRE_READY" == "1" && "$WAIT_READY" != "1" ]]; then
+  # REQUIRE_READY=1 is the env spelling of --require-ready, and the header
+  # promises it "waits for the ready banner and fails if it never appears".
+  # Setting only the requirement left WAIT_READY at 0, so the run never waited,
+  # recorded `ready banner: not-checked`, and failed on a banner it was never
+  # given the chance to see.
+  WAIT_READY=1
+fi
+
 if [[ "$RECREATE" == "1" && "$FORCE_RECREATE" != "1" ]]; then
   # RECREATE=1 is the env spelling of --force-recreate (PRO-306 B2) so a
   # runbook step can pin it without touching the argument list.

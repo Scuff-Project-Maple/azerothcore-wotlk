@@ -3349,10 +3349,19 @@ class TestBootPathPRO306(unittest.TestCase):
 
     # --- B2: a boot claim has to be tied to a container that restarted ------- #
     def test_wrapper_does_not_end_in_exec_docker_compose(self):
+        # Spellings, not behaviours: `exec "${COMPOSE_CMD[@]}"` is only one way to
+        # write an unreportable boot, and the historical one was
+        # `exec docker compose up -d ac-worldserver`. Assert the *shape* — no
+        # top-level exec at all, and the last statement is the one that reports.
         src = self._source()
-        self.assertNotIn('exec "${COMPOSE_CMD[@]}"', src,
-                         "the boot must be reportable: exec leaves nothing to print "
-                         "the StartedAt / since-boot FATAL verdict from (PRO-306 B2)")
+        code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
+        self.assertIsNone(re.search(r"^\s*exec\b", code, re.M),
+                          "the boot must be reportable: exec leaves nothing to print "
+                          "the StartedAt / since-boot FATAL verdict from (PRO-306 B2)")
+        statements = [l for l in code.splitlines() if l.strip()]
+        self.assertEqual(statements[-1].strip(), 'exit "$rc"',
+                         "the wrapper must end by reporting, not by handing its exit "
+                         "status to compose (PRO-306 B2)")
         for marker in ("BOOT VERDICT", "BOOT_T0", "StartedAt", "since=", "lifetime"):
             self.assertIn(marker, src, f"boot-identity reporting lost {marker!r}")
 
@@ -3377,8 +3386,9 @@ class TestBootPathPRO306(unittest.TestCase):
         # assignment fails, and `set -e` ends the script with no output.
         code = "\n".join(l for l in self._source().splitlines()
                          if not l.lstrip().startswith("#"))
-        self.assertNotIn("| head -n 1", code,
-                         "take the first line with a parameter expansion instead of `| head -n 1`")
+        self.assertIsNone(re.search(r"\|\s*head\b", code),
+                          "take the first line with a parameter expansion, not a `head` "
+                          "pipeline: any spelling of it kills the wrapper under pipefail")
 
     def test_dependency_check_only_is_documented_and_reachable(self):
         proc = self._run(["--help"])
@@ -3394,6 +3404,7 @@ class TestBootPathPRO306(unittest.TestCase):
         # The database service specifically: without this the dependency gate can
         # end the script between two log lines.
         self.assertIn('cannot ask compose about $DB_SERVICE', src)
+
     def test_recreate_env_and_flag_are_the_same_request_after_double_dash(self):
         # PRO-179 NB-1 keeps benign post-`--` flags forwarded; PRO-306 B2 adds
         # that they must also be *seen*, so the two spellings cannot disagree.
@@ -3404,6 +3415,385 @@ class TestBootPathPRO306(unittest.TestCase):
         self.assertIn("FORCE_RECREATE=1", src)
         self.assertIn('RECREATE" == "1"', src)
 
+
+class TestBootPathFakeDockerPRO306(unittest.TestCase):
+    """PRO-306 review B-1/B-2: the exit code is the verification, so run the
+    wrapper against a fake `docker` and assert on the code it really returns.
+
+    The class above can only reach argument parsing: `COMPOSE_ROOT` points at an
+    empty dir with no lease, so every run dies before the boot. That is exactly
+    the region where the two blocking defects were *not* — both lived after the
+    gate, in the code that decides whether a boot may be called clean, and both
+    exited 0 on a boot that was never proven.
+
+    So this class runs the real wrapper end to end with a fake `docker` first on
+    `PATH` (the same CLI the wrapper shells out to) and a fake `PYTHON` that
+    stands in for both the lease check and the gate. Every scenario below is a
+    claim about an exit status, not about a spelling in the source.
+
+    Exit-code contract asserted here: 2 = the command line was refused, 3 = the
+    stack refused the boot, 4 = the container started but the run may not be
+    called a clean boot, 0 = proven.
+    """
+
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+
+    FAKE_DOCKER = r'''#!/usr/bin/env python3
+import os, re, sys
+
+def env(k, d=""):
+    return os.environ.get(k, d)
+
+def main():
+    argv = sys.argv[1:]
+    if env("FAKE_TRACE"):
+        with open(env("FAKE_TRACE"), "a") as fh:
+            fh.write(" ".join(argv) + "\n")
+    if not argv:
+        sys.exit(127)
+    if argv[0] == "compose":
+        return compose(argv[1:])
+    return plain(argv)
+
+def compose(argv):
+    rest, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-f", "--file", "-p", "--project-name"):
+            i += 2
+            continue
+        if a.startswith("--file=") or a.startswith("--project-name="):
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    if not rest:
+        sys.stderr.write("fake docker: compose: no verb\n")
+        sys.exit(2)
+    verb, args = rest[0], rest[1:]
+    if verb == "ps":
+        svc = args[-1] if args else ""
+        if svc == "ac-worldserver" and env("FAKE_NO_WS_CONTAINER") != "1":
+            sys.stdout.write("ws-container-id\n")
+        elif svc == "ac-database" and env("FAKE_NO_DB") != "1":
+            sys.stdout.write("db-container-id\n")
+        elif svc == "ac-client-data-init" and env("FAKE_NO_INIT") != "1":
+            sys.stdout.write("init-container-id\n")
+        return 0
+    if verb == "exec":
+        if "mysql" not in args:
+            sys.stderr.write("fake docker: compose exec: expected mysql\n")
+            sys.exit(2)
+        sql = args[-1]
+        if env("FAKE_DB_FAIL") == "1":
+            sys.stderr.write("ERROR 2002 (HY000): Can't connect\n")
+            return 1
+        if "COUNT(*) FROM updates_include" in sql:
+            sys.stdout.write(env("FAKE_UPDATES_INCLUDE", "4") + "\n")
+        elif "COUNT(*) FROM updates" in sql:
+            # read twice per run (dependency gate, then after the boot); a counter
+            # file is the only way the second read can differ across processes
+            reads, sf = 0, env("FAKE_LEDGER_STATE")
+            if sf and os.path.exists(sf):
+                with open(sf) as fh:
+                    reads = len(fh.read().splitlines())
+            if sf:
+                with open(sf, "a") as fh:
+                    fh.write("1\n")
+            moved = env("FAKE_LEDGER_MOVED") == "1" and reads >= 1
+            sys.stdout.write((env("FAKE_UPDATES_AFTER", "3079") if moved
+                              else env("FAKE_UPDATES_BEFORE", "3078")) + "\n")
+        else:
+            sys.stderr.write("fake docker: unexpected sql: %s\n" % sql)
+            return 1
+        return 0
+    if verb == "up":
+        if env("FAKE_UP_RC"):
+            sys.stderr.write("fake docker: up failed\n")
+            return int(env("FAKE_UP_RC"))
+        if "--no-deps" not in args:
+            sys.stderr.write("fake compose: Creating ac-db-import ac-client-data-init\n")
+        else:
+            sys.stderr.write("fake compose: Container ac-worldserver  Started\n")
+        return 0
+    sys.stderr.write("fake docker: compose: unhandled verb %r\n" % verb)
+    sys.exit(2)
+
+def plain(argv):
+    if argv[0] == "inspect":
+        fmt, ident = "", argv[-1]
+        for i, a in enumerate(argv):
+            if a in ("--format", "-f"):
+                fmt = argv[i + 1]
+            elif a.startswith("--format="):
+                fmt = a.split("=", 1)[1]
+        if ident == "ws-container-id":
+            out = {"{{.State.Status}}": env("FAKE_WS_STATUS", "running"),
+                   "{{.State.StartedAt}}": env("FAKE_STARTED", "1970-01-01T00:00:00.000000000Z"),
+                   "{{.RestartCount}}": env("FAKE_RESTARTS", "0")}.get(fmt, "unknown")
+        elif ident == "db-container-id":
+            if "{{.State.Status}}" in fmt:
+                out = env("FAKE_DB_STATUS", "running")
+            elif "Health" in fmt:
+                out = env("FAKE_DB_HEALTH", "healthy")
+            else:
+                out = "unknown"
+        elif ident == "init-container-id":
+            if "{{.State.ExitCode}}" in fmt:
+                out = env("FAKE_INIT_RC", "0")
+            elif "{{.State.Running}}" in fmt:
+                out = env("FAKE_INIT_RUNNING", "false")
+            else:
+                out = "unknown"
+        else:
+            sys.stderr.write("fake docker: inspect unknown id %s\n" % ident)
+            return 1
+        sys.stdout.write(out + "\n")
+        return 0
+    if argv[0] == "volume":
+        pat = ""
+        for i, a in enumerate(argv):
+            if a == "--filter":
+                pat = argv[i + 1]
+            elif a.startswith("--filter="):
+                pat = a.split("=", 1)[1]
+        if "name=" not in pat:
+            sys.stderr.write("fake docker: volume ls without a name filter\n")
+            return 1
+        if env("FAKE_NO_VOLUME") == "1":
+            return 0
+        name = env("FAKE_VOLUME", "wow-server_ac-client-data")
+        # docker's `--filter name=` is an UNANCHORED regex, which is why the
+        # wrapper matches the name itself instead of trusting the filter
+        if re.search(pat.split("=", 1)[1], name):
+            sys.stdout.write(name + "\n")
+        return 0
+    if argv[0] == "logs":
+        if env("FAKE_LOGS_FAIL") == "1":
+            sys.stderr.write("Error: No such container: ws-container-id\n")
+            return 1
+        lines = []
+        if env("FAKE_LOG_TEXT"):
+            lines.append(env("FAKE_LOG_TEXT"))
+        if env("FAKE_LOG_READY") == "1":
+            lines.append("AzerothCore rev. abc (worldserver-daemon) ready...")
+        if env("FAKE_LOG_FATAL") == "1":
+            lines.append("FATAL something terrible")
+        sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+        return 0
+    sys.stderr.write("fake docker: unhandled %r\n" % (argv[:2],))
+    sys.exit(2)
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+    def _run(self, argv, fake=None, env_extra=None):
+        import datetime as dt
+        import os
+        import stat
+        import subprocess
+        import tempfile
+        fake = dict(fake or {})
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "fakebin"
+            bin_dir.mkdir()
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(self.FAKE_DOCKER, encoding="utf-8")
+            fake_docker.chmod(fake_docker.stat().st_mode | stat.S_IEXEC)
+            # Stands in for `python3`: the wrapper calls it twice, once as the
+            # lease checker (`$PYTHON - <lease>`) and once as the gate. Both must
+            # succeed here, or nothing below the gate is ever exercised.
+            gate = Path(tmp) / "fakegate"
+            gate.write_text("#!/usr/bin/env bash\n"
+                            'echo "RESULT: PASS (0.0s)"\n'
+                            "exit 0\n", encoding="utf-8")
+            gate.chmod(gate.stat().st_mode | stat.S_IEXEC)
+            lease = Path(tmp) / "lease"
+            lease.write_text(json.dumps({
+                "agentId": "pro-306-fake-docker-tests", "issueId": "PRO-306",
+                "action": "boot-path tests",
+                "acquiredAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "expectedMinutes": 60,
+            }), encoding="utf-8")
+            now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Drop any FAKE_* the ambient environment happens to carry, then set
+            # this scenario's — a leaked one would silently redefine the test.
+            env = {k: v for k, v in os.environ.items() if not k.startswith("FAKE_")}
+            env.update(COMPOSE_ROOT=tmp, LEASE_FILE=str(lease), PYTHON=str(gate),
+                       PATH=str(bin_dir) + os.pathsep + os.environ["PATH"],
+                       FAKE_STARTED=fake.pop("FAKE_STARTED", now),
+                       FAKE_LEDGER_STATE=str(Path(tmp) / "ledger"))
+            env.update(fake)
+            env.update(env_extra or {})
+            proc = subprocess.run(["bash", str(self.WRAPPER), *argv],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, timeout=120, env=env)
+            # stdout/stderr are merged for the assertions, but the split matters
+            # when a refusal must be visible on stderr.
+            return proc
+
+    # --- the baseline every other scenario is measured against --------------- #
+    def test_a_proven_fresh_boot_exits_zero(self):
+        proc = self._run(["--force-recreate", "--require-ready", "--strict-boot"],
+                         fake={"FAKE_LOG_READY": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("BOOT MODE: no-deps", proc.stdout)
+        self.assertIn("BOOT VERDICT: fresh boot", proc.stdout)
+        self.assertIn("ready banner: seen", proc.stdout)
+        self.assertIn("before=3078 after=3078 (unchanged", proc.stdout)
+
+    # --- B-2: an unreadable log stream is not "zero FATALs" ------------------ #
+    def test_strict_boot_fails_when_docker_logs_is_unreadable(self):
+        proc = self._run(["--force-recreate", "--strict-boot"],
+                         fake={"FAKE_LOGS_FAIL": "1"})
+        self.assertEqual(proc.returncode, 4, proc.stdout)
+        self.assertIn("cannot check anything", proc.stdout)
+        # The number itself is the regression: a folded-stderr `|| true` made an
+        # unreadable stream print `0`, which `--strict-boot` then happily passed.
+        since = [l for l in proc.stdout.splitlines() if "LOG_FATAL since this boot" in l]
+        self.assertEqual(len(since), 1, proc.stdout)
+        self.assertIn("logs-unreadable", since[0])
+        self.assertNotIn("): 0", since[0])
+
+    def test_strict_boot_fails_on_a_fatal_line(self):
+        proc = self._run(["--force-recreate", "--strict-boot"],
+                         fake={"FAKE_LOG_FATAL": "1"})
+        self.assertEqual(proc.returncode, 4, proc.stdout)
+        self.assertIn("FATAL line(s) appeared since", proc.stdout)
+
+    def test_a_fatal_line_is_reported_without_strict_boot(self):
+        # Report-only is the default; the numbers must still be there, and the
+        # since-boot and lifetime counts must stay two separate numbers.
+        proc = self._run(["--force-recreate"], fake={"FAKE_LOG_FATAL": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("LOG_FATAL since this boot (since=", proc.stdout)
+        self.assertIn("lifetime (whole container, not a boot measurement): 1", proc.stdout)
+
+    # --- B-1: a requirement that cannot be checked is refused, not skipped --- #
+    def test_no_start_and_require_ready_is_refused_at_parse_time(self):
+        proc = self._run(["--no-start", "--require-ready"])
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("contradict", proc.stdout)
+
+    def test_no_start_and_strict_boot_is_refused_at_parse_time(self):
+        proc = self._run(["--no-start", "--strict-boot"])
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("contradict", proc.stdout)
+
+    def test_env_spellings_of_the_contradiction_are_refused_too(self):
+        # REQUIRE_READY=1 / STRICT_BOOT=1 arrive after argument parsing, so the
+        # check has to sit after the RECREATE=1 expansion, not in the flag loop.
+        for key in ("REQUIRE_READY", "STRICT_BOOT"):
+            proc = self._run(["--no-start"], env_extra={key: "1"})
+            self.assertEqual(proc.returncode, 2, f"{key}: {proc.stdout}")
+            self.assertIn("contradict", proc.stdout, key)
+
+    def test_a_missing_worldserver_container_is_never_exit_zero(self):
+        # This is the exact PRO-303 shape: compose "succeeded", the container is
+        # not there, and the run used to report a clean boot.
+        for argv in (["--force-recreate"], ["--no-start"]):
+            proc = self._run(argv, fake={"FAKE_NO_WS_CONTAINER": "1"})
+            self.assertEqual(proc.returncode, 4, f"{argv}: {proc.stdout}")
+            self.assertIn("no container id", proc.stdout)
+
+    def test_require_ready_fails_when_the_banner_never_appears(self):
+        proc = self._run(["--force-recreate", "--require-ready", "--ready-timeout", "0"])
+        self.assertEqual(proc.returncode, 4, proc.stdout)
+        self.assertIn("REFUSING TO CALL THIS A BOOT", proc.stdout)
+
+    # --- the boot verdict cannot be talked into lying ----------------------- #
+    def test_force_recreate_that_did_not_move_started_at_refuses(self):
+        proc = self._run(["--force-recreate"],
+                         fake={"FAKE_STARTED": "2026-01-01T00:00:00.000000000Z"})
+        self.assertEqual(proc.returncode, 3, proc.stdout)
+        self.assertIn("did not move past BOOT_T0", proc.stdout)
+
+    def test_a_stale_container_without_recreate_is_labelled_not_a_fresh_boot(self):
+        proc = self._run([], fake={"FAKE_STARTED": "2026-01-01T00:00:00.000000000Z"})
+        self.assertIn("NOT A FRESH BOOT", proc.stdout)
+        self.assertIn("LIFETIME counter", proc.stdout)
+        self.assertNotIn("BOOT VERDICT: fresh boot", proc.stdout)
+
+    def test_compose_exit_code_is_passed_through(self):
+        proc = self._run(["--force-recreate"], fake={"FAKE_UP_RC": "17"})
+        self.assertEqual(proc.returncode, 17, proc.stdout)
+
+    # --- B1: the no-deps contract is enforced, not narrated ----------------- #
+    def test_a_moving_ledger_in_no_deps_mode_is_a_failure(self):
+        proc = self._run(["--force-recreate"], fake={"FAKE_LEDGER_MOVED": "1"})
+        self.assertEqual(proc.returncode, 4, proc.stdout)
+        self.assertIn("REFUSING TO CALL THIS A CLEAN BOOT", proc.stdout)
+
+    def test_a_moving_ledger_in_with_one_offs_mode_is_reported_not_refused(self):
+        # Here the updater *is* supposed to run, so a moving ledger is the point
+        # of the run — and the message must not call it a write path nobody asked
+        # for.
+        proc = self._run(["--with-one-offs", "--force-recreate"],
+                         fake={"FAKE_LEDGER_MOVED": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("BOOT MODE: with-one-offs", proc.stdout)
+        self.assertNotIn("REFUSING TO CALL THIS A CLEAN BOOT", proc.stdout)
+
+    # --- the dependency gate refuses what depends_on used to swallow --------- #
+    def test_dependency_gate_refuses_a_cold_or_broken_stack(self):
+        for fake in ({"FAKE_NO_DB": "1"},                      # nothing to talk to
+                     {"FAKE_DB_STATUS": "exited"},             # there but not running
+                     {"FAKE_DB_HEALTH": "unhealthy"},          # running but sick
+                     {"FAKE_DB_FAIL": "1"},                    # ledger unreadable
+                     {"FAKE_UPDATES_INCLUDE": "0"},            # ledger never configured
+                     {"FAKE_NO_VOLUME": "1"},                  # no client data
+                     {"FAKE_NO_INIT": "1"},                    # one-off vanished
+                     {"FAKE_INIT_RUNNING": "true"},            # one-off still working
+                     {"FAKE_INIT_RC": "1"}):                   # one-off failed
+                proc = self._run(["--force-recreate"], fake=fake)
+                self.assertEqual(proc.returncode, 3, f"{fake}: {proc.stdout}")
+                self.assertIn("REFUSING BOOT", proc.stdout, str(fake))
+
+    def test_a_running_one_off_is_not_read_as_a_completed_one(self):
+        # docker reports ExitCode 0 for a *running* container, so "last exit 0"
+        # alone let an in-flight client-data download count as a populated volume.
+        proc = self._run(["--force-recreate"], fake={"FAKE_INIT_RUNNING": "true"})
+        self.assertEqual(proc.returncode, 3, proc.stdout)
+        self.assertIn("still running", proc.stdout)
+
+    def test_the_volume_name_follows_docker_vol_data(self):
+        # compose mounts ${DOCKER_VOL_DATA:-ac-client-data}; a hard-coded name
+        # refused a stack that was perfectly healthy under a different volume.
+        ok = self._run(["--force-recreate"],
+                       fake={"FAKE_VOLUME": "wow-server_custom-data"},
+                       env_extra={"DOCKER_VOL_DATA": "custom-data"})
+        self.assertEqual(ok.returncode, 0, ok.stdout)
+        bad = self._run(["--force-recreate"], fake={"FAKE_VOLUME": "wow-server_ac-client-data-v2"})
+        self.assertEqual(bad.returncode, 3, bad.stdout)
+        self.assertIn("no ac-client-data volume exists", bad.stdout)
+
+    # --- bad numbers are a usage error, not a post-boot crash --------------- #
+    def test_non_numeric_timeouts_are_refused_before_the_boot(self):
+        for argv in (["--require-ready", "--ready-timeout", "abc"],
+                    []):
+            env_extra = {"FRESH_SLOP_SECONDS": "soon"} if not argv else {}
+            proc = self._run(argv, env_extra=env_extra)
+            self.assertEqual(proc.returncode, 2, f"{argv}: {proc.stdout}")
+            self.assertIn("non-negative integer", proc.stdout)
+
+    # --- post-`--` flags that look like boot-shaping flags are refused ------ #
+    def test_unrecognised_recreate_or_start_shapes_after_double_dash_are_refused(self):
+        for arg in ("--force-rec", "--no-star", "--force-recreatex"):
+            proc = self._run(["--", arg])
+            self.assertEqual(proc.returncode, 2, f"{arg}: {proc.stdout}")
+            self.assertIn("shaped like a recreate/dependency/start flag", proc.stdout)
+
+    def test_the_recorded_and_cosmetic_flags_after_double_dash_still_work(self):
+        proc = self._run(["--", "--force-recreate", "--no-color"],
+                         fake={"FAKE_LOG_READY": "1"}, env_extra={"REQUIRE_READY": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("BOOT VERDICT: fresh boot", proc.stdout)
+
+    def test_no_deps_cannot_be_smuggled_after_double_dash(self):
+        proc = self._run(["--", "--no-deps"])
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("the boot path owns dependency handling", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
