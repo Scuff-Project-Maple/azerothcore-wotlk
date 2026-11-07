@@ -269,7 +269,10 @@ rc=0
 if (( rc != 0 )); then
   echo "worldserver-up: REFUSING BOOT — pre-flight failed (exit $rc)." >&2
   echo "worldserver-up: ac-worldserver was not started. Fix the named file(s) or" >&2
-  echo "                  escalate to Scuff (SQL); do not bypass this gate." >&2
+  echo "                  escalate to Scuff (SQL); a 'preflight: operational error:' or" >&2
+  echo "                  'could not write the --json payload' line from the gate is an" >&2
+  echo "                  environment or evidence-write failure, not a finding about your SQL." >&2
+  echo "                  Do not bypass this gate." >&2
   exit "$rc"
 fi
 
