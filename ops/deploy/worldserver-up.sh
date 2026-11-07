@@ -220,7 +220,7 @@ LEDGER_ROWS_BEFORE=""
 LEDGER_FP_BEFORE=""
 # One read, two numbers, so the "before" side costs a single client invocation
 # and cannot be a row count from one moment and a fingerprint from another.
-LEDGER_FP_SQL="SELECT CONCAT(COUNT(*),':',IFNULL(SUM(CRC32(CONCAT_WS('|',name,state,hash))),0) FROM updates)"
+LEDGER_FP_SQL="SELECT CONCAT(COUNT(*),':',IFNULL(SUM(CRC32(CONCAT_WS('|',name,state,hash))),0)) FROM updates"
 
 while [[ $# -gt 0 ]]; do
   arg="$1"
