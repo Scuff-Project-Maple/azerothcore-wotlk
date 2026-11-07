@@ -449,6 +449,11 @@ idea of the feature. Checks:
   on reload)? Does it grant items/levels/gold outside a designed path?
 - **Core-vs-script boundary** — does this patch C++ where Lua would do?
   (§3.1, §3.2.)
+- **Merge hygiene** — was the integration taken from `origin/<branch>` in a
+  detached worktree and published by explicit SHA (§5.4)? A merge built on a
+  local branch by name, or a publish with no clean
+  `scripts/merge-guard.sh` run behind it, is a **blocking** finding: it is
+  the one class of mistake that is invisible in the diff.
 - **Operability** — is the change verifiable in game and does the task say
   how? Does it force a 30–90 minute rebuild when Lua or SQL would have
   avoided it? That is a real cost, not a nit.
@@ -476,6 +481,46 @@ completed review with adverse findings is `done`, not `blocked`.
 Order is fixed: author → `Scuff (Rev)` (verdict `done`) → `Scuff (QA)`
 (pass) → merge. Rev's gate is before QA's; reading a diff never substitutes
 for an in-game pass.
+
+**The merge target is `origin/<branch>`, never a local branch by name.**
+`origin/Playerbot` is the authoritative integration line (PRO-319). A local
+ref that merely shares its name is a snapshot somebody once checked out, and
+snapshots drift. Integrate in a detached worktree and publish by explicit
+SHA, so the commit that was reviewed is the commit that lands:
+
+```bash
+git fetch origin
+git worktree add <scratch> --detach origin/<branch>   # never: git checkout <branch>
+# merge the feature branch in <scratch>, read the result, then:
+scripts/merge-guard.sh --publish <merge-sha> <branch>
+git push origin <merge-sha>:refs/heads/<branch>       # never: git push origin <branch>
+```
+
+Why the rule is mechanical rather than a warning: a local branch can sit
+behind or diverged from its upstream while still being called `Playerbot`,
+and `git push origin <branch>` then publishes whatever that snapshot holds —
+either dropping commits the line already has or shipping local-only work
+nobody reviewed. What git prints while doing it is `Fast-forward`, which
+makes an unreviewed publish look like a clean merge. That is exactly how
+PRO-319's local `Playerbot` came to sit 10 ahead / 94 behind
+`origin/Playerbot`.
+
+Run the guard before every publish. It is read-only and idempotent — it
+reads refs, never fetches, never writes, needs no Docker — and it refuses
+when the proposed merge target is a local branch that is behind or diverged
+from its upstream, printing the divergent counts, the commits on both sides,
+and the safe command:
+
+```bash
+scripts/merge-guard.sh <branch>                  # refuse if refs/heads/<branch> != origin/<branch>
+scripts/merge-guard.sh --publish <sha> <branch>  # + require <sha> to fast-forward origin/<branch>
+```
+
+Exit 0 means publishing as prescribed is safe; exit 1 means it refused and
+printed the safe command instead. `--allow-ahead` downgrades "local branch
+carries local-only commits" to a warning and is not for the integration
+line. Publish one SHA at a time — never `--all` / `--mirror` / `--tags`, and
+never PRO-319's `archive/*` tags, which stay local by design.
 
 ---
 
