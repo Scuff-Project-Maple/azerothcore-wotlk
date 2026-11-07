@@ -95,9 +95,11 @@ safe_pattern() {
 
 # A local-branch refusal is decided before the fast-forward check, so a stale
 # local branch — behind, or behind and diverged — plus a non-fast-forward
-# --publish SHA used to report one fault and hide the other. Diagnostic only: it
-# never changes the verdict or the exit code, and an unresolvable SHA is simply
-# not reported rather than turning exit 1 into 2.
+# --publish SHA used to report one fault and hide the other. Two branches: when
+# the SHA does descend from (or equal) the line tip the local branch is the only
+# fault and the helper says so; when it does not, both faults are named.
+# Diagnostic only: it never changes the verdict or the exit code, and an
+# unresolvable SHA is simply not reported rather than turning exit 1 into 2.
 report_publish_ff_fault() {
   local sha
   sha=$(git -C "$repo" rev-parse --verify --quiet "$publish^{commit}" 2>/dev/null) || return 0
@@ -246,9 +248,18 @@ if [[ -n $publish ]]; then
     safe_pattern "$publish"
     exit 1
   fi
-  say "ok — $publish is a fast-forward over $remote/$line @ ${remote_sha:0:9}"
-  say "  publish it, and only it:"
-  say "  git push $remote ${publish_sha}:refs/heads/$line"
+  # Equality splits like the other three publish paths: the fourth site used to
+  # print one SHA and call it a fast-forward over itself. "Nothing to publish"
+  # is honest here because this is the ok path; on the refused path the refusal
+  # stands, so report_publish_ff_fault must not offer that reassurance.
+  if [[ $publish_sha == "$remote_sha" ]]; then
+    say "ok — $publish is already the tip of $remote/$line @ ${remote_sha:0:9}"
+    say "  it is already on the line — nothing to publish."
+  else
+    say "ok — $publish is a fast-forward over $remote/$line @ ${remote_sha:0:9}"
+    say "  publish it, and only it:"
+    say "  git push $remote ${publish_sha}:refs/heads/$line"
+  fi
   exit 0
 fi
 say "ok — nothing refused for a SHA publish, but no --publish SHA was given"
