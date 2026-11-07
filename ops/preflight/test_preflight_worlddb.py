@@ -3294,5 +3294,83 @@ class TestTheCiWorkflowMatchesItsDocumentation(unittest.TestCase):
                              "README re-adopted a CI claim about a check that does not exist: %r" % gone)
 
 
+class TestBootPathPRO306(unittest.TestCase):
+    """PRO-306 B1/B2: what the wrapper may claim about a boot.
+
+    B1 — a gated boot must not silently re-run the `depends_on` one-offs, and
+    must name the mode it ran in. B2 — a boot claim must be tied to a container
+    that actually restarted, so the wrapper cannot end in `exec docker compose`
+    (nothing can report afterwards) and cannot accept a `--force-recreate` run
+    whose `StartedAt` never moved.
+
+    Argument-level only: `COMPOSE_ROOT` points at an empty temp dir with no
+    `.stack/lease`, so a run that clears parsing dies at the lease check and can
+    never reach `docker compose`, even on the deploy host.
+    """
+
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+
+    def _run(self, argv, env_extra=None):
+        import os
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, COMPOSE_ROOT=tmp, LEASE_FILE=str(Path(tmp) / "lease"))
+            env.update(env_extra or {})
+            return subprocess.run(["bash", str(self.WRAPPER), *argv],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, timeout=60, env=env)
+
+    def _source(self):
+        return self.WRAPPER.read_text(encoding="utf-8")
+
+    # --- B1: the dependency mode is never something the log does not name --- #
+    def test_wrapper_refuses_no_deps_from_the_caller(self):
+        for argv in (["--no-deps"], ["--no-deps=true"], ["--", "--no-deps"]):
+            proc = self._run(argv)
+            self.assertEqual(proc.returncode, 2, f"{argv}: {proc.stdout[:200]}")
+            self.assertIn("the boot path owns dependency handling", proc.stdout, f"{argv}")
+
+    def test_wrapper_accepts_the_explicit_one_off_mode(self):
+        proc = self._run(["--with-one-offs"])
+        self.assertNotIn("refusing to forward", proc.stdout)
+        self.assertIn("lease", proc.stdout, "should reach the lease check, not parsing")
+
+    def test_boot_mode_is_validated(self):
+        proc = self._run([], env_extra={"BOOT_MODE": "whatever"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("BOOT_MODE must be", proc.stdout)
+
+    def test_help_names_the_boot_mode_and_the_dependency_gate(self):
+        proc = self._run(["--help"])
+        self.assertEqual(proc.returncode, 0)
+        for claim in ("BOOT MODE", "--with-one-offs", "read-only"):
+            self.assertIn(claim, proc.stdout)
+
+    # --- B2: a boot claim has to be tied to a container that restarted ------- #
+    def test_wrapper_does_not_end_in_exec_docker_compose(self):
+        src = self._source()
+        self.assertNotIn('exec "${COMPOSE_CMD[@]}"', src,
+                         "the boot must be reportable: exec leaves nothing to print "
+                         "the StartedAt / since-boot FATAL verdict from (PRO-306 B2)")
+        for marker in ("BOOT VERDICT", "BOOT_T0", "StartedAt", "since=", "lifetime"):
+            self.assertIn(marker, src, f"boot-identity reporting lost {marker!r}")
+
+    def test_wrapper_rejects_recreate_and_no_recreate_together(self):
+        proc = self._run(["--force-recreate", "--no-recreate"])
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("cancel each other", proc.stdout)
+
+    def test_recreate_env_and_flag_are_the_same_request_after_double_dash(self):
+        # PRO-179 NB-1 keeps benign post-`--` flags forwarded; PRO-306 B2 adds
+        # that they must also be *seen*, so the two spellings cannot disagree.
+        proc = self._run(["--", "--force-recreate"])
+        self.assertNotIn("refusing to forward", proc.stdout)
+        self.assertIn("lease", proc.stdout)
+        src = self._source()
+        self.assertIn("FORCE_RECREATE=1", src)
+        self.assertIn('RECREATE" == "1"', src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
