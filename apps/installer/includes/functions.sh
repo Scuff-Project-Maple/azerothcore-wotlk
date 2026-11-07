@@ -143,7 +143,27 @@ function inst_get_default_branch() {
 # Module Management System
 # =============================================================================
 # Load the module manager functions from the dedicated modules-manager directory
-source "$AC_PATH_INSTALLER/includes/modules-manager/modules.sh"
+#
+# Guarded (PRO-306 B4). The ac-client-data-init container sources this file
+# straight from its CMD — "source /azerothcore/apps/installer/includes/
+# functions.sh && inst_download_client_data" (apps/docker/Dockerfile) — which
+# bypasses apps/installer/includes/includes.sh, the only place AC_PATH_INSTALLER
+# is ever set. With the variable unset the line below became
+# `source "/includes/modules-manager/modules.sh"`, and every client-data start
+# printed a hard-looking
+#   functions.sh: line 146: /includes/modules-manager/modules.sh: No such file
+#   or directory
+# before printing "Data v20.0 already installed" and exiting 0 — exactly the
+# kind of line that hides a real failure later. It is deliberately not "fixed"
+# by letting the path resolve: modules.sh sources the installer's other
+# includes, which source $AC_PATH_DEPS/... (bash-lib, joiner, semver_bash), and
+# the client-data image ships only apps/ — so resolving the path would trade one
+# missing-file error for three. The data download needs none of it.
+if [ -n "${AC_PATH_INSTALLER:-}" ]; then
+    source "$AC_PATH_INSTALLER/includes/modules-manager/modules.sh"
+else
+    echo "[installer] modules.sh not loaded: AC_PATH_INSTALLER is unset, so this file was sourced directly instead of through apps/installer/includes/includes.sh (that is how the ac-client-data-init container runs it). Expected — inst_download_client_data does not need the module manager."
+fi
 
 function inst_simple_restarter {
     echo "Running $1 ..."
