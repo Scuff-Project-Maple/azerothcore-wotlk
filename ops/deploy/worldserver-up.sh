@@ -317,7 +317,7 @@ while [[ $# -gt 0 ]]; do
             # something compose was handed quietly.
             die "refusing to forward $1 to docker compose: the boot path owns dependency handling, and the dependency mode has to be named for the log. Leave the default (which already implies --no-deps) or pass --with-one-offs before --."
             ;;
-          --force-recreate*|--no-recreate*|--no-start*)
+          --force-recreate|--no-recreate|--no-start)
             # Forwarded (PRO-179 NB-1 keeps benign post-`--` flags working), but
             # *also* recorded, because these decide what this run may claim:
             # without this the fresh-boot verdict and the NOT-A-BOOT label would
@@ -333,6 +333,22 @@ while [[ $# -gt 0 ]]; do
             # instead spins the loop forever on the same argument.
             shift
             continue
+            ;;
+          --no-color|--no-ansi|--no-build|--no-aliases|--no-anon|--no-log-prefix)
+            # Exact-match allowlist for the benign `--no-*` compose flags that do
+            # not change what this run may claim. They are forwarded unrecorded
+            # on purpose; anything else in this shape is refused below.
+            ;;
+          --no-*|--force-*)
+            # Refused rather than forwarded (PRO-306 review NB-5). An unknown
+            # spelling like `-- --force-rec` or `-- --no-star` used to reach
+            # compose unrecorded, and the safety of that path rested entirely on
+            # compose's own parser rejecting it — which is an assumption about a
+            # binary this script cannot audit. Anything that *looks* like a
+            # recreate / dependency / start-shaping flag has to be one this
+            # wrapper recognises and can describe in the log, or it does not get
+            # near compose.
+            die "refusing to forward $1 to docker compose: it is shaped like a recreate/dependency/start flag but is not one this wrapper records, so the boot verdict could not honestly describe it. Use the exact compose flag name, and pass it before -- if the wrapper has a flag for it."
             ;;
         esac
         COMPOSE_ARGS+=("$1")
@@ -398,6 +414,36 @@ if [[ "$FORCE_RECREATE" == "1" ]]; then
   done
 fi
 
+# Contradictory requests are refused at parse time rather than silently cancelled
+# later (PRO-306 review B-1). `--no-start` creates the container without starting
+# it, so there is no boot to wait a ready banner on and no since-boot log window
+# to count FATAL lines in; an earlier revision let exactly that combination run
+# and exit 0 with the caller's hard requirement dropped on the floor. Checked
+# here rather than in the flag loop so the env spellings (REQUIRE_READY=1,
+# STRICT_BOOT=1) are refused by the same code path as the flags.
+if [[ "$NO_START" == "1" ]]; then
+  if [[ "$REQUIRE_READY" == "1" ]]; then
+    die "--require-ready and --no-start contradict each other: nothing starts, so the ready banner can never appear. Drop one: --no-start to create only, or --require-ready to boot and prove readiness."
+  fi
+  if [[ "$STRICT_BOOT" == "1" ]]; then
+    die "--strict-boot and --no-start contradict each other: with nothing started there is no since-boot log window, so a FATAL count would describe a boot that did not happen. Drop one: --no-start to create only, or --strict-boot to boot and fail on FATAL."
+  fi
+fi
+
+# Numeric knobs are validated before the boot, not at first use (PRO-306 review
+# NB-3): `--ready-timeout abc` used to die at `deadline=$(( ... ))` *after*
+# ac-worldserver had already been started, with rc=1 — a code the runbook does
+# not document (2 usage / 3 refuse / 4 not-a-boot) — and it died before the
+# ready wait and the ledger before/after evidence could be printed. Arithmetic
+# expansion is also a command-execution path for a value shaped like an array
+# subscript, so a non-digit never reaches the arithmetic context at all.
+if [[ ! "$READY_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  die "READY_TIMEOUT must be a non-negative integer number of seconds (got '$READY_TIMEOUT')"
+fi
+if [[ ! "$FRESH_SLOP_SECONDS" =~ ^[0-9]+$ ]]; then
+  die "FRESH_SLOP_SECONDS must be a non-negative integer number of seconds (got '$FRESH_SLOP_SECONDS')"
+fi
+
 compose_ps_q() {
   # `docker compose ps -q <service>` — empty when the service has no container
   # in this project. stdin is closed because `compose ps` is not a reader and a
@@ -443,7 +489,7 @@ assert_dependencies() {
   # a cold or half-imported database, so it fails closed; in with-one-offs mode
   # the one-offs are still coming up and a cold stack legitimately has an empty
   # ledger, so the same numbers are reported without refusing.
-  local require_ledger="$1" id status health rows inc vol init_id initrc="none"
+  local require_ledger="$1" id status health rows inc vol init_id initrc="none" initrunning="unknown"
   note "dependency gate (asserting by hand what depends_on used to do silently)"
 
   id="$(compose_ps_q "$DB_SERVICE")" \
@@ -488,33 +534,70 @@ assert_dependencies() {
   # No `| head -n 1`: under `set -euo pipefail` a `head` that closes the pipe
   # early turns the producer into a SIGPIPE failure, and an assignment that
   # fails kills the script with no output at all.
-  local vol_raw=""
-  if ! vol_raw="$(docker volume ls -q --filter "name=ac-client-data" </dev/null)"; then
+  #
+  # The volume name comes from compose, not from a string in this script:
+  # docker-compose.yml mounts `${DOCKER_VOL_DATA:-ac-client-data}`, so anyone who
+  # sets that knob would otherwise be refused a boot for a volume that does not
+  # exist under that name (PRO-306 review NB-1). The docker `name=` filter is an
+  # *unanchored* regex, so `name=ac-client-data` also matches an unrelated
+  # `…_ac-client-data-v2`; the filter is only a cheap pre-selection and the
+  # decision is made by an exact comparison here. A compose-managed volume is
+  # normally project-prefixed (`wow-server_ac-client-data`), an external one is
+  # not, so both spellings are accepted and nothing else is.
+  local vol_name="${DOCKER_VOL_DATA:-ac-client-data}"
+  local vol_raw="" c
+  if ! vol_raw="$(docker volume ls -q --filter "name=${vol_name}" </dev/null)"; then
     if [[ "$require_ledger" == "1" ]]; then
-      refuse "cannot list docker volumes, so this boot cannot confirm ac-client-data exists. BOOT_MODE=no-deps starts no ac-client-data-init to create it."
+      refuse "cannot list docker volumes, so this boot cannot confirm $vol_name exists. BOOT_MODE=no-deps starts no ac-client-data-init to create it."
     fi
   fi
   vol_raw="${vol_raw//$'\r'/}"
-  vol="${vol_raw%%$'\n'*}"
+  vol=""
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    c="${c%%/*}"
+    if [[ "$c" == "$vol_name" || "$c" == *"_${vol_name}" ]]; then
+      vol="$c"
+      break
+    fi
+  done <<<"$vol_raw"
   if [[ -z "$vol" ]]; then
     if [[ "$require_ledger" == "1" ]]; then
-      refuse "no ac-client-data volume exists. BOOT_MODE=no-deps starts no ac-client-data-init, and ac-worldserver mounts that volume read-only — boot with --with-one-offs to populate it first."
+      refuse "no $vol_name volume exists. BOOT_MODE=no-deps starts no ac-client-data-init, and ac-worldserver mounts that volume read-only — boot with --with-one-offs to populate it first."
     fi
-    note "  [dep 3] no ac-client-data volume yet; ac-client-data-init will create it"
+    note "  [dep 3] no $vol_name volume yet; ac-client-data-init will create it"
   else
     init_id=""
     if ! init_id="$(compose_ps_q ac-client-data-init)"; then
       if [[ "$require_ledger" == "1" ]]; then
-        refuse "cannot ask compose about ac-client-data-init, so the last exit code of the one-off that fills ac-client-data cannot be verified."
+        refuse "cannot ask compose about ac-client-data-init, so the last exit code of the one-off that fills $vol_name cannot be verified."
       fi
     fi
-    if [[ -n "$init_id" ]]; then
+    if [[ -z "$init_id" ]]; then
+      # The volume exists but the one-off that filled it is gone, so there is no
+      # exit code to read. `none` used to fall through as if it satisfied the
+      # check (PRO-306 review NB-2): in no-deps mode, where nothing will re-run
+      # that one-off, "we cannot check" has to be a refusal, not a pass.
+      if [[ "$require_ledger" == "1" ]]; then
+        refuse "$vol_name exists but no ac-client-data-init container is present, so nothing can show it completed successfully. BOOT_MODE=no-deps will not re-run it — boot with --with-one-offs to run the one-off again, or remove the volume and let it recreate."
+      fi
+      note "  [dep 3] client data: volume=$vol ac-client-data-init container absent (exit code unverifiable; compose will re-run the one-off)"
+    else
       initrc="$(docker inspect --format '{{.State.ExitCode}}' "$init_id" </dev/null 2>/dev/null || echo unknown)"
-      if [[ "$initrc" != "0" ]]; then
-        refuse "the last ac-client-data-init exited $initrc, so ac-client-data may be incomplete. Fix that one-off, or re-run it deliberately with --with-one-offs."
+      initrunning="$(docker inspect --format '{{.State.Running}}' "$init_id" </dev/null 2>/dev/null || echo unknown)"
+      if [[ "$initrunning" == "true" ]]; then
+        # `.State.ExitCode` reads 0 for a *running* container, so an in-flight
+        # client-data download would otherwise read as a completed one.
+        if [[ "$require_ledger" == "1" ]]; then
+          refuse "ac-client-data-init is still running, so $vol_name is being written right now and its last exit code is not meaningful yet. Wait for it to finish, then re-run."
+        fi
+        note "  [dep 3] client data: volume=$vol ac-client-data-init still running (its exit code means nothing yet; compose will wait for it)"
+      elif [[ "$initrc" != "0" ]]; then
+        refuse "the last ac-client-data-init exited $initrc, so $vol_name may be incomplete. Fix that one-off, or re-run it deliberately with --with-one-offs."
+      else
+        note "  [dep 3] client data: volume=$vol ac-client-data-init last exit=$initrc"
       fi
     fi
-    note "  [dep 3] client data: volume=$vol ac-client-data-init last exit=$initrc"
   fi
 }
 
@@ -658,7 +741,12 @@ fatal_total="not-counted"
 ledger_after=""
 if [[ -z "$ws_id" ]]; then
   note "ac-worldserver has no container id; nothing to report a boot from."
-  [[ "$NO_START" == "1" ]] || rc=$(( rc != 0 ? rc : 4 ))
+  # Not a boot, whatever mode asked for it. The `--no-start` exemption an earlier
+  # revision carried here let `--no-start --require-ready --strict-boot` with no
+  # worldserver container at all exit 0 — a missing container is the strongest
+  # possible "this was not a boot", so no flag may talk the wrapper out of saying
+  # so (PRO-306 review B-1).
+  rc=$(( rc != 0 ? rc : 4 ))
 else
   ws_status="$(docker inspect --format '{{.State.Status}}' "$ws_id" </dev/null 2>/dev/null || echo unknown)"
   ws_started="$(docker inspect --format '{{.State.StartedAt}}' "$ws_id" </dev/null 2>/dev/null || echo 0001-01-01T00:00:00Z)"
@@ -683,8 +771,23 @@ else
     note "BOOT VERDICT: fresh boot — container StartedAt is at or after this wrapper's start."
   fi
 
-  fatal_since="$(docker logs --since "$BOOT_T0" "$ws_id" </dev/null 2>&1 | grep -c 'FATAL' || true)"
-  fatal_total="$(docker logs "$ws_id" </dev/null 2>&1 | grep -c 'FATAL' || true)"
+  # Capture the log stream and its exit status separately (PRO-306 review B-2).
+  # Folding stderr into stdout and appending `|| true` — what this did before —
+  # turns a *failing* `docker logs` into the literal string "0", which then reads
+  # as "zero FATAL lines" to `--strict-boot` and to whoever is reading the run
+  # log. A daemon error, a pruned log file or a non-json-file logging driver all
+  # reach that path; an unreadable log stream is not evidence of a clean boot, so
+  # it stays a word and the STRICT_BOOT guard below fails on any non-number.
+  if fatal_since_logs="$(docker logs --since "$BOOT_T0" "$ws_id" </dev/null 2>/dev/null)"; then
+    fatal_since="$(printf '%s\n' "$fatal_since_logs" | grep -c 'FATAL' || true)"
+  else
+    fatal_since="logs-unreadable"
+  fi
+  if fatal_total_logs="$(docker logs "$ws_id" </dev/null 2>/dev/null)"; then
+    fatal_total="$(printf '%s\n' "$fatal_total_logs" | grep -c 'FATAL' || true)"
+  else
+    fatal_total="logs-unreadable"
+  fi
   note "LOG_FATAL since this boot (since=$BOOT_T0): $fatal_since    lifetime (whole container, not a boot measurement): $fatal_total"
 
   if [[ "$WAIT_READY" == "1" && "$NO_START" != "1" ]]; then
@@ -710,19 +813,42 @@ else
   if [[ -n "$LEDGER_ROWS_BEFORE" && "$ledger_after" =~ ^[0-9]+$ ]]; then
     if [[ "$LEDGER_ROWS_BEFORE" == "$ledger_after" ]]; then
       note "acore_world.updates rows: before=$LEDGER_ROWS_BEFORE after=$ledger_after (unchanged — no update was imported by this boot)"
+    elif [[ "$BOOT_MODE" == "no-deps" ]]; then
+      # The contract of no-deps is literally "this boot ran no updater", so a
+      # ledger that moved underneath it is a violated contract, not a colour line
+      # (PRO-306 review NB-4).
+      echo "worldserver-up: REFUSING TO CALL THIS A CLEAN BOOT — acore_world.updates rows changed during a BOOT_MODE=no-deps boot (before=$LEDGER_ROWS_BEFORE after=$ledger_after). Something imported updates while this wrapper started ac-worldserver without them; find the writer before trusting the run." >&2
+      rc=$(( rc != 0 ? rc : 4 ))
     else
-      note "acore_world.updates rows: before=$LEDGER_ROWS_BEFORE after=$ledger_after — CHANGED. Something imported during this boot; with BOOT_MODE=$BOOT_MODE that is the write path the runbook does not claim."
+      note "acore_world.updates rows: before=$LEDGER_ROWS_BEFORE after=$ledger_after — CHANGED, which is what BOOT_MODE=with-one-offs asked for: ac-db-import ran the updater against the live acore_world during this boot."
     fi
   else
-    note "acore_world.updates rows: before='${LEDGER_ROWS_BEFORE:-unknown}' after='${ledger_after:-unknown}' (could not compare)"
+    # An unreadable ledger on either side is not the same as an unchanged one.
+    # In no-deps mode the whole read-only claim rests on that comparison, so it
+    # fails closed; in with-one-offs mode the updater was *meant* to run and the
+    # count is diagnostic only.
+    echo "worldserver-up: acore_world.updates rows: before='${LEDGER_ROWS_BEFORE:-unknown}' after='${ledger_after:-unknown}' (could not compare)." >&2
+    if [[ "$BOOT_MODE" == "no-deps" ]]; then
+      echo "worldserver-up: REFUSING TO CALL THIS A READ-ONLY BOOT — BOOT_MODE=no-deps claims no update was imported, and it cannot prove that without a ledger count on both sides." >&2
+      rc=$(( rc != 0 ? rc : 4 ))
+    fi
   fi
 fi
 
-if [[ "${STRICT_BOOT}" == "1" && "$fatal_since" =~ ^[0-9]+$ ]] && (( fatal_since > 0 )); then
-  echo "worldserver-up: REFUSING TO CALL THIS A BOOT — $fatal_since FATAL line(s) appeared since $BOOT_T0." >&2
+# `--strict-boot` may only pass on a number it actually counted (PRO-306 review
+# B-2): `not-counted` (no container to report from) and `logs-unreadable` are both
+# "I do not know", and under --strict-boot "I do not know" is a failure.
+if [[ "${STRICT_BOOT}" == "1" ]] && { [[ ! "$fatal_since" =~ ^[0-9]+$ ]] || (( fatal_since > 0 )); }; then
+  if [[ "$fatal_since" =~ ^[0-9]+$ ]]; then
+    echo "worldserver-up: REFUSING TO CALL THIS A BOOT — $fatal_since FATAL line(s) appeared since $BOOT_T0." >&2
+  else
+    echo "worldserver-up: REFUSING TO CALL THIS A BOOT — --strict-boot cannot check anything: the since-boot FATAL count is '$fatal_since', not a number. A log stream this wrapper cannot read is not proof of a clean boot." >&2
+  fi
   rc=$(( rc != 0 ? rc : 4 ))
 fi
-if [[ "${REQUIRE_READY}" == "1" && "$ready" != "seen" && "$NO_START" != "1" ]]; then
+# No `--no-start` exemption here: the contradictory pair is refused at parse time,
+# so reaching this check with --no-start would itself be a bug (PRO-306 review B-1).
+if [[ "${REQUIRE_READY}" == "1" && "$ready" != "seen" ]]; then
   echo "worldserver-up: REFUSING TO CALL THIS A BOOT — ready banner '$ready'." >&2
   rc=$(( rc != 0 ? rc : 4 ))
 fi
