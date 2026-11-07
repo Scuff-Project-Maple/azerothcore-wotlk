@@ -93,7 +93,8 @@ class Args:
 def git_head(root: Path) -> str:
     try:
         proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root),
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "unknown"
     return proc.stdout.decode().strip() or "unknown"
@@ -116,14 +117,16 @@ def git_history(root: Path) -> dict:
     out: dict = {"shallow": None, "commits": None}
     try:
         proc = subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=str(root),
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, timeout=30)
         if proc.returncode == 0:
             out["shallow"] = proc.stdout.decode().strip() == "true"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     try:
         proc = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=str(root),
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, timeout=120)
         if proc.returncode == 0:
             out["commits"] = int(proc.stdout.decode().strip() or 0)
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):

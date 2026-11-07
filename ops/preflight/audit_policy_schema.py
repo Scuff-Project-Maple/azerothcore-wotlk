@@ -66,7 +66,7 @@ def tracked_files(repo, patterns):
     try:
         proc = subprocess.run(["git", "ls-files", "--"] + list(patterns),
                               cwd=str(repo), stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=60)
+                              stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
@@ -78,7 +78,8 @@ def tracked_files(repo, patterns):
         # module SQL exists".
         inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
                                 cwd=str(repo), stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=60)
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                timeout=60)
         if inside.returncode != 0 or inside.stdout.strip() not in (b"true", b"1"):
             return None
     return [repo / n for n in names]
@@ -201,14 +202,22 @@ def resolve_provenance_problems(policy, repo):
                 f"record names it, upstream-ref-attested-missing) while a shape-only read "
                 f"of the same file would pass it; run `{refresh}` or point verifiedRef at "
                 f"a ref this clone holds"]
-    rc3, otype, _err3 = _git(repo, ["cat-file", "-t", oid])
+    rc3, otype, err3 = _git(repo, ["cat-file", "-t", oid])
+    if rc3 is None:
+        # git could not answer the type question. "non-commit object" is a claim about
+        # the object, and this run is not in a position to make it — the same reason the
+        # two probes above refuse instead of passing (review N1).
+        return [f"upstreamProvenance.verifiedRef: {ref!r} resolves to {oid[:12]} in {repo}, "
+                f"but its object type cannot be determined: {err3}; the gate fails closed "
+                f"on the same question, so an audit that cannot ask it must not report a "
+                f"pass either"]
     kind = otype if rc3 == 0 and otype else "non-commit object"
     return [f"upstreamProvenance.verifiedRef: {ref!r} resolves to {oid[:12]} in {repo}, "
             f"which is a {kind}, not a commit; the gate cannot list a tree of it and "
             f"refuses the boot as not-a-commit, so this policy must not audit clean"]
 
 
-def provenance_problems(policy, repo=None):
+def provenance_problems(policy, repo=None, resolved=None):
     """Check the upstreamProvenance invariants the write-policy exemption rests on.
 
     PRO-248 review N3. `classify_origin()` decides the exemption for an
@@ -220,6 +229,10 @@ def provenance_problems(policy, repo=None):
 
     This is a column audit's equal: the claim is `verifiedRef` names a remote-tracking
     ref that only a fetch can move, and an unverifiable claim here is a hole, not a bug.
+
+    `resolved` is the caller's single answer to "is there a git tree here to ask"; it
+    is passed in rather than re-probed so that the depth this function ran and the depth
+    `provenance_mode` reports cannot drift apart (review N2). Left None it is derived.
 
     Two depths, and the caller reports which one ran (`provenance_mode`). Without a
     repo this is text only: block present, name non-empty, not an object name, under
@@ -267,12 +280,14 @@ def provenance_problems(policy, repo=None):
     # Shape is necessary and not sufficient, and it is all that is available with no
     # repo to ask. Where a repo is present, resolve the name: that is the check which
     # makes the audit's answer the gate's answer (PRO-307 A2).
-    if repo is not None and repo_is_git(repo):
+    if resolved is None:
+        resolved = repo is not None and repo_is_git(repo)
+    if resolved:
         problems += resolve_provenance_problems(policy, repo)
     return problems
 
 
-def provenance_mode(policy, repo) -> tuple[str, str]:
+def provenance_mode(policy, repo, resolved=None) -> tuple[str, str]:
     """What the provenance half of this run actually checked: (mode, why).
 
     "0 problem(s)" has to be readable as what it means. A shape-only pass says the
@@ -286,7 +301,9 @@ def provenance_mode(policy, repo) -> tuple[str, str]:
                               "which is itself reported above; nothing was resolved")
     if repo is None:
         return "shape-only", "no repo was named, so verifiedRef was never resolved"
-    if not repo_is_git(repo):
+    if resolved is None:
+        resolved = repo_is_git(repo)
+    if not resolved:
         return "shape-only", f"{repo} is not a git tree, so verifiedRef was never resolved"
     return "resolved", f"verifiedRef was peeled in the git repo at {repo}"
 
@@ -363,8 +380,14 @@ def main(argv=None) -> int:
     # The upstream exemption is a policy claim like any other column name: if it does
     # not hold the failure is silent, so it is audited here rather than in a review
     # comment nobody re-reads (PRO-248 review N3).
-    mode, mode_why = provenance_mode(policy, repo)
-    problems += provenance_problems(policy, repo)
+    # One probe of "is there a git tree here", shared by both halves of the provenance
+    # check. Each half used to ask for itself, so the two could disagree: the run printed
+    # RESOLVED while the half that actually peels the ref had decided there was no repo
+    # and returned nothing (review N2). It also stops the audit spawning git twice for
+    # the same question.
+    resolved = repo is not None and repo_is_git(repo)
+    mode, mode_why = provenance_mode(policy, repo, resolved=resolved)
+    problems += provenance_problems(policy, repo, resolved=resolved)
     print(f"provenance check: {mode.upper()} — {mode_why}")
     if mode != "resolved":
         print("provenance check: a shape-only pass does not mean verifiedRef resolves, "

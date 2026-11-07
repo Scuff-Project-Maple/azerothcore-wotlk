@@ -217,8 +217,8 @@ class MySQL:
         ) + " | " + " ".join(shlex.quote(a) for a in restore)
         try:
             proc = subprocess.run(["bash", "-lc", shell], stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, timeout=self.timeout * 4,
-                                  cwd=str(self.compose_root))
+                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                  timeout=self.timeout * 4, cwd=str(self.compose_root))
         except subprocess.TimeoutExpired as exc:
             raise OperationalError(f"clone timed out after {self.timeout * 4}s") from exc
         err = proc.stderr.decode("utf-8", "replace")
@@ -1265,9 +1265,13 @@ class Preflight:
         genuine upstream file into an unverified one (PRO-248 review B2).
         """
         try:
+            # PRO-307 A4, same rule as `MySQL._run()`: with no `stdin` the child keeps
+            # the gate's fd 0, and `git` is perfectly willing to read from it (askpass,
+            # credentials, `git credential fill`) while the operator's piped script is
+            # silently half-eaten.
             proc = subprocess.run(["git", *argv], cwd=str(self.git_root),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  timeout=timeout)
+                                  stdin=subprocess.DEVNULL, timeout=timeout)
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
             return None, "", str(exc)
         return (proc.returncode,
@@ -1468,10 +1472,14 @@ class Preflight:
                 # of a deletion, which is the failure mode this function exists to avoid.
                 return False, "", False
             if not stat.S_ISREG(st.st_mode):
-                # NB-4: a directory has a size, and quoting it would tell the operator
-                # FETCH_HEAD "holds 2 byte(s)" when the truth is that it is not a file.
-                return True, (f"{declared} {why_not}, which is more than a failed fetch "
-                              f"leaves but is not a fetch this gate can read"), False
+                # NB-4: a directory has a size too, and quoting it would tell the
+                # operator that FETCH_HEAD "holds 2 byte(s)" when the truth is that it
+                # is not a file at all. Say what it is and say the gate cannot read it —
+                # both halves of review N7's rule, without inventing a byte count for a
+                # thing that never had any bytes.
+                return True, (f"{declared} {why_not}; the gate cannot read a fetch record "
+                              f"out of it, which is more than a failed fetch leaves but is "
+                              f"not a fetch this gate can read"), False
             if st.st_size == 0:
                 return False, "", False
             return True, (f"{declared} holds {st.st_size} byte(s) this process cannot read "
@@ -3101,7 +3109,8 @@ class Preflight:
         argv += ["config", "--format", "json"]
         try:
             proc = subprocess.run(argv, cwd=str(Path(self.a.compose_root)),
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  stdin=subprocess.DEVNULL, timeout=90)
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             self.r.fail("0b", f"cannot run `docker compose config`: {exc}. Without the resolved "
                               f"compose model the gate cannot prove that the SQL it scanned is the "
@@ -3279,7 +3288,8 @@ class Preflight:
             # gate asserted against the compose config alone.
             ids = subprocess.run(base + ["ps", "-a", "-q", svc_name],
                                  cwd=str(Path(self.a.compose_root)),
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, timeout=60)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return
         cid = ids.stdout.decode("utf-8", "replace").strip().splitlines()
@@ -3289,7 +3299,8 @@ class Preflight:
             return
         try:
             insp = subprocess.run(["docker", "inspect", cid[0].strip()],
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  stdin=subprocess.DEVNULL, timeout=60)
             data = json.loads(insp.stdout.decode("utf-8", "replace"))
         except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
             self.r.warn("0b", f"could not inspect the existing {svc_name} container; compose "
