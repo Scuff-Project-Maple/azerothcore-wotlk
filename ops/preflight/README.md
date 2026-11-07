@@ -86,6 +86,25 @@ its original path as the *following* field, not as `"old -> new"`, and both side
 The output is decoded with `surrogateescape` so a path that is not valid UTF-8 at all comes back
 byte-for-byte. Do not tidy any of those away.
 
+That last choice is what makes such a name *count* as dirty, and it also puts a lone surrogate into
+the report — so the reporting layer has to be able to carry it (PRO-308 QA finding B). Whether
+`print()` survives one is the operator's locale, not the gate's: on the deploy host a
+`UnicodeEncodeError` landed between `render()` and the `--json` write, and the boot was refused with
+a traceback, no stated reason and no payload. `_emit()` therefore escapes what the stream's codec
+refuses (`backslashreplace`, so the name is still identifiable) and `_write_json_payload()` pins
+`ensure_ascii=True`, which is the load-bearing half. The explicit `encoding="utf-8"` is the weaker
+half and is best read that way: with `ensure_ascii` on it changes nothing today, it only stops the
+payload's byte form from following whoever eventually relaxes that flag.
+
+Escaping the codec is not the whole of it, though. **Evidence before presentation** (PRO-313 review
+B1): `main()` writes the `--json` payload *first* and prints afterwards, and each half is held apart
+from the other. `_emit()` guards the whole body including `flush()`, naming a refused write on the
+fallback stream instead of raising — a pipe closed early is not a verdict; `_render_or_say_why()`
+degrades to listing the findings if `render()` itself blows up; and a payload we cannot write refuses
+the boot with `EXIT_ERROR` rather than letting it through on the checks' own rc. The rule behind all
+three: the payload is the half nobody can regenerate once the scratch schema is dropped, and the
+terminal echo is the half you can re-derive by re-running. `main()` still carries no bare `print()`.
+
 ### The third tag: the tracked upstream ref (PRO-248)
 
 Directory tag plus author tag is a claim about **history**, and history metadata is cheap to
