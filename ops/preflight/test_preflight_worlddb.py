@@ -2695,7 +2695,9 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         state, detail, cause = pf.upstream_ref_state(p)
         self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"), (state, cause),
                          detail)
-        self.assertIn("repo", detail)
+        # Not merely "something about the repo": an empty binding must be reported as a
+        # missing line, not as a record written for a repo named "".
+        self.assertIn("names no `repo`", detail)
 
     def test_the_gate_writes_no_record_it_cannot_bind(self):
         # The write side of the same rule, and the `repo unknown` nit: an unbound record

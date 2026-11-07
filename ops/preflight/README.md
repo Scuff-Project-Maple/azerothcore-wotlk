@@ -121,8 +121,12 @@ tree object booted a forged-author file on a `WARN` — the reason `git rev-pars
 is no longer the existence test. It is now a two-step question: peel to a commit, and if that fails
 ask separately whether the name resolved to *anything* (`rev-parse --verify --quiet <ref>`, with
 `cat-file -t` naming what came back). Only a name that resolves to nothing at all may be `missing`.
-`git ls-tree` is never asked of a ref the gate does not trust — including one whose recorded commit
-git cannot place (PRO-300) — and none of these probes fetch.
+`git ls-tree` is never asked of a ref the gate does not trust (PRO-300): not of a ref whose recorded
+commit git cannot place and whose move no reflog explains, and not of a ref sitting behind a record
+this gate could not have written. A recorded move that a surviving reflog *does* explain stays
+trustworthy enough to read — that is how an honest force-push still boots — so "never asked" is a
+claim about the unexplained shapes, not about every ref with an attestation. None of these probes
+fetch.
 Every git call the gate makes — the ref probes, the author lookup, the work-tree `git status`, and
 the attestation's `rev-parse --git-common-dir`, `config --get remote.<r>.url` and
 `merge-base --is-ancestor` (PRO-300) — goes through the one `_git()` helper, so "nothing in here
@@ -179,8 +183,9 @@ and the gate can list that commit's tree — the run writes down that it did:
 Three properties are what make it the missing witness. It lives in the **common dir**, which
 `update-ref -d`, `rm FETCH_HEAD` and `rm -rf .git/logs/refs/remotes` all leave alone, and which a
 linked worktree shares with its siblings. It is written **only by the path that earned it** —
-`missing`, `not-a-commit`, `not-remote` and an untrusted record all refuse before the write, so a
-ref that is not there can never fabricate a record of having been verified. And a fresh `git clone`
+`missing`, `not-a-commit`, `not-remote`, an untrusted record and a tree whose common dir git will not
+name all refuse before the write, so a ref that is not there can never fabricate a record of having
+been verified, and no record exists that does not say which tree earned it. And a fresh `git clone`
 gets a common dir with **no record in it**, which is the part AC 6 rests on: an untouched clone of a
 remote that never carried the ref has nothing to find, so its answer is still `absent` and it still
 boots offline on the `WARN`. The location is asked from git (`rev-parse --git-common-dir`) rather
@@ -188,10 +193,12 @@ than hardcoded as `.git` for the same reason `_reflog_path()` asks `--git-path` 
 admin dir is not `.git` — and when git will not answer there is no state directory at all, never a
 guessed one: a probe nobody answers must not become a finding, and an attestation written somewhere
 untrustworthy is worse than none. `--preflight-state-dir` relocates it for a test or for someone
-running the gate over a tree they do not want written inside. The write is a temp file plus
-`os.replace`, because a record truncated by a crash mid-write would then fail closed every later
-boot, and a failure to write is an informational note rather than a finding: the record is evidence
-*for* a later deletion check and must never become a precondition for booting.
+running the gate over a tree they do not want written inside; it names a **directory** and the record
+is the `last-verified` file inside it, so pointing two trees at one state dir gets the second one
+refused rather than trusted — the `repo` line in the record names the other tree. The write is a temp
+file plus `os.replace`, because a record truncated by a crash mid-write would then fail closed every
+later boot, and a failure to write is an informational note rather than a finding: the record is
+evidence *for* a later deletion check and must never become a precondition for booting.
 
 From then on `missing` is not one answer. A ref with a record that has gone is
 `indeterminate`/`attested-missing`, not `unchecked`. An ordinary `git pull` between boots is not
@@ -199,15 +206,33 @@ suspected: the recorded commit is an ancestor of the one the ref names now, `git
 --is-ancestor` says so, and the record moves forward with the run. A ref whose recorded commit git
 cannot place, with no reflog to explain the move, is not the history this gate verified, so
 `ls-tree` is never asked of it and the boot is refused (`oid-mismatch`); a genuine force-push is
-cleared by the reflog it leaves behind. And an attestation the gate cannot trust is never a pass —
-an unparsable line, a missing or unknown `version`, a `repo` line naming some other common dir, or a
-`remote url` that is not this tree's each refuse the boot with the reason named, because copying a
-record in from a clone that really did fetch is the obvious way to fake a satisfied past and those
-two lines exist to catch it. A record that simply holds no `last-verified` line for *this* ref is
-`absent`, not untrusted: pointing `verifiedRef` at a new name starts a fresh history instead of
-failing on a record earned for the old one. Section 4 says which of these it used — the summary line
-carries `last-verified <oid>@<when>` for the record a satisfied boot relied on, and a separate
-`upstream-ref-attestation` INFO line names the record file.
+cleared by the reflog it leaves behind.
+
+A record this gate could not have written is refused too, and refused on **both** paths — that is the
+PRO-300 review's finding, because a record read as merely *absent* on the path that ends in a write
+lets one appended junk line buy back the exemption and then stamps the forged oid as verified. On the
+satisfied path, where the ref is present and peels to a commit, an unparsable line, a missing or
+unknown `version`, no `repo` line at all, a `repo` naming some other common dir, or a `remote url`
+that is not this tree's each stop the boot `indeterminate`/`attestation-untrusted`, name which of
+those they are, do not read that ref's tree at all, and write nothing — so a record cannot be
+laundered by the very boot it just blocked. `repo` is *required* rather than compared-when-present
+because the gate always knows its own common dir, and `write_attestation()` refuses to emit a record
+it cannot bind for exactly that reason; `remote url` is compared only when both sides can name one,
+since a tree may legitimately have no remote and a record written before `git remote add` is not a
+forgery. The one shape that stays inert on the satisfied path is a record the OS will not hand over
+(unreadable, or not a regular file): that is an environment accident rather than a claim about the
+ref, what the exemption rests on there is the tree comparison, and making it fatal would turn the
+record into a precondition for booting, which AC 6 forbids. It is still reported, and it still cannot
+attest.
+
+A record that simply holds no `last-verified` line for *this* ref is `absent`, not untrusted, and the
+binding lines are settled only after that — a record that says nothing about `ref` says nothing about
+`ref` no matter whose common dir it names. Pointing `verifiedRef` at a new name therefore starts a
+fresh history instead of failing on a record earned for the old one, and a file copied in from another
+clone cannot accuse a clone that never carried the ref (PRO-300 review B1: `rm` must not be the only
+way out). Section 4 says which of these it used — the summary line carries `last-verified <oid>@<when>`
+for the record a satisfied boot relied on, `last-verified refused (record untrusted: <cause>)` for one
+that was refused, and a separate `upstream-ref-attestation` INFO line names the record file.
 
 What the attestation does **not** guarantee, since a half-told guarantee is worse than none:
 
@@ -218,13 +243,19 @@ What the attestation does **not** guarantee, since a half-told guarantee is wors
   `preflight-policy.json` outright. Against someone who owns the working tree this is friction, not
   a defense, and it is no wider a privilege than the `update-ref` described under "Honest limit"
   below.
+- It does not repair itself. A boot that cannot parse the record keeps the lines it was given rather
+  than rewriting them, because unparsable lines are the evidence of the tampering it just refused; so
+  the FAIL's remedy is the literal one it prints — `rm <state dir>/last-verified` — and the next
+  satisfied boot writes a fresh record naming this tree. Anyone offering "just re-run it" for a
+  corrupt record is describing a different design.
 - It refuses a **silent** move, not a move. `git update-ref` writes a reflog entry by default, and a
   reflog is exactly what the `oid-mismatch` branch treats as an innocent explanation — it is what a
   real force-push leaves behind too. So the attestation catches the `update-ref` whose reflog was
   then removed; the one that leaves its reflog in place stays the deliberate, loud act described
   under "Honest limit" below, where a reviewer running `git reflog refs/remotes/origin/Playerbot`
-  sees it and the next real fetch undoes it. Anything stronger would refuse an ordinary
-  force-push-based upstream workflow, which is not this gate's job.
+  sees it. On a tree that really does fetch from the remote the next fetch undoes the move; a tree
+  nobody fetches into keeps the moved ref, reflog and all, for as long as it is not fetched. Anything
+  stronger would refuse an ordinary force-push-based upstream workflow, which is not this gate's job.
 - It signs nothing and authenticates no clock. `attestedWhen` is this host's UTC time at the moment
   a satisfied run wrote the line; the claim it supports is "this gate read this commit through this
   ref here", not "upstream published this then".
