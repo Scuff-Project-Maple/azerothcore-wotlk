@@ -2482,6 +2482,79 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertTrue(pf.r.failed,
                         "--allow-missing-upstream-ref widened past the missing case")
 
+    # -- PRO-315: what the flag is allowed to rescue ------------------------------- #
+
+    def _empty_own_reflog_under_the_flag(self, d, allow):
+        """The PRO-308 finding A shape, once with the flag and once without.
+
+        `refs/remotes/origin/Absent` is not in git at all, and the only thing this clone
+        holds for it is a 0-byte `logs/refs/remotes/origin/Absent`. That is the weakest
+        evidence the 'ref-deleted' tier accepts — a file, not a record — so it is the
+        shape that decides whether the flag covers the tier or only its strong end.
+        """
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_00.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        pf.a.allow_missing_upstream_ref = allow
+        calls = self._stub_git_shapes(
+            pf, commit_peel=(1, "", ""), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/refs/remotes/origin/Absent", ""),
+            fetch_head_path=(0, ".git/FETCH_HEAD_ABSENT", ""), namespace=(0, "", ""))
+        self._empty_own_reflog(d, "refs/remotes/origin/Absent")
+        return pf, p, calls
+
+    def test_the_flag_rescues_a_present_but_empty_own_reflog_and_says_so(self):
+        # The decision PRO-315 makes explicit: the flag opts out of the 'ref-deleted'
+        # tier, not out of the strongest evidence inside it, so a reflog with entries in
+        # it and a reflog that is an empty file are rescued identically. Pinned on both
+        # halves of that — the answer, and the audit trail that has to name the flag.
+        d = self._repo()
+        pf, p, calls = self._empty_own_reflog_under_the_flag(d, allow=True)
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertEqual("unobserved", up["wasTrackedCertainty"],
+                         "the evidence this test is about is the empty file")
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_UNCHECKED, "missing-allowed"), (state, cause),
+                         "the flag stopped covering the weak end of the tier it covers")
+        self.assertIn("--allow-missing-upstream-ref", detail)
+        origin, _prov = self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertEqual("upstream", origin)
+        self.assertEqual([], fails,
+                         "an opted-in run was still refused over a file that proves "
+                         "nothing either way")
+        self.assertIn("upstream-ref-unverified", warns)
+        self.assertIn("--allow-missing-upstream-ref",
+                      " ".join(x.message for x in pf.r.findings
+                               if x.severity == "WARN"),
+                         "the exemption was granted on the empty file without the flag "
+                         "being named in the record")
+        self.assertFalse(pf.r.failed)
+        self.assertEqual([], [c for c in calls if c[:1] == ["ls-tree"]],
+                         "a ref this clone cannot resolve was handed to ls-tree on the "
+                         "way to the exemption")
+
+    def test_an_empty_own_reflog_without_the_flag_still_refuses_the_boot(self):
+        # The twin that makes the test above a discriminator rather than a description:
+        # byte-identical clone, same 0-byte reflog, the flag absent from the command
+        # line. The two must never land on the same answer, or "a decision someone has to
+        # type" has quietly become a default. The fail-closed half of this shape is
+        # already pinned by `test_a_zero_byte_reflog_still_fails_closed`; what this pair
+        # adds is the contrast, which is the thing under decision.
+        d = self._repo()
+        pf, p, _calls = self._empty_own_reflog_under_the_flag(d, allow=False)
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "ref-deleted"), (state, cause))
+        self.assertNotIn("--allow-missing-upstream-ref", detail,
+                         "a run where nobody typed anything was told about an opt-in "
+                         "that was never made")
+        self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
+        self.assertNotIn("upstream-ref-unverified", warns)
+        self.assertTrue(pf.r.failed,
+                        "the boot went through on an empty file and no opt-in")
+
 
 class TestPolicyAuditPinsProvenance(unittest.TestCase):
     """PRO-248 review N3: the ref the exemption rests on is a policy invariant too.

@@ -1364,6 +1364,12 @@ class Preflight:
         upstream ref is not here" used to be inherited by simply saying nothing;
         `--allow-missing-upstream-ref` makes it a decision that has to be typed
         (PRO-248 review N1, opening 2).
+
+        Its scope is the whole 'ref-deleted' tier, the shapes whose only evidence is
+        an empty file included, and nothing else — not 'not-a-commit', not an
+        unreadable or non-remote ref, and not 'missing', which never needed it
+        (PRO-315; see the 'ref-deleted' bullet of `upstream_ref_state()` for why the
+        empty file is inside the tier rather than outside it).
         """
         return bool(getattr(self.a, "allow_missing_upstream_ref", False))
 
@@ -1612,6 +1618,21 @@ class Preflight:
           is the only way back to the WARN, and it is a decision someone has to type. A
           plain `git clone` leaves none of the three, so a clone that has never fetched
           still lands on 'missing' (review B1, PRO-301 review N1).
+          The flag opts out of this tier, not out of its strongest evidence only, so it
+          rescues the empty-reflog shape exactly as it rescues a reflog full of entries.
+          That is a decision, not an oversight of the empty file (PRO-315): the verdict
+          on that shape says the gate "will neither assert a deletion it did not observe
+          nor grant the upstream exemption on the question", which is what a run where
+          nobody typed anything answers, and the clause appended after it is what an
+          opted-in run adds. The empty file stays inside the tier because the exemption
+          is already one `rm` away — delete that 0-byte `logs/<ref>`, leave no FETCH_HEAD
+          and no sibling reflog, and the same clone answers 'missing' and boots on the
+          WARN with no flag typed at all. A flag that refused what `rm` hands out would
+          keep only the honest operator's copy, since this WARN quotes the flag by name
+          and the `rm` route quotes nobody. Making the tier actually unforgiving means
+          requiring an upstream-tagged new file with no verifiable ref to show a recorded
+          fetch instead of deletable evidence — the last-verified attestation, not this
+          flag.
         - 'not-a-commit' / REF_INDETERMINATE: the name resolves to a tree, blob or other
           non-commit object. Fail closed. It is not missing, and calling it missing was
           the false statement that kept the exemption.
@@ -1654,6 +1675,13 @@ class Preflight:
                                f"its own, while this clone does have fetch history "
                                f"({why}), so the ref was either deleted after it arrived "
                                f"or never existed in this clone")
+                # PRO-315: the opt-in is scoped to this tier, not to the strongest
+                # evidence inside it. `verdict` is whichever of the three answers above
+                # the evidence supported, the empty-file one included, so the flag that
+                # returns REF_UNCHECKED here covers a reflog with entries in it and a
+                # 0-byte reflog identically. See the 'ref-deleted' bullet of this
+                # method's docstring for why the weak shape is not held to a stricter
+                # standard than the strong one.
                 if self.allow_missing_upstream_ref():
                     return (self.REF_UNCHECKED,
                             f"{verdict}; --allow-missing-upstream-ref was passed, which "

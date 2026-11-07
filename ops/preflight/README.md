@@ -124,7 +124,7 @@ directory+author rule.
 | state | what git actually said | what the gate does |
 | --- | --- | --- |
 | `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
-| `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
+| `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own — even when those files exist and hold nothing | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN`, and it walks back every answer in this row |
 | `indeterminate` / `not-a-commit` | the name resolves to an object that is not a commit — `HEAD^{tree}`, a blob, a mistyped object name, the null sha | `FAIL`, failing closed, naming `refreshCommand`. It is not missing, and calling it `missing` was the false statement that kept the exemption |
 | `indeterminate` / other | git errored, or the ref is not under `refs/remotes/` | `FAIL`, failing closed |
 
@@ -203,6 +203,20 @@ forever with the single-writer lease held and the worldserver never starting.
 case only. It does not rescue `not-a-commit`, any other `indeterminate` cause, or a ref that was
 genuinely never fetched — the `WARN` for that one is already granted without it, and the flag is not
 a general mute switch.
+
+What "the `ref-deleted` case" covers is that tier, not the strong end of it, and that is a decision
+rather than an oversight of the empty file (PRO-315). The flag walks every `ref-deleted` answer back
+to the `WARN`, including the answer whose only local trace is a 0-byte `logs/<ref>`, which is a file
+that records nothing either way. The reason the weak shape is not held to a stricter standard than
+the strong one is that the exemption is already one `rm` away: delete that file in a clone with no
+`FETCH_HEAD` and no sibling reflog and the gate reads the same clone as `missing`, which boots on the
+`WARN` with nothing typed at all. A flag that refused what `rm` grants would keep only the copy of
+the choice that names itself — the `WARN` quotes `--allow-missing-upstream-ref` by name — and leave
+the unquoted route as the only one still standing. Both ends are pinned:
+`test_the_flag_rescues_a_present_but_empty_own_reflog_and_says_so` and its twin without the flag.
+Making the tier actually unforgiving is not this flag's job; it is the durable last-verified
+attestation above, which would require an upstream-tagged new file with no verifiable ref to show a
+recorded fetch instead of evidence an `rm` can remove.
 
 `verifiedRef` is stored fully qualified, as `refs/remotes/origin/Playerbot`. A short
 `origin/Playerbot` is ambiguous: git expands `refs/heads/` before `refs/remotes/`, so a single
