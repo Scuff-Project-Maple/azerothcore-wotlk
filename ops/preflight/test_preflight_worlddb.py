@@ -3444,6 +3444,26 @@ import os, re, sys
 def env(k, d=""):
     return os.environ.get(k, d)
 
+def fp_shape_ok(sql):
+    # The real server parses the fingerprint read before it answers it, so a fake
+    # that replies to any string containing "CRC32" cannot tell a working read from
+    # one that dies with ERROR 1064 on every boot — which is how PRO-327 happened:
+    # a missing `)` in LEDGER_FP_SQL printed fingerprint=not-computed on the live
+    # stack while all 36 fake-docker tests stayed green. Quoted text is stripped
+    # first (a literal may hold a paren or a keyword and MySQL does not parse it),
+    # then the read has to be paren-balanced and still ask for the two aggregates
+    # the [dep 2] line and the before/after comparison are built from.
+    stripped = re.sub(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"", "", sql)
+    if stripped.count("(") != stripped.count(")"):
+        return False
+    flat = re.sub(r"\s+", " ", stripped)
+    for shape in (r"CONCAT\s*\(\s*COUNT\s*\(\s*\*\s*\)",
+                  r"IFNULL\s*\(\s*SUM\s*\(\s*CRC32\s*\(\s*CONCAT_WS\s*\(",
+                  r"\bFROM\s+updates\b"):
+        if not re.search(shape, flat):
+            return False
+    return True
+
 def main():
     argv = sys.argv[1:]
     if env("FAKE_TRACE"):
@@ -3495,6 +3515,16 @@ def compose(argv):
             # own counter so FAKE_LEDGER_MOVED keeps meaning "a row appeared" and
             # FAKE_LEDGER_FP_MOVED means "a row was rewritten in place" — the
             # PENDING -> RELEASED apply a row count cannot see (PRO-306 B1).
+            #
+            # Parse before answer: MySQL checks syntax before it resolves columns,
+            # so a read with unbalanced parens must die here as ERROR 1064 rather
+            # than be rewarded with a canned ROWS:FP (PRO-327). FAKE_FP_FAIL stays
+            # the ERROR 1054 / unknown-column simulation.
+            if not fp_shape_ok(sql):
+                sys.stderr.write("ERROR 1064 (42000) at line 1: You have an error in "
+                                 "your SQL syntax; the fingerprint read is not a shape "
+                                 "MySQL would accept\n")
+                return 1
             if env("FAKE_FP_FAIL") == "1":
                 sys.stderr.write("ERROR 1054 (42S22): Unknown column 'hash' in 'field list'\n")
                 return 1
@@ -3791,6 +3821,109 @@ if __name__ == "__main__":
         self.assertIn("fingerprint was not readable on both sides", proc.stdout)
         self.assertIn("[dep 2]", proc.stdout)
         self.assertIn("fingerprint=not-computed", proc.stdout)
+
+    # --- PRO-327: a green suite has to imply a green fingerprint read --------- #
+    #
+    # The live symptom was `[dep 2] ... fingerprint=not-computed` on every boot of
+    # the real stack while all 36 tests here stayed green, because the fake answered
+    # any string containing "CRC32" with a canned ROWS:FP and never looked at the
+    # SQL. So the contract below is put on the fake: it parses the read the way
+    # MySQL would, and the SQL it is given for that check is the one lifted out of
+    # the wrapper itself.
+
+    def _fake_docker(self, argv, fake=None):
+        # Run the fake `docker` on its own, with the argv `db_scalar` builds, so a
+        # scenario can talk about one read instead of a whole boot.
+        import os
+        import stat
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "docker"
+            script.write_text(self.FAKE_DOCKER, encoding="utf-8")
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("FAKE_")}
+            env.update(fake or {})
+            return subprocess.run([str(script), *argv], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, timeout=60, env=env)
+
+    @staticmethod
+    def _fp_argv(sql):
+        return ["compose", "exec", "-T", "-e", "MYSQL_PWD=password", "ac-database",
+                "mysql", "--no-defaults", "-u", "root", "-N", "-B", "acore_world",
+                "-e", sql]
+
+    def _wrapper_fp_sql(self):
+        src = self.WRAPPER.read_text(encoding="utf-8")
+        m = re.search(r'^LEDGER_FP_SQL="(.*)"$', src, re.M)
+        self.assertIsNotNone(m, "the wrapper must keep the fingerprint read as one "
+                                "double-quoted LEDGER_FP_SQL line, or the fake has "
+                                "nothing to check")
+        return m.group(1)
+
+    def _dep2(self, proc):
+        lines = [l for l in proc.stdout.splitlines() if "[dep 2]" in l]
+        self.assertEqual(len(lines), 1, proc.stdout)
+        return lines[0]
+
+    def test_the_wrapper_fingerprint_read_is_one_mysql_would_accept(self):
+        proc = self._fake_docker(self._fp_argv(self._wrapper_fp_sql()))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "3078:111111")
+        self.assertNotIn("ERROR", proc.stderr)
+
+    def test_the_fake_rejects_a_fingerprint_read_mysql_would_reject(self):
+        # The PRO-327 shape: the `CONCAT(` closed one paren too few before `FROM`.
+        good = self._wrapper_fp_sql()
+        broken = good.replace("0)) FROM updates", "0) FROM updates")
+        self.assertNotEqual(broken, good, "the broken shape must really differ from the shipped one")
+        proc = self._fake_docker(self._fp_argv(broken))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("ERROR 1064", proc.stderr)
+        self.assertEqual(proc.stdout, "", "a rejected read must not also hand back a fingerprint")
+
+    def test_the_fake_still_answers_error_1054_for_the_simulated_unknown_column(self):
+        # FAKE_FP_FAIL is the "fork shapes the table differently" case and has to
+        # stay distinguishable from a syntax error: parse first, then resolve.
+        proc = self._fake_docker(self._fp_argv(self._wrapper_fp_sql()),
+                                 fake={"FAKE_FP_FAIL": "1"})
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ERROR 1054", proc.stderr)
+        self.assertNotIn("1064", proc.stderr)
+
+    def test_a_paren_in_a_literal_does_not_break_the_shape_check(self):
+        # Quoted text is not syntax: without the strip, a legitimate read that
+        # filters on a value containing "(" would be refused and the fingerprint
+        # would go missing for a reason no stack has.
+        with_literal = self._wrapper_fp_sql().replace(
+            "FROM updates", "FROM updates WHERE name <> 'left(' ")
+        proc = self._fake_docker(self._fp_argv(with_literal))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "3078:111111")
+
+    def test_the_dependency_gate_fingerprint_is_never_not_computed(self):
+        proc = self._run([], env_extra={"DEPENDENCY_CHECK_ONLY": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        dep2 = self._dep2(proc)
+        self.assertIn("updates rows=3078 updates_include rows=4", dep2)
+        self.assertRegex(dep2, r"fingerprint=\d+:\d+", dep2)
+        self.assertNotIn("not-computed", dep2)
+
+    def test_only_a_simulated_read_failure_may_lose_the_fingerprint(self):
+        for argv, fake in ((["--force-recreate"], {}),
+                           (["--force-recreate", "--require-ready", "--strict-boot"],
+                            {"FAKE_LOG_READY": "1"}),
+                           (["--with-one-offs", "--force-recreate"], {}),
+                           (["--force-recreate"], {"FAKE_LEDGER_MOVED": "1"}),
+                           (["--force-recreate"], {"FAKE_LEDGER_FP_MOVED": "1"})):
+            proc = self._run(argv, fake=fake)
+            dep2 = self._dep2(proc)
+            self.assertNotIn("not-computed", dep2, f"{argv} {fake}: {proc.stdout}")
+            self.assertRegex(dep2, r"fingerprint=\d+:\d+", f"{argv} {fake}: {proc.stdout}")
+        # The one allowed exception, stated as the positive case so the rule above
+        # cannot be satisfied by a fake that simply never prints the word.
+        lost = self._run(["--force-recreate"], fake={"FAKE_FP_FAIL": "1"})
+        self.assertIn("fingerprint=not-computed", self._dep2(lost))
 
     # --- the dependency gate refuses what depends_on used to swallow --------- #
     def test_dependency_gate_refuses_a_cold_or_broken_stack(self):
