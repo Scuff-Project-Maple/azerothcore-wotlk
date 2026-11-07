@@ -235,23 +235,34 @@ unknown `version`, no `repo` line at all, a `repo` naming some other common dir,
 that is not this tree's each stop the boot `indeterminate`/`attestation-untrusted`, name which of
 those they are, do not read that ref's tree at all, and write nothing — so a record cannot be
 laundered by the very boot it just blocked. `repo` is *required* rather than compared-when-present
-because the gate always knows its own common dir, and `write_attestation()` refuses to emit a record
-it cannot bind for exactly that reason; `remote url` is compared only when both sides can name one,
-since a tree may legitimately have no remote and a record written before `git remote add` is not a
-forgery. The one shape that stays inert on the satisfied path is a record the OS will not hand over
+and required outright, not merely when git will name this tree's common dir — a record of ours always
+carries it, because `write_attestation()` refuses to emit one it cannot bind, and requiring it only
+when the probe answers is the gap `--preflight-state-dir` could walk through (PRO-300 review finding 5);
+`remote url` is compared only when both sides can name one, since a tree may legitimately have no
+remote and a record written before `git remote add` is not a forgery. Both bindings are written only
+when they fit on one line: a `remote.<name>.url`, or a common-dir path, containing a CR or LF would
+otherwise spill a second line into the record that the strict read would then read as a binding this
+run never made, so such a binding is treated as unavailable and the `remote url` line is omitted
+(PRO-300 review finding 2). The one shape that stays inert on the satisfied path is a record the OS
+will not hand over
 (unreadable, or not a regular file): that is an environment accident rather than a claim about the
 ref, what the exemption rests on there is the tree comparison, and making it fatal would turn the
 record into a precondition for booting, which AC 6 forbids. It is still reported, and it still cannot
-attest.
+attest — including on the path where the run goes on to write a record over it, which is the one place
+AC 6 was previously being read as a licence for silence (PRO-300 review).
 
 A record that simply holds no `last-verified` line for *this* ref is `absent`, not untrusted, and the
 binding lines are settled only after that — a record that says nothing about `ref` says nothing about
 `ref` no matter whose common dir it names. Pointing `verifiedRef` at a new name therefore starts a
-fresh history instead of failing on a record earned for the old one, and a file copied in from another
-clone cannot accuse a clone that never carried the ref (PRO-300 review B1: `rm` must not be the only
-way out). Section 4 says which of these it used — the summary line carries `last-verified <oid>@<when>`
-for the record a satisfied boot relied on, `last-verified refused (record untrusted: <cause>)` for one
-that was refused, and a separate `upstream-ref-attestation` INFO line names the record file.
+fresh history instead of failing on a record earned for the old one — the pre-write read asks the same
+`repo`/`remote url` question the strict read does, so a file this gate could not have written
+contributes no lines to the record it replaces it with (PRO-300 review finding 4) — and a file copied
+in from another clone cannot accuse a clone that never carried the ref (PRO-300 review B1: `rm` must
+not be the only way out). Section 4 says which of these it used — the summary line carries
+`last-verified <oid>@<when>` for the record a satisfied boot relied on, `last-verified refused (record
+untrusted: <cause>)` for one that was refused, a separate `upstream-ref-attestation` INFO line names
+the record file, and a `WARN` `upstream-ref-attestation-unreadable` names it when the record on disk
+could not be read at all and this run wrote a fresh one over it.
 
 What the attestation does **not** guarantee, since a half-told guarantee is worse than none:
 
@@ -306,10 +317,15 @@ records nothing, rather than claiming a deletion it did not see or a fetch it ca
 **entry** of its own", not "no reflog of its own" — the evidence list right next to it names the
 file.
 
-Both of those files are read directly rather than through `git`, so the read is bounded the way every
-`git` call is (PRO-301 review N4): `stat` first, regular files only, at most one capped chunk. A fifo
-planted at `.git/logs/<ref>` therefore answers "nothing was observed" instead of blocking the boot
-forever with the single-writer lease held and the worldserver never starting.
+All three of the files the gate reads directly rather than through `git` — the reflog, `FETCH_HEAD`,
+and the `last-verified` record — go through one bounded reader, the way every `git` call is bounded
+(PRO-301 review N4, and PRO-300 review finding 1 for the record, which had been left as a bare
+`read_text()`): `stat` first, regular files only, at most one capped chunk, and nothing is ever opened
+that `stat` did not just confirm is a regular file. A fifo planted at `.git/logs/<ref>` therefore
+answers "nothing was observed" instead of blocking the boot forever with the single-writer lease held
+and the worldserver never starting, and a fifo planted at the record path answers `untrusted` /
+`unreadable` for the same reason — `open()` on a writer-less fifo never returns, so no `except OSError`
+would ever have been reached.
 
 `--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
 and `attested-missing` cases only — both answer the same question, "the ref is simply not here",
