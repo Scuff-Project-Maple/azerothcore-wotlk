@@ -216,8 +216,8 @@ class MySQL:
         ) + " | " + " ".join(shlex.quote(a) for a in restore)
         try:
             proc = subprocess.run(["bash", "-lc", shell], stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, timeout=self.timeout * 4,
-                                  cwd=str(self.compose_root))
+                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                  timeout=self.timeout * 4, cwd=str(self.compose_root))
         except subprocess.TimeoutExpired as exc:
             raise OperationalError(f"clone timed out after {self.timeout * 4}s") from exc
         err = proc.stderr.decode("utf-8", "replace")
@@ -1262,11 +1262,15 @@ class Preflight:
         `errors` is exposed because `git ls-tree -z` emits raw path bytes: decoding
         those with "replace" would silently mangle a non-ASCII filename and turn a
         genuine upstream file into an unverified one (PRO-248 review B2).
+
+        stdin is DEVNULL, not inherited: the gate is routinely piped into
+        `ssh host 'bash -s'`, and a git child left on the caller's fd 0 drains the rest
+        of that script (PRO-307 A4; review N3 for the probes this one missed).
         """
         try:
             proc = subprocess.run(["git", *argv], cwd=str(self.git_root),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  timeout=timeout)
+                                  stdin=subprocess.DEVNULL, timeout=timeout)
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
             return None, "", str(exc)
         return (proc.returncode,
@@ -1297,7 +1301,12 @@ class Preflight:
     # git 2.43.0 with GIT_ALLOW_PROTOCOL=none it exits 128 and leaves FETCH_HEAD at
     # 0 bytes (sha256 e3b0c44298fc…, the empty-string digest), so `Path.exists()` on
     # that file is not evidence that anything was fetched (PRO-307 A1).
-    FETCH_HEAD_ENTRY_RE = re.compile(r"^([0-9a-fA-F]{7,64})(?:\s|$)")
+    #
+    # 40 or 64 hex digits, because that is all `git fetch` ever writes there: FETCH_HEAD
+    # carries full object names, never the abbreviated ones `git log` prints (review
+    # N6). A shorter hex run is therefore not a fetched-ref line, and the branch below
+    # reports it as content that does not parse rather than counting it as a fetch.
+    FETCH_HEAD_ENTRY_RE = re.compile(r"^([0-9a-fA-F]{40,64})(?:\s|$)")
 
     def _fetch_head_evidence(self) -> tuple[bool, str]:
         """Did a fetch leave anything readable in FETCH_HEAD? (bool, detail) — local only.
@@ -1309,6 +1318,12 @@ class Preflight:
         object is still not empty, so it stays evidence — the gate must not hand the
         exemption back just because a file holds something unexpected — but it is
         reported as what it is, never as a fetch this gate observed.
+
+        A file the OS will not hand over is a third answer, and it must not borrow the
+        sentence of either of the other two (review N7). `stat` needs no read permission,
+        so the gate still asks how big the thing is: 0 bytes is exactly the shape a failed
+        fetch leaves, and a non-zero file it cannot read is content somebody put there —
+        evidence it cannot inspect, which is not the same as no record.
         """
         rc, fp, _err = self._git(["rev-parse", "--git-path", "FETCH_HEAD"])
         if rc != 0 or not fp.strip():
@@ -1319,17 +1334,27 @@ class Preflight:
             p = self.git_root / p
         try:
             raw = p.read_bytes()
-        except OSError:
-            return False, ""
+        except OSError as exc:
+            try:
+                size = p.stat().st_size
+            except OSError:
+                # Neither readable nor sizeable: the gate observed nothing about the
+                # contents, and existence alone was never fetch evidence (A1). Answering
+                # "no" here keeps the never-fetched clone's WARN rather than accusing it
+                # of a deletion, which is the failure mode this function exists to avoid.
+                return False, ""
+            if size == 0:
+                return False, ""
+            return True, (f"{declared} holds {size} byte(s) this process cannot read "
+                          f"({exc.strerror}), which is more than a failed fetch leaves but "
+                          f"is not a fetch this gate can read")
         if not raw.strip():
             return False, ""
-        lines = [ln for ln in raw.decode("utf-8", "replace").splitlines()
-                 if ln.strip()]
-        entries = [ln for ln in lines if self.FETCH_HEAD_ENTRY_RE.match(ln)]
-        if entries:
-            first = self.FETCH_HEAD_ENTRY_RE.match(entries[0]).group(1)
-            return True, (f"{declared} lists {len(entries)} fetched ref(s), the first at "
-                          f"{first[:12]}, so a fetch completed in this clone")
+        matched = [m for m in (self.FETCH_HEAD_ENTRY_RE.match(ln)
+                               for ln in raw.decode("utf-8", "replace").splitlines()) if m]
+        if matched:
+            return True, (f"{declared} lists {len(matched)} fetched ref(s), the first at "
+                          f"{matched[0].group(1)[:12]}, so a fetch completed in this clone")
         return True, (f"{declared} holds {len(raw)} byte(s) that do not parse as fetched-ref "
                       f"lines, which is more than a failed fetch leaves but is not a fetch "
                       f"this gate can read")
@@ -2657,7 +2682,8 @@ class Preflight:
         argv += ["config", "--format", "json"]
         try:
             proc = subprocess.run(argv, cwd=str(Path(self.a.compose_root)),
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  stdin=subprocess.DEVNULL, timeout=90)
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
             self.r.fail("0b", f"cannot run `docker compose config`: {exc}. Without the resolved "
                               f"compose model the gate cannot prove that the SQL it scanned is the "
@@ -2835,7 +2861,8 @@ class Preflight:
             # gate asserted against the compose config alone.
             ids = subprocess.run(base + ["ps", "-a", "-q", svc_name],
                                  cwd=str(Path(self.a.compose_root)),
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, timeout=60)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return
         cid = ids.stdout.decode("utf-8", "replace").strip().splitlines()
@@ -2845,7 +2872,8 @@ class Preflight:
             return
         try:
             insp = subprocess.run(["docker", "inspect", cid[0].strip()],
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  stdin=subprocess.DEVNULL, timeout=60)
             data = json.loads(insp.stdout.decode("utf-8", "replace"))
         except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
             self.r.warn("0b", f"could not inspect the existing {svc_name} container; compose "

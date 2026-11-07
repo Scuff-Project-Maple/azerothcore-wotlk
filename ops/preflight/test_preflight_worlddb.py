@@ -1876,6 +1876,99 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         fails, _ = self._outcomes(pf)
         self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
 
+    def _only_fetch_head(self, pf, declared):
+        """No reflog, no siblings, and FETCH_HEAD answered by `declared` (a git-path)."""
+        return self._stub_git_shapes(
+            pf, commit_peel=(1, "", "fatal: Needed a single revision"), obj=(1, "", ""),
+            reflog_path=(0, ".git/logs/ABSENT", ""),
+            fetch_head_path=(0, declared, ""), namespace=(0, "", ""))
+
+    def test_an_abbreviated_oid_in_fetch_head_is_not_counted_as_a_fetched_ref(self):
+        # Review N6: `git fetch` writes full object names in FETCH_HEAD — never the
+        # abbreviated ones `git log` prints — so a 7-hex run is not a fetched-ref line.
+        # It is still more content than a failed fetch leaves, so the refusal stands;
+        # what must not come back is the gate reporting it as refs a fetch brought down.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_02.sql", self.IN_BAND)
+        (d / ".git" / "FETCH_HEAD").write_text("0d8a474\t\tbranch 'Playerbot' of origin\n")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._only_fetch_head(pf, ".git/FETCH_HEAD")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("do not parse", up["wasTrackedDetail"])
+        self.assertNotIn("fetched ref(s)", up["wasTrackedDetail"])
+        self.assertNotIn("so a fetch completed", up["wasTrackedDetail"])
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails])
+
+    def test_a_fetch_head_the_os_will_not_read_is_not_answered_as_no_record(self):
+        # Review N7: "unreadable" and "absent" are different facts and the README's rule
+        # is that they must not share a sentence. The gate cannot read the bytes, so it
+        # keeps what a non-empty file already proves — more than a failed fetch leaves —
+        # and says it could not read them, without claiming a fetch it did not observe.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_03.sql", self.IN_BAND)
+        (d / ".git" / "FETCH_HEAD").mkdir()
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._only_fetch_head(pf, ".git/FETCH_HEAD")
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"],
+                        "an unreadable FETCH_HEAD was answered as no FETCH_HEAD at all")
+        self.assertIn("cannot read", up["wasTrackedDetail"])
+        self.assertIn("byte(s)", up["wasTrackedDetail"])
+        self.assertNotIn("so a fetch completed", up["wasTrackedDetail"])
+        self.assertNotIn("do not parse", up["wasTrackedDetail"])
+        self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertIn("upstream-ref-deleted", [r for r, _ in fails],
+                      f"the unreadable record was treated as no evidence: {warns}")
+
+    def test_a_fetch_head_that_can_neither_be_read_nor_sized_is_no_evidence(self):
+        # The other half of review N7. Where the gate observed nothing at all — git names
+        # a FETCH_HEAD that is not there to read or stat — existence alone was never
+        # fetch evidence (A1), and answering "no record" is what keeps a never-fetched
+        # clone the WARN it is promised instead of a deletion accusation.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_04.sql", self.IN_BAND)
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._only_fetch_head(pf, ".git/FETCH_HEAD_never_written")
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        self.assertFalse(up["wasTracked"], up["wasTrackedDetail"])
+        self._run(pf, self._file(d, p))
+        fails, warns = self._outcomes(pf)
+        self.assertNotIn("upstream-ref-deleted", [r for r, _ in fails])
+        self.assertIn("upstream-ref-unverified", warns)
+        self.assertFalse(pf.r.failed)
+
+    def test_an_absolute_git_path_for_fetch_head_is_read_too(self):
+        # Review N9: `git rev-parse --git-path` answers relative in an ordinary clone and
+        # absolute wherever the common dir was moved (linked worktrees, $GIT_DIR). Both
+        # branches have to reach the same file; only the relative one was ever run.
+        #
+        # `git_root` is pointed at a tree that does not exist so the answer can only come
+        # from the declared absolute path: a read that treated git's answer as relative
+        # to the tracked tree (string-concatenating it, say) would report no FETCH_HEAD
+        # here. Note what this pair of tests can and cannot pin: dropping the
+        # `if not p.is_absolute()` guard in favour of an unconditional `git_root / p` is
+        # NOT detectable on any filesystem, because pathlib's `/` replaces the left side
+        # when the right is absolute. That revert is an equivalent mutant, so the guard
+        # is documented as defensive clarity, not as behaviour this test proves.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_04_05.sql", self.IN_BAND)
+        real = d / ".git" / "FETCH_HEAD"
+        real.write_text("0d8a474fc67971fb3dd7616e26323d3066442555\t\tbranch "
+                        "'Playerbot' of origin\n")
+        pf = self._pf(d, verified_ref="refs/remotes/origin/Absent")
+        self._only_fetch_head(pf, str(real))
+        pf.git_root = d / "no-such-tree"
+        up = pf.upstream_ref()
+        self.assertTrue(up["wasTracked"], up["wasTrackedDetail"])
+        self.assertIn("fetched ref(s)", up["wasTrackedDetail"])
+        self.assertIn("0d8a474fc679", up["wasTrackedDetail"])
+        self.assertEqual("fetched", up["wasTrackedCertainty"])
+
     # -- each of the three history signals, on its own (review N4) ----------------- #
 
     def test_the_reflog_alone_is_enough_history(self):
@@ -2031,6 +2124,15 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         inferred = next(m for r, m in fails if r == "upstream-ref-deleted")
         self.assertIn("never existed", inferred)
         self.assertNotIn("so it was deleted rather than never fetched", inferred)
+        # Review N5: the sentence *is* the deliverable here, so it is pinned as written.
+        # "never existed" alone stayed true with the old over-claim restored, which is how
+        # `this clone has fetch history` -> `this clone has fetched` survived a mutation
+        # run. Both halves of the honest claim are now asserted, not just its tail.
+        self.assertIn("does have fetch history", inferred)
+        self.assertIn("was either deleted after it arrived or never existed in this clone",
+                      inferred)
+        self.assertIn("this clone has fetch history", inferred)
+        self.assertNotIn("this clone has fetched,", inferred)
 
         d2 = self._repo()
         p2 = self._commit(d2, f"{self.UP_REL}/2026_11_04_01_00.sql", self.IN_BAND)
@@ -2043,6 +2145,8 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         fails2, _ = self._outcomes(pf2)
         direct = next(m for r, m in fails2 if r == "upstream-ref-deleted")
         self.assertIn("deleted rather than never fetched", direct)
+        # And the *other* sentence, the one only a reflog of this very ref earns.
+        self.assertIn("demonstrably had and no longer does", direct)
 
     def _watch_git_verbs(self, pf):
         """Record every git verb the gate runs, while delegating to real git."""
@@ -2232,6 +2336,13 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self.assertIn(when, msg, "the FAIL must name when it was verified")
         self.assertIn("git fetch --prune origin Playerbot", msg)
         self.assertIn("pending_db_world", msg)
+        # Review N5: this verdict is what distinguishes a stripped clone from a clone
+        # that never fetched, and shortening it re-blurs exactly that. It has to name the
+        # fingerprints that are missing — including a FETCH_HEAD that names *nothing*
+        # fetched, which is the A1 answer — and why that rules out a never-fetched clone.
+        self.assertIn("no FETCH_HEAD that names a fetched ref", msg)
+        self.assertIn("no sibling reflog", msg)
+        self.assertIn("has genuinely never fetched has no attestation to lose", msg)
         self.assertTrue(pf.r.failed, "the residual POC was handed a boot")
         self.assertEqual([], [c for c in seen if c[:1] == ["ls-tree"]],
                          "the gate asked a ref it does not trust for its file list")
@@ -2950,6 +3061,40 @@ class TestGateDoesNotEatItsCallersStdin(unittest.TestCase):
         self.assertEqual(sql, kw.get("input"))
         self.assertNotIn("stdin", kw, "input and stdin together is a ValueError at exec time")
 
+    def test_no_spawn_in_the_tooling_leaves_a_child_on_the_callers_stdin(self):
+        # Review N3. DEVNULL had to be added call by call, so the test has to be the
+        # thing that scales: scan every `subprocess.run` in ops/preflight and refuse any
+        # that names neither `stdin=` nor `input=`. The next probe written here that
+        # forgets is the same silent-stop bug `ssh host 'bash -s'` measured (A4).
+        import ast
+        bare = []
+        spreads = []
+        for path in sorted(HERE.glob("*.py")):
+            if path.name == Path(__file__).name:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                if node.func.attr != "run" or not isinstance(node.func.value, ast.Name):
+                    continue
+                if node.func.value.id != "subprocess":
+                    continue
+                named = {kw.arg for kw in node.keywords}
+                where = f"{path.name}:{node.lineno}"
+                if None in named:
+                    spreads.append(where)
+                elif "stdin" not in named and "input" not in named:
+                    bare.append(where)
+        self.assertEqual([], bare,
+                         "a subprocess.run in ops/preflight leaves its child on the "
+                         "caller's fd 0 (PRO-307 A4)")
+        # The one `**`-spread call is DbRunner._run's `feed`, whose DEVNULL default the
+        # two spies above pin directly. A second spread would be an unchecked spawn.
+        self.assertEqual(["preflight_worlddb.py"], sorted({s.split(":")[0] for s in spreads}),
+                         f"unexpected **kwargs spawn sites: {spreads}")
+        self.assertEqual(1, len(spreads), f"unexpected **kwargs spawn sites: {spreads}")
+
     def test_a_child_with_no_sql_of_its_own_reads_an_empty_stdin_and_returns(self):
         # The regression this pins is the silent stop, not an exception: an inherited
         # fd 0 still holding the tail of a piped script makes `cat` swallow it instead
@@ -3026,6 +3171,40 @@ class TestScanRootIsNamedHonestly(unittest.TestCase):
         # The two lines must not be interchangeable: each says what its root is for.
         self.assertIn("updates_include", text)
         self.assertIn("0b", text)
+
+    def test_main_is_what_puts_the_scanned_tree_in_the_report(self):
+        # Review N4: the test above hand-builds a Report, so deleting the one line in
+        # main() that sets `scanned_from` left the suite green while the banner printed
+        # an empty scan root. Drive main() and read what it printed.
+        import preflight_worlddb as P
+        captured = {}
+
+        class FakePreflight:
+            sql_root = "/worktree/data/sql"
+            git_root = "/mnt/data/wow-server"
+
+            def __init__(self, args, policy, report):
+                captured["report"] = report
+
+            def run(self):
+                return 0
+
+        saved = P.Preflight
+        P.Preflight = FakePreflight
+        try:
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                code = P.main(["--policy", str(HERE / "preflight-policy.json"),
+                               "--compose-root", tempfile.gettempdir()])
+        finally:
+            P.Preflight = saved
+        self.assertEqual(0, code, err.getvalue())
+        self.assertEqual("/mnt/data/wow-server", captured["report"].data.get("scanned_from"),
+                         "main() no longer tells the report which tree the scan walked")
+        self.assertIn("scanned from", out.getvalue())
+        self.assertIn("/mnt/data/wow-server", out.getvalue())
+        # And it is the *banner line* that carries it, not just the data dict.
+        self.assertIn("scanned from : /mnt/data/wow-server", out.getvalue())
 
     def test_the_two_flags_say_which_one_steers_the_scan(self):
         helps = {tuple(a.option_strings): (a.help or "")
@@ -3234,6 +3413,82 @@ class TestPolicyAuditPinsProvenance(unittest.TestCase):
             self.assertIn("does not mean verifiedRef resolves", out)
             d = self._repo(str(Path(tmp) / "git"))
             self.assertEqual("resolved", audit_policy_schema.provenance_mode(POLICY, d)[0])
+
+    def test_an_unanswerable_object_type_is_not_reported_as_a_non_commit_object(self):
+        # Review N1. `cat-file -t` can fail to answer at all — no git on PATH, a timeout,
+        # a corrupt object store. The old fall-through still printed "which is a <kind>,
+        # not a commit", asserting a fact about the object this run never established: the
+        # same over-claim class PRO-307 exists to close, one layer down in the audit.
+        import audit_policy_schema
+        policy = self._prov_policy()
+        answers = [(1, "", "fatal: Needed a single revision"),
+                   (0, "0d8a474fc67971fb3dd7616e26323d3066442555", ""),
+                   (None, "", "git: cat-file: not found")]
+
+        def fake_git(repo, argv):
+            return answers.pop(0) if answers else (0, "", "")
+
+        saved = audit_policy_schema._git
+        audit_policy_schema._git = fake_git
+        try:
+            problems = audit_policy_schema.resolve_provenance_problems(policy, Path("/repo"))
+        finally:
+            audit_policy_schema._git = saved
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("cannot be determined", problems[0])
+        self.assertIn("git: cat-file: not found", problems[0])
+        self.assertIn("the gate fails closed on the same question", problems[0])
+        self.assertNotIn("non-commit object", problems[0])
+        self.assertNotIn("which is a", problems[0])
+
+    def test_the_depth_it_prints_is_the_depth_that_actually_ran(self):
+        # Review N2. provenance_mode() and the resolution half each called repo_is_git()
+        # for themselves, so the two could disagree and the run could print RESOLVED while
+        # the half that peels verifiedRef had decided there was no repo and returned no
+        # problems at all — "0 problem(s)" read as a resolved pass that never happened.
+        import audit_policy_schema
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._repo(tmp)
+            self._git(d, "update-ref", self.REF, self._git(d, "rev-parse", "HEAD"))
+            probed = []
+            real = audit_policy_schema.repo_is_git
+
+            def counting(repo):
+                probed.append(repo)
+                return real(repo)
+
+            saved = audit_policy_schema.repo_is_git
+            audit_policy_schema.repo_is_git = counting
+            try:
+                code, out = self._audit(d, self._prov_policy())
+            finally:
+                audit_policy_schema.repo_is_git = saved
+            self.assertEqual(0, code, out)
+            self.assertIn("RESOLVED", out)
+            self.assertEqual(1, len(probed),
+                             f"the audit asked {len(probed)} times whether {d} is a git "
+                             f"tree; the depth it prints and the depth that ran have to "
+                             f"be the same single answer")
+
+    def test_the_shared_answer_also_holds_when_the_tree_is_not_git(self):
+        # Review N2, the other direction: one answer is only honest if a false one keeps
+        # both halves shape-only rather than leaving the resolution half to guess.
+        import audit_policy_schema
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "tree"
+            (plain / "data/sql/base/db_world").mkdir(parents=True)
+            probed = []
+            saved = audit_policy_schema.repo_is_git
+            audit_policy_schema.repo_is_git = lambda repo: probed.append(repo) or False
+            try:
+                code, out = self._audit(plain, self._prov_policy())
+            finally:
+                audit_policy_schema.repo_is_git = saved
+            self.assertEqual(0, code, out)
+            self.assertIn("SHAPE-ONLY", out)
+            self.assertIn("0 problem(s)", out)
+            self.assertEqual(1, len(probed),
+                             f"{len(probed)} independent git-ness probes for one run")
 
     def test_a_malformed_name_is_reported_once_and_never_resolved(self):
         # The two depths must not file the same defect twice, and a name the shape

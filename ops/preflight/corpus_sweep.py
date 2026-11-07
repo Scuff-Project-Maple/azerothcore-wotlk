@@ -72,7 +72,8 @@ class Args:
 def git_head(root: Path) -> str:
     try:
         proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(root),
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              stdin=subprocess.DEVNULL, timeout=30)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "unknown"
     return proc.stdout.decode().strip() or "unknown"
