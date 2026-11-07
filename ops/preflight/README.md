@@ -148,7 +148,7 @@ directory+author rule.
 | `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref — no reflog, no `FETCH_HEAD`, no sibling reflog and no `last-verified` record naming it | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
 | `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
 | `indeterminate` / `attested-missing` | the ref is gone and none of those three signals is present, **but** this clone's `last-verified` record says a satisfied run of this gate read this very ref at a named commit at a named time | `FAIL`, failing closed, naming the attested oid, the timestamp, the record path and `refreshCommand`. A clone that genuinely never fetched has no attestation to lose, so this is one whose fetch fingerprints were removed after the fact; `--allow-missing-upstream-ref` walks it back to the `WARN` exactly as it does `ref-deleted`, because it is the same claim with a different witness |
-| `indeterminate` / `attestation-untrusted` | the ref is gone and a record for it exists that this gate cannot vouch for — unreadable, holding a line it cannot parse, unversioned or of a version it does not read, or written for another repo or another remote url | `FAIL`, failing closed, naming the record path and the reason. "The record is unreadable" must not be the same sentence as "there is no record", or truncating a file is all it takes to buy back the exemption the record was blocking |
+| `indeterminate` / `attestation-untrusted` | the ref is gone and a record for it exists that this gate cannot vouch for — unreadable, too large for the bounded read to have seen all of it, holding a line it cannot parse, unversioned or of a version it does not read, or written for another repo or another remote url | `FAIL`, failing closed, naming the record path and the reason. "The record is unreadable" must not be the same sentence as "there is no record", or truncating a file is all it takes to buy back the exemption the record was blocking |
 | `indeterminate` / `oid-mismatch` | the ref resolves to a commit, and the commit recorded for it is neither that commit nor an ancestor of it, and the ref carries no reflog of its own | `FAIL`, failing closed, naming both oids. A fetch fast-forwards a remote-tracking ref and a real force-push leaves a reflog, so this is the shape of `git update-ref` pointing the tracked ref at commits of the operator's choosing — and `ls-tree` is never asked of it |
 | `indeterminate` / `not-a-commit` | the name resolves to an object that is not a commit — `HEAD^{tree}`, a blob, a mistyped object name, the null sha | `FAIL`, failing closed, naming `refreshCommand`. It is not missing, and calling it `missing` was the false statement that kept the exemption |
 | `indeterminate` / other | git errored, or the ref is not under `refs/remotes/` | `FAIL`, failing closed |
@@ -256,13 +256,25 @@ those they are, do not read that ref's tree at all, and write nothing — so a r
 laundered by the very boot it just blocked. `repo` is *required* rather than compared-when-present
 and required outright, not merely when git will name this tree's common dir — a record of ours always
 carries it, because `write_attestation()` refuses to emit one it cannot bind, and requiring it only
-when the probe answers is the gap `--preflight-state-dir` could walk through (PRO-300 review finding 5);
+when the probe answers is the gap `--preflight-state-dir` could walk through (PRO-300 review finding 5).
+Present is not the same as checked, though: a `repo` line the gate has nothing to compare against —
+git will not name this tree's common dir while the record is being read from an overridden state
+directory — is `untrusted` too, because anyone who can write that file can write any path into it, so
+the line is worth exactly what the gate can verify it against (PRO-300 review NB-4).
 `remote url` is compared only when both sides can name one, since a tree may legitimately have no
-remote and a record written before `git remote add` is not a forgery. Both bindings are written only
+remote and a record written before `git remote add` is not a forgery — and the name it is compared
+against is taken from the canonical `refs/remotes/<remote>/<branch>` name `git` resolved for
+`verifiedRef`, not from the spelling policy happens to use. A short `verifiedRef: origin/Playerbot`
+names the same remote to an operator, and parsing a remote out of it here would have meant guessing;
+reading it as unparseable instead wrote no `remote url` line at all, which left a later
+`git remote set-url` with nothing to be caught by (PRO-300 review NB-2). Both bindings are written only
 when they fit on one line: a `remote.<name>.url`, or a common-dir path, containing a CR or LF would
 otherwise spill a second line into the record that the strict read would then read as a binding this
 run never made, so such a binding is treated as unavailable and the `remote url` line is omitted
-(PRO-300 review finding 2). The one shape that stays inert on the satisfied path is a record the OS
+(PRO-300 review finding 2) — but omitted is not the same as absent from the report: a url binding this
+gate declined to write is one the record can never enforce, so section 4 says so on the
+`upstream-ref-attestation` line rather than leaving the next `git remote set-url` unwatched (PRO-300
+review NB-3). The one shape that stays inert on the satisfied path is a record the OS
 will not hand over
 (unreadable, or not a regular file): that is an environment accident rather than a claim about the
 ref, what the exemption rests on there is the tree comparison, and making it fatal would turn the
@@ -273,9 +285,12 @@ AC 6 was previously being read as a licence for silence (PRO-300 review).
 A record that simply holds no `last-verified` line for *this* ref is `absent`, not untrusted, and the
 binding lines are settled only after that — a record that says nothing about `ref` says nothing about
 `ref` no matter whose common dir it names. Pointing `verifiedRef` at a new name therefore starts a
-fresh history instead of failing on a record earned for the old one — the pre-write read asks the same
-`repo`/`remote url` question the strict read does, so a file this gate could not have written
-contributes no lines to the record it replaces it with (PRO-300 review finding 4) — and a file copied
+fresh history instead of failing on a record earned for the old one — the pre-write read asks the strict read's
+whole question — one `_record_content_refusal()` and one `_record_binding_refusal()`, not a second and
+laxer copy of part of it — so a file this gate could not have written contributes no lines to the
+record it replaces it with (PRO-300 review finding 4, and NB-6: it used to ask about the version and
+the bindings but not the unparsable lines, so a record the strict read had refused could still have
+those lines carried forward into a rewrite this gate signs its own name to) — and a file copied
 in from another clone cannot accuse a clone that never carried the ref (PRO-300 review B1: `rm` must
 not be the only way out). Section 4 says which of these it used — the summary line carries
 `last-verified <oid>@<when>` for the record a satisfied boot relied on, `last-verified refused (record
@@ -336,15 +351,31 @@ records nothing, rather than claiming a deletion it did not see or a fetch it ca
 **entry** of its own", not "no reflog of its own" — the evidence list right next to it names the
 file.
 
-All three of the files the gate reads directly rather than through `git` — the reflog, `FETCH_HEAD`,
-and the `last-verified` record — go through one bounded reader, the way every `git` call is bounded
-(PRO-301 review N4, and PRO-300 review finding 1 for the record, which had been left as a bare
-`read_text()`): `stat` first, regular files only, at most one capped chunk, and nothing is ever opened
-that `stat` did not just confirm is a regular file. A fifo planted at `.git/logs/<ref>` therefore
+The three paths `git` reports about the tree — the reflog, `FETCH_HEAD`, and the `last-verified`
+record — all go through one bounded reader, the way every `git` call is bounded (PRO-301 review N4,
+and PRO-300 review finding 1 for the record, which had been left as a bare `read_text()`): `stat`
+first, regular files only, at most one capped chunk. The gate reads other files directly too — the
+policy JSON, `worldserver.conf.dist`, the company update files themselves, a referenced SQL file — but
+those are paths it was handed, not paths `git` reported about a tree it was not asked to trust, which
+is the distinction the probe is drawn around. The file is then opened `O_NOFOLLOW | O_NONBLOCK` and
+re-checked with an `fstat()` of the descriptor that was actually opened (PRO-300 review NB-6): a
+`stat` by path and an `open()` by path are two lookups of a name somebody else controls, and the
+second answer is the only one that describes the bytes. A fifo planted at `.git/logs/<ref>` therefore
 answers "nothing was observed" instead of blocking the boot forever with the single-writer lease held
 and the worldserver never starting, and a fifo planted at the record path answers `untrusted` /
 `unreadable` for the same reason — `open()` on a writer-less fifo never returns, so no `except OSError`
 would ever have been reached.
+
+A record larger than that one capped chunk is refused as `unreadable`, not read as though it were the
+file (PRO-300 review NB-1). Every question the readers ask of a record — "does it name a version",
+"does it hold a `last-verified` line for this ref" — is a question about the bytes they were handed,
+and a prefix is not the file: answering `absent` for a truncated record puts "the record says nothing"
+within reach of whoever can make the record long, which is the same act as truncating it. `unreadable`
+is the right cause because it is the truth the rest of the gate acts on: inert on the satisfied path,
+where the tree comparison carries the boot (AC 6), and a refusal on the path where the record is all
+that stands between a stripped `.git` and the exemption. A record that cannot be read in full is never
+rewritten, either — rebuilding it from the part that could be read would drop every other ref's line
+past the cap, and losing an operator's history is not a price the record is worth.
 
 `--allow-missing-upstream-ref` is **off by default on the boot path** and rescues the `ref-deleted`
 and `attested-missing` cases only — both answer the same question, "the ref is simply not here",

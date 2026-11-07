@@ -15,6 +15,7 @@ import json
 import re
 import tempfile
 import unittest
+from unittest import mock
 from argparse import Namespace
 from pathlib import Path
 
@@ -3555,8 +3556,8 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
         pf = self._pf(d)
         seen = self._watch_git_verbs(pf)
-        pf.attestation_record = lambda ref: (pf.ATTEST_UNTRUSTED,
-                                             "a cause-less refusal", "", "", "")
+        pf.attestation_record = lambda ref, url_ref="": (
+            pf.ATTEST_UNTRUSTED, "a cause-less refusal", "", "", "")
         up = pf.upstream_ref()
         self.assertTrue(up.get("treeSkipped"),
                         "an untrusted record with no cause was treated as no record")
@@ -3566,6 +3567,318 @@ class TestUpstreamRefProvenance(unittest.TestCase):
         state, detail, cause = pf.upstream_ref_state(p)
         self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"),
                          (state, cause), detail)
+
+
+    # -- PRO-300 review NB round: the six non-blocking findings ------------------- #
+
+    def _pad_record(self, path, cap):
+        """Grow `path` past `cap` with comment lines, leaving it otherwise parseable.
+
+        Comments are the filler precisely because the parser skips them: the file has to
+        be one this gate would happily read if it could read all of it, so the only thing
+        the size can change is how much of it was seen.
+        """
+        import os
+        with path.open("a", encoding="utf-8") as fh:
+            while os.path.getsize(str(path)) <= cap:
+                fh.write("# " + "x" * 60 + "\n")
+        return path
+
+    def test_the_bounded_read_distinguishes_a_prefix_from_the_whole_file(self):
+        # Review NB-1. Nothing pinned the read cap, so raising `_OBSERVATION_READ_CAP`
+        # (1<<16 -> 1<<24 is the obvious "fix" for a record that got refused) leaves this
+        # suite green while every caller below silently stops being exercised. The cap is
+        # the contract, so it is pinned at both edges: a file of exactly `cap` bytes was
+        # read whole, one byte more was not.
+        import os
+        import tempfile
+        d = self._repo()
+        pf = self._pf(d)
+        # The value itself, not just the comparison below it: this is the bound that
+        # keeps a file someone else controls from turning into an unbounded read, and
+        # every test in this class pads relative to it, so a suite that only ever asked
+        # "larger than whatever the cap is now" would stay green at 1 GiB.
+        self.assertEqual(1 << 16, pf._OBSERVATION_READ_CAP,
+                         "the read cap was moved; that is a decision about how much a "
+                         "hostile record may make this gate read, not a tuning knob")
+        cap = pf._OBSERVATION_READ_CAP
+        with tempfile.TemporaryDirectory() as td:
+            whole = Path(td) / "whole"
+            whole.write_bytes(b"#" * cap)
+            self.assertEqual((os.path.getsize(str(whole)), False),
+                             (whole.stat().st_size,
+                              pf._read_bounded(whole)[2]),
+                             "a file of exactly the cap was reported as a prefix")
+            over = Path(td) / "over"
+            over.write_bytes(b"#" * cap + b"\n")
+            self.assertTrue(pf._read_bounded(over)[2],
+                            "a file one byte past the cap was reported as the whole "
+                            "file, which is the mutation NB-1 was written for")
+
+    def test_a_record_too_large_to_read_is_not_reported_as_holding_nothing(self):
+        # Review NB-1, run against the shape the README forbids. `_read_bounded()` read
+        # one capped chunk and said nothing about having stopped, so a record padded past
+        # the cap had its `last-verified` line land in the part nobody looked at. Every
+        # reader then answered its own honest question about a prefix — "no `version`",
+        # "no `last-verified` line for this ref" — and a forged `git update-ref` that a
+        # readable record would have failed as `oid-mismatch` booted with
+        # `attestation=recorded`, no tree skip, and no finding at all.
+        import os
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_07_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        path = self._attest(d)
+        self._pad_record(path, self._pf(d)._OBSERVATION_READ_CAP)
+        self._forge_ref_move(d)
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual((pf.ATTEST_UNTRUSTED, "unreadable"),
+                         (up["attestation"], up["attestationCause"]),
+                         up["attestationDetail"])
+        self.assertIn("larger than", up["attestationDetail"],
+                      "an over-cap record was refused without saying why")
+        self.assertNotIn("holds no `last-verified` line", up["attestationDetail"],
+                         "a record that was only partly read was reported as one that "
+                         "holds nothing")
+        # AC 6: the size of a file the gate wrote is an environment fact, not a
+        # disproof, so the satisfied path stays inert exactly as `unreadable` does.
+        self.assertFalse(up["attestationRefused"])
+        self.assertFalse(up["treeSkipped"])
+        # And it was not rewritten: rebuilding the file from the prefix that could be
+        # read would drop every other ref's line, so the operator's file stands.
+        self._run(pf, self._file(d, p))
+        self.assertFalse(pf.r.failed,
+                         "an over-cap record refused a boot AC 6 says it may not")
+        self.assertGreater(path.stat().st_size, pf._OBSERVATION_READ_CAP,
+                           "the record was rewritten from a prefix of itself")
+        self.assertIn("was not rewritten", pf.upstream_ref()["attestationNote"],
+                      "a satisfied boot quietly declined to update the record")
+
+    def test_an_over_cap_record_still_fails_the_missing_ref_closed(self):
+        # The other half of NB-1, and the half that keeps the fix honest: inert on the
+        # path where the tree itself carries the boot, refusing on the path where the
+        # record was the only thing standing between a stripped `.git` and the upstream
+        # exemption. Otherwise "make the record long" is a clean escape hatch.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_07_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        path = self._attest(d)
+        self._pad_record(path, self._pf(d)._OBSERVATION_READ_CAP)
+        self._virgin(d)
+        pf = self._pf(d)
+        up = pf.upstream_ref()
+        self.assertEqual("missing", up["state"])
+        state, detail, cause = pf.upstream_ref_state(p)
+        self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"),
+                         (state, cause), detail)
+        self._run(pf, self._file(d, p))
+        fails, _ = self._outcomes(pf)
+        self.assertIn("upstream-ref-attestation-untrusted", [r for r, _ in fails],
+                      f"a long enough record bought back the exemption: {fails}")
+        self.assertTrue(pf.r.failed)
+
+    def test_a_short_verifiedRef_still_carries_the_remote_url_binding(self):
+        # Review NB-2. `remote_url_for_ref()` parsed a remote name out of a ref only when
+        # it began `refs/remotes/`, and the binding check only ever compared a url the
+        # record already carried. `verifiedRef: origin/Playerbot` therefore wrote no
+        # `remote url` line at all, and `git remote set-url origin
+        # https://evil.invalid/...` — moving the record's remote under it — read as
+        # `recorded`. The canonical name `upstream_ref()` had already resolved is
+        # `fullRef`; using it for the lookup is what keeps the binding in force.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_07_00.sql", self.IN_BAND)
+        url = "https://example.invalid/acro.git"
+        self._git(d, "remote", "add", "origin", url)
+        pf = self._pf(d, verified_ref="origin/Playerbot")
+        up = pf.upstream_ref()
+        self.assertEqual("ok", up["state"], up["detail"])
+        self.assertTrue(up["remoteTracked"], up["remoteDetail"])
+        self.assertEqual(self.ATTEST_REF, up["fullRef"],
+                         "the canonical name policy spells short was not kept")
+        body = pf.attestation_file().read_text()
+        self.assertIn(f"remote url {url}", body,
+                      "a short `verifiedRef` wrote a record with no url binding to "
+                      f"compare against: {body!r}")
+        pf2 = self._pf(d, verified_ref="origin/Playerbot")
+        self.assertEqual("recorded", pf2.upstream_ref()["attestation"],
+                         "the untouched tree was already untrusted, so the attack below "
+                         "proves nothing")
+        self._git(d, "remote", "set-url", "origin", "https://evil.invalid/acro.git")
+        pf3 = self._pf(d, verified_ref="origin/Playerbot")
+        up3 = pf3.upstream_ref()
+        self.assertEqual((pf3.ATTEST_UNTRUSTED, "url"),
+                         (up3["attestation"], up3["attestationCause"]),
+                         up3["attestationDetail"])
+        self._run(pf3, self._file(d, p))
+        fails, _ = self._outcomes(pf3)
+        self.assertIn("upstream-ref-attestation-untrusted", [r for r, _ in fails],
+                      "the record's remote moved under it and the boot did not notice")
+        self.assertTrue(pf3.r.failed)
+
+    def test_a_dropped_url_binding_says_so_on_the_report(self):
+        # Review NB-3. A url that cannot fit on one line is dropped rather than written
+        # (finding 2), which is the right call — but the record then permanently carries
+        # no `remote url` line, and a record with no url line is exactly the record a
+        # later `git remote set-url` cannot be caught by. Section 4 said nothing, so the
+        # one binding the gate had chosen not to enforce was invisible.
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_07_00.sql", self.IN_BAND)
+        self._git(d, "remote", "add", "origin", "https://example.invalid/acro.git")
+        self._git(d, "config", "remote.origin.url",
+                  "https://example.invalid/acro.git\rlast-verified "
+                  + self.ATTEST_REF + " = " + "1" * 40 + " @ 2020-01-01T00:00:00+00:00")
+        pf = self._pf(d)
+        self._run(pf, self._file(d, p))
+        infos = [(x.rule, x.message) for x in pf.r.findings if x.severity == "INFO"]
+        named = [m for r, m in infos if r == "upstream-ref-attestation"]
+        self.assertTrue(any("remote url" in m and "omitted" in m for m in named),
+                        f"a binding the gate itself declined to write went unreported: "
+                        f"{named}")
+        self.assertNotIn("remote url", pf.attestation_file().read_text(),
+                         "the url was written anyway, so the report line proves nothing")
+
+    def test_a_repo_line_this_gate_cannot_compare_is_untrusted(self):
+        # Review NB-4. Finding 5 required a `repo` line but compared it only `if
+        # expect_repo`, so under `--preflight-state-dir` plus an unanswered
+        # `--git-common-dir` a record naming somebody else's common dir was trusted
+        # outright. Presence without comparability is not a satisfied binding: anyone who
+        # can write this file can write any `repo` line, so the line is worth only what
+        # the gate can check it against.
+        import tempfile
+        d = self._repo()
+        p = self._commit(d, f"{self.UP_REL}/2026_11_07_00.sql", self.IN_BAND)
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, state_dir, ignore_errors=True)
+        head = self._git(d, "rev-parse", self.ATTEST_REF)
+        for repo_line in ("/some/other/host/checkout/.git",
+                          str((d / ".git").resolve())):
+            with self.subTest(repo=repo_line):
+                # Both halves matter. The first is the attack; the second is the
+                # deliberate contract change it forces — a record of *this* clone is
+                # untrusted too when the gate has nothing to compare it against, because
+                # trusting it would trust the file's own word that it belongs here.
+                (state_dir / "last-verified").write_text(
+                    f"version 1\nrepo {repo_line}\nlast-verified {self.ATTEST_REF} = "
+                    f"{head} @ 2020-01-01T00:00:00+00:00\n", encoding="utf-8")
+                pf = self._pf(d)
+                pf.a.preflight_state_dir = str(state_dir)
+                self._stub_git_shapes(pf, common_dir=(128, "", "stub"))
+                status, why, _oid, _when, cause = pf.attestation_record(self.ATTEST_REF)
+                self.assertEqual((pf.ATTEST_UNTRUSTED, "repo"), (status, cause), why)
+                self.assertIn("cannot determine", why)
+                state, detail, rcause = pf.upstream_ref_state(p)
+                self.assertEqual((pf.REF_INDETERMINATE, "attestation-untrusted"),
+                                 (state, rcause), detail)
+
+    def test_the_pre_write_read_refuses_unparsable_lines_too(self):
+        # Review NB-6. The strict read refused a record with an unparsable line; the
+        # pre-write read asked only about version and bindings, then carried the rest of
+        # the file forward into a rewrite this gate signs its own name to. The two
+        # readers now ask one question, asked in `_record_content_refusal()`.
+        d = self._repo()
+        self._git(d, "update-ref", self.ATTEST_REF, "HEAD")
+        pf = self._pf(d)
+        path = pf.attestation_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"version 1\nrepo {(d / '.git').resolve()}\n"
+            f"this line is not a record of anything\n"
+            f"last-verified refs/remotes/origin/Other = {'2' * 40} @ "
+            f"2020-01-01T00:00:00+00:00\n", encoding="utf-8")
+        detail, when = pf.write_attestation(self.ATTEST_REF,
+                                            self._git(d, "rev-parse", self.ATTEST_REF))
+        self.assertTrue(when, f"nothing was written: {detail}")
+        body = path.read_text()
+        self.assertIn(f"last-verified {self.ATTEST_REF} = ", body)
+        self.assertNotIn("this line is not a record of anything", body,
+                         "the strict reader refuses this line and the pre-write reader "
+                         f"preserved it: {body!r}")
+        self.assertNotIn("refs/remotes/origin/Other", body,
+                         "a record the strict reader will not vouch for had its lines "
+                         "carried forward anyway")
+
+    def test_a_record_swapped_for_a_fifo_after_the_stat_cannot_block_the_boot(self):
+        # Review NB-6, second half. `_read_bounded()` decided "regular file" from a `stat`
+        # by path and then opened the path again, which is a second lookup of a name
+        # somebody else controls. The window is the whole point: an honest-looking file at
+        # `stat` time and a fifo at `open()` time blocks the boot inside the kernel, where
+        # no `except OSError` can reach it. `O_NONBLOCK` plus a `fstat()` of the
+        # descriptor actually opened closes it, so this answers instead of hanging.
+        import os
+        import signal
+        import tempfile
+        d = self._repo()
+        pf = self._pf(d)
+        with tempfile.TemporaryDirectory() as td:
+            decoy = Path(td) / "decoy"
+            decoy.write_text("version 1\n", encoding="utf-8")
+            fifo = Path(td) / "last-verified"
+            os.mkfifo(str(fifo))
+            real_stat = os.stat
+
+            def lying_stat(path, *a, **kw):
+                # What `stat` said about the path before it was swapped.
+                return real_stat(str(decoy))
+
+            def on_alarm(signum, frame):
+                raise AssertionError(
+                    "the last-verified read blocked on a file that was not a regular "
+                    "file by the time it was opened")
+
+            previous = signal.signal(signal.SIGALRM, on_alarm)
+            self.addCleanup(signal.signal, signal.SIGALRM, previous)
+            signal.alarm(10)
+            try:
+                with mock.patch("os.stat", side_effect=lying_stat):
+                    text, why_not, partial = pf._read_bounded(fifo)
+            finally:
+                signal.alarm(0)
+        self.assertTrue(why_not,
+                        "a fifo that arrived after the stat was read as a regular file")
+        self.assertFalse(partial)
+        self.assertEqual("", text)
+
+    def test_a_fifo_with_a_writer_is_answered_without_ever_being_read(self):
+        # The companion to the test above, and the one that pins the other half of NB-6.
+        # With no writer a fifo makes `open()` itself fail, so `O_NONBLOCK` alone answers
+        # it; with a writer holding it open the `open()` succeeds and the only thing
+        # between this gate and a read that never returns is the `fstat()` of the
+        # descriptor that was actually opened. That is the answer `stat` by path cannot
+        # give once the path has been swapped.
+        import os
+        import signal
+        import tempfile
+        d = self._repo()
+        pf = self._pf(d)
+        with tempfile.TemporaryDirectory() as td:
+            decoy = Path(td) / "decoy"
+            decoy.write_text("version 1\n", encoding="utf-8")
+            fifo = Path(td) / "last-verified"
+            os.mkfifo(str(fifo))
+            keeper = os.open(str(fifo), os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, keeper)
+            real_stat = os.stat
+
+            def lying_stat(path, *a, **kw):
+                return real_stat(str(decoy))
+
+            def on_alarm(signum, frame):
+                raise AssertionError(
+                    "the last-verified read went looking inside a fifo because the only "
+                    "thing it consulted about the opened file was a stat of its path")
+
+            previous = signal.signal(signal.SIGALRM, on_alarm)
+            self.addCleanup(signal.signal, signal.SIGALRM, previous)
+            signal.alarm(10)
+            try:
+                with mock.patch("os.stat", side_effect=lying_stat):
+                    text, why_not, partial = pf._read_bounded(fifo)
+            finally:
+                signal.alarm(0)
+        self.assertIn("fifo", why_not, why_not)
+        self.assertEqual("", text)
+        self.assertFalse(partial)
 
 
 class TestPolicyAuditPinsProvenance(unittest.TestCase):
