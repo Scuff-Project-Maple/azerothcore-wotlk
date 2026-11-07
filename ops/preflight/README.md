@@ -113,12 +113,19 @@ the boot was still refused — the damage was that `REFUSING BOOT … (exit 120)
 an interpreter accident instead of the finding that refused the boot. So a stream that refused
 `_emit()` is retired on the way out: flushed, closed, and replaced on `sys.stdout`/`sys.stderr` by a
 `_RetiredStream` that absorbs everything, which is what leaves the interpreter nothing to fail on.
+The stand-in also reports `closed = True` (PRO-341 review N3), so CPython's shutdown flush skips it
+outright instead of relying on `flush()` staying inert forever.
 The exit status stays the three documented above, and `TestTheGateHoldsItsOwnRc` runs the refusals in
 subprocesses against a real `/dev/full`, a real early-closed pipe and a real closed fd 1, because
 interpreter teardown is not observable from inside a fixture. The same class pins the other PRO-325
 observation: with fd 1 closed, `sys.stdout` is `None` and the old label printed the word `None` where
 a destination belongs; an absent thing is now named as absent, including on the degraded render line,
 which says "no --json payload requested" rather than claiming a payload nobody asked for.
+That last sentence is decided on truthiness, so `--json ""` — what an operator's `--json "$TARGET"`
+becomes when `$TARGET` is blank, since the wrapper forwards unrecognised arguments verbatim — is no
+payload requested, not a payload sitting at an empty path (PRO-341 review B1). And the refusal names the destination an operator can act on: `_emit()` adds what
+the stream actually is, so a full device reads `could not write the report to <stdout> (/dev/full)` and
+a closed fd 1 reads `<stdout> (nothing is attached to it)` (PRO-341 review N2, N4).
 
 ### The third tag: the tracked upstream ref (PRO-248)
 

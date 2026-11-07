@@ -3935,9 +3935,16 @@ class _RetiredStream:
     device and rebinding `sys.stdout` alone was enough to hold rc at the gate's own code.
     Writes "succeed" here so that no late third-party write discovers a fresh exception
     class at the worst possible moment.
+
+    `closed = True` is the second belt, not decoration. Measured on 3.12.3: a stand-in
+    whose `flush()` raises and which has no `closed` attribute costs rc 120, while one
+    that reports itself closed is skipped outright by `flush_std_files()` and costs rc 1.
+    Our `flush()` cannot raise, so today the two agree — the attribute is what keeps the
+    guarantee true if a future edit ever gives it a reason to.
     """
 
     errors = "backslashreplace"
+    closed = True
 
     def __init__(self, name: str, encoding: str = "utf-8"):
         self.name = name
@@ -3970,6 +3977,13 @@ def _retire_broken_stream(stream, label: str) -> None:
     `sys.stdout`/`sys.stderr` to a `_RetiredStream`: `closed` is a property of the stream
     class, and the rebinding is what makes the guarantee hold for a stand-in that never
     sets one. Never raise — this runs from inside a failure handler.
+
+    Closing stdout is only safe because CPython builds the std streams with
+    `closefd=False`: measured on 3.12.3, `sys.stdout.buffer.raw.closefd` is False and
+    `os.fstat(1)` still succeeds after `sys.stdout.close()`. That is what lets the two
+    stderr notices `main()` emits afterwards still reach a live fd 2 under
+    `> /dev/full 2>&1`, where fd 2 *is* fd 1. Load-bearing, and invisible here — if a
+    future interpreter ever builds them with `closefd=True`, retiring must stop closing.
     """
     for method in ("flush", "close"):
         try:
@@ -4005,7 +4019,7 @@ def _stream_label(stream) -> str:
     return repr(stream)
 
 
-def _emit(stream, text: str, label=None) -> None:
+def _emit(stream, text: str, *, label=None) -> None:
     r"""Write a report block to a stream; never let presentation cost the verdict.
 
     What `print()` survives is the operator's locale, not the gate's. `dirty_paths()`
@@ -4033,6 +4047,10 @@ def _emit(stream, text: str, label=None) -> None:
     against a real `/dev/full` and a real early-closed pipe). So a stream that refused us
     is retired on the way out, and the rc the wrapper sees stays one of the three the gate
     documents.
+
+    `label` is keyword-only (PRO-341 review N5). It used to be the third positional, which
+    meant a future positional argument silently became the destination name an operator
+    reads during a refused boot.
     """
     encoding = getattr(stream, "encoding", None) or "utf-8"
     name = label if label else _stream_label(stream)
@@ -4040,6 +4058,15 @@ def _emit(stream, text: str, label=None) -> None:
         # PRO-325 NB2: `1>&-` leaves `sys.stdout` as `None`, and `repr(None)` used to be
         # the "name". Say what is missing instead of printing the word None.
         name = f"{name} (nothing is attached to it)"
+    elif label:
+        # PRO-341 review N2: the label names the channel `main()` aimed at, which is not
+        # the destination the operator has to go and fix. `<stdout>` points at a terminal;
+        # `/dev/full` points at the thing that actually refused. Say it only when it adds
+        # something — an ordinary pipe reports `<stdout>` either way, and a parenthetical
+        # that repeats the label is noise, not information.
+        real = _stream_label(stream)
+        if real and real != name:
+            name = f"{name} ({real})"
     try:
         try:
             stream.write(text + "\n")
@@ -4106,7 +4133,7 @@ def render(report: Report, args) -> str:
     return "\n".join(out)
 
 
-def _render_or_say_why(report: Report, args, payload_note=None) -> str:
+def _render_or_say_why(report: Report, args, *, payload_note: str) -> str:
     """Render the printed verdict, and if rendering itself breaks, say so.
 
     `render()` is the thing that explains the refusal, so an exception escaping it
@@ -4123,13 +4150,18 @@ def _render_or_say_why(report: Report, args, payload_note=None) -> str:
     asked for one at all, it must not imply one exists (PRO-325 NB2's shape again — an
     absent thing rendered as a bare `None`). `NO_JSON_PAYLOAD_NOTE` is the single
     wording for the absent case so this line and any future one cannot drift apart.
+
+    Which is why the parameter is required and keyword-only (PRO-341 review N1). It used
+    to default to `None` and derive its own wording when nobody passed one — a branch no
+    caller in the repo ever reached, and the last place that could print `the --json
+    payload at X is unaffected`, a claim nothing had verified. A defaulted claim and a
+    defaulted write-gate are also how B1 got in: the two tests disagreed (`is None` vs
+    truthiness) and only one of them was load-bearing. There is no derivation left to
+    disagree with.
     """
     try:
         return render(report, args)
     except Exception as exc:
-        if payload_note is None:
-            payload_note = (f"the --json payload at {args.json_out} is unaffected"
-                            if getattr(args, "json_out", None) else NO_JSON_PAYLOAD_NOTE)
         lines = [
             "PRO-179 world-DB updater pre-flight",
             f"RESULT: {'FAIL — boot refused' if report.failed else 'PASS'}",
@@ -4263,13 +4295,24 @@ def main(argv=None) -> int:
             payload_error = (f"preflight: could not write the --json payload to "
                              f"{args.json_out}: {type(exc).__name__}: {exc}")
     if not args.json_only:
-        if args.json_out is None:
+        # One test, the one the write above uses (PRO-341 review B1). `--json ""` is
+        # reachable: `worldserver-up.sh` forwards unrecognised operator arguments
+        # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with a blank
+        # `$TARGET` arrives here as an empty path. The truthiness test above skips the
+        # write, so an `is None` test here fell through to the `else` and told the
+        # operator the payload "is on disk" at a path that rendered as nothing. That is
+        # PRO-325 NB2's shape, an absent thing asserted as present, one layer up. Two
+        # spellings of one question is the bug; now there is one. What `--json ""` still
+        # does *not* do is reach the evidence-missing refusal below, because
+        # `payload_error` stays None — same as base, and tracked apart.
+        if not args.json_out:
             payload_note = NO_JSON_PAYLOAD_NOTE
         elif payload_error:
             payload_note = f"the --json payload at {args.json_out} was NOT written"
         else:
             payload_note = f"the --json payload at {args.json_out} is on disk"
-        _emit(sys.stdout, _render_or_say_why(report, args, payload_note), label="<stdout>")
+        _emit(sys.stdout, _render_or_say_why(report, args, payload_note=payload_note),
+              label="<stdout>")
     if payload_error:
         # The boot path asks for the payload and trusts it as the evidence, so a run
         # that produced no evidence file refuses the boot rather than reporting
