@@ -4064,8 +4064,123 @@ CHECK_TITLES = {
     "5": "dry run on scratch clone",
 }
 
+# The one wording for "nobody asked for a machine-readable report". PRO-325 NB2 found an
+# absent thing rendered as a bare `None`; the fix is a phrase, so it belongs in a constant
+# rather than in two f-strings that can drift apart.
+NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
 
-def _emit(stream, text: str) -> None:
+
+class _RetiredStream:
+    r"""A sink that absorbs anything written to a stream the kernel already refused.
+
+    `_emit` guards its own `write()` and `flush()`, and PRO-325 measured that it does.
+    What no guard reaches is the flush CPython performs on `sys.stdout` and `sys.stderr`
+    *after* `main()` has returned: the bytes a refusing device would not take are still
+    sitting in the buffer, the interpreter tries again during shutdown, and `Py_Exit()`
+    turns a failed final flush into exit status **120**. PRO-325's `extraB` capture is
+    that shape verbatim —
+
+        preflight: could not write the report to <stdout>: BrokenPipeError: [Errno 32] Broken pipe
+        Exception ignored in: <_io.TextIOWrapper name='<stdout>' mode='w' encoding='utf-8'>
+        BrokenPipeError: [Errno 32] Broken pipe
+
+    — and `extraD` is the same run read from `ops/deploy/worldserver-up.sh`, which can
+    only print `REFUSING BOOT — pre-flight failed (exit 120)`: a refusal carrying an rc
+    the gate never issues, so the wrapper's non-zero-means-refused contract still holds
+    while the number itself points at an interpreter accident instead of a verdict.
+
+    Once a stream has refused us there is nothing left to deliver to it, so hand the
+    interpreter something that cannot fail. `flush_std_files()` flushes whatever
+    `sys.stdout` and `sys.stderr` are *bound to* when shutdown runs — PRO-325's
+    reproduction confirms it, because leaving `sys.__stdout__` pointed at the full
+    device and rebinding `sys.stdout` alone was enough to hold rc at the gate's own code.
+    Writes "succeed" here so that no late third-party write discovers a fresh exception
+    class at the worst possible moment.
+
+    `closed = True` is the second belt, not decoration. Measured on 3.12.3: a stand-in
+    whose `flush()` raises and which has no `closed` attribute costs rc 120, while one
+    that reports itself closed is skipped outright by `flush_std_files()` and costs rc 1.
+    Our `flush()` cannot raise, so today the two agree — the attribute is what keeps the
+    guarantee true if a future edit ever gives it a reason to.
+    """
+
+    errors = "backslashreplace"
+    closed = True
+
+    def __init__(self, name: str, encoding: str = "utf-8"):
+        self.name = name
+        self.encoding = encoding
+
+    def write(self, s) -> int:
+        return len(s)
+
+    def writelines(self, lines) -> None:
+        return None
+
+    def flush(self) -> None:
+        return None
+
+    def isatty(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+
+def _retire_broken_stream(stream, label: str) -> None:
+    """Take a stream out of the interpreter's hands before it flushes it again.
+
+    Two guarded steps, in this order. `flush()` then `close()` first: closing is the
+    honest thing to do with a descriptor that cannot be written, and a stream that
+    reports itself closed is the one shape `flush_std_files()` skips — measured on
+    `/dev/full`, `close()` raises `OSError(28, ...)` and still leaves `closed` True, so
+    that alone drops rc from 120 back to the gate's own code. Then rebind
+    `sys.stdout`/`sys.stderr` to a `_RetiredStream`: `closed` is a property of the stream
+    class, and the rebinding is what makes the guarantee hold for a stand-in that never
+    sets one. Never raise — this runs from inside a failure handler.
+
+    Closing stdout is only safe because CPython builds the std streams with
+    `closefd=False`: measured on 3.12.3, `sys.stdout.buffer.raw.closefd` is False and
+    `os.fstat(1)` still succeeds after `sys.stdout.close()`. That is what lets the two
+    stderr notices `main()` emits afterwards still reach a live fd 2 under
+    `> /dev/full 2>&1`, where fd 2 *is* fd 1. Load-bearing, and invisible here — if a
+    future interpreter ever builds them with `closefd=True`, retiring must stop closing.
+    """
+    for method in ("flush", "close"):
+        try:
+            getattr(stream, method)()
+        except Exception:
+            pass
+    stand_in = _RetiredStream(label, getattr(stream, "encoding", None) or "utf-8")
+    if stream is sys.stdout:
+        sys.stdout = stand_in
+    elif stream is sys.stderr:
+        sys.stderr = stand_in
+
+
+def _stream_label(stream) -> str:
+    r"""Name the destination a report block was aimed at.
+
+    PRO-325 NB2: the wording used to be `getattr(stream, "name", None) or repr(stream)`,
+    and with fd 1 closed (`1>&-`) CPython hands `main()` `sys.stdout = None`, so the one
+    line an operator reads under a failed boot came out
+
+        preflight: could not write the report to None: AttributeError: ...
+
+    `repr(None)` is the string `'None'`, so the guard never fired and the docstring's
+    promise to "name the failure" broke in exactly the shape it existed for. A stream
+    that is not a stream gets said out loud instead; anything with a real `name`, or that
+    only `repr()` can identify, keeps the wording the PRO-313 pins already assert.
+    """
+    if stream is None:
+        return "<stream not open>"
+    name = getattr(stream, "name", None)
+    if name:
+        return str(name)
+    return repr(stream)
+
+
+def _emit(stream, text: str, *, label=None) -> None:
     r"""Write a report block to a stream; never let presentation cost the verdict.
 
     What `print()` survives is the operator's locale, not the gate's. `dirty_paths()`
@@ -4086,8 +4201,33 @@ def _emit(stream, text: str) -> None:
     code or the payload on disk (PRO-313 review B1). Name the failure on the fallback
     stream and return normally. What this does *not* make safe is `render()` itself,
     which is why `main()` writes the payload before it calls `_emit` at all.
+
+    Naming it is not the whole job: a guard that survives its own `flush()` still leaves
+    the unflushed bytes for the interpreter's shutdown flush to trip over, which is how a
+    refused boot came to exit 120 (PRO-325 NB1, reproduced in `TestTheGateHoldsItsOwnRc`
+    against a real `/dev/full` and a real early-closed pipe). So a stream that refused us
+    is retired on the way out, and the rc the wrapper sees stays one of the three the gate
+    documents.
+
+    `label` is keyword-only (PRO-341 review N5). It used to be the third positional, which
+    meant a future positional argument silently became the destination name an operator
+    reads during a refused boot.
     """
     encoding = getattr(stream, "encoding", None) or "utf-8"
+    name = label if label else _stream_label(stream)
+    if stream is None:
+        # PRO-325 NB2: `1>&-` leaves `sys.stdout` as `None`, and `repr(None)` used to be
+        # the "name". Say what is missing instead of printing the word None.
+        name = f"{name} (nothing is attached to it)"
+    elif label:
+        # PRO-341 review N2: the label names the channel `main()` aimed at, which is not
+        # the destination the operator has to go and fix. `<stdout>` points at a terminal;
+        # `/dev/full` points at the thing that actually refused. Say it only when it adds
+        # something — an ordinary pipe reports `<stdout>` either way, and a parenthetical
+        # that repeats the label is noise, not information.
+        real = _stream_label(stream)
+        if real and real != name:
+            name = f"{name} ({real})"
     try:
         try:
             stream.write(text + "\n")
@@ -4097,13 +4237,13 @@ def _emit(stream, text: str) -> None:
             stream.write("\n")
         stream.flush()
     except Exception as exc:
-        label = getattr(stream, "name", None) or repr(stream)
         try:
-            sys.__stderr__.write(f"preflight: could not write the report to {label}: "
+            sys.__stderr__.write(f"preflight: could not write the report to {name}: "
                                  f"{type(exc).__name__}: {exc}\n")
             sys.__stderr__.flush()
         except Exception:
             pass
+        _retire_broken_stream(stream, name)
 
 
 def _write_json_payload(path, payload: dict) -> None:
@@ -4154,7 +4294,7 @@ def render(report: Report, args) -> str:
     return "\n".join(out)
 
 
-def _render_or_say_why(report: Report, args) -> str:
+def _render_or_say_why(report: Report, args, *, payload_note: str) -> str:
     """Render the printed verdict, and if rendering itself breaks, say so.
 
     `render()` is the thing that explains the refusal, so an exception escaping it
@@ -4164,6 +4304,21 @@ def _render_or_say_why(report: Report, args) -> str:
     is a terminal that says nothing. A degraded line that still names the failing
     checks beats that, and the names come straight off the report rather than through
     any of the formatting that just failed.
+
+    The clause about the payload is a claim, so it has to come from whoever knows it:
+    `main()` passes `payload_note` after the write has been attempted. Asked for a
+    payload we could not write, the degraded line must not say the payload is fine; not
+    asked for one at all, it must not imply one exists (PRO-325 NB2's shape again — an
+    absent thing rendered as a bare `None`). `NO_JSON_PAYLOAD_NOTE` is the single
+    wording for the absent case so this line and any future one cannot drift apart.
+
+    Which is why the parameter is required and keyword-only (PRO-341 review N1). It used
+    to default to `None` and derive its own wording when nobody passed one — a branch no
+    caller in the repo ever reached, and the last place that could print `the --json
+    payload at X is unaffected`, a claim nothing had verified. A defaulted claim and a
+    defaulted write-gate are also how B1 got in: the two tests disagreed (`is None` vs
+    truthiness) and only one of them was load-bearing. There is no derivation left to
+    disagree with.
     """
     try:
         return render(report, args)
@@ -4172,7 +4327,7 @@ def _render_or_say_why(report: Report, args) -> str:
             "PRO-179 world-DB updater pre-flight",
             f"RESULT: {'FAIL — boot refused' if report.failed else 'PASS'}",
             f"!! render() raised {type(exc).__name__}: {exc}; the findings are listed "
-            "unformatted below and the --json payload is unaffected",
+            f"unformatted below and {payload_note}",
         ]
         for f in report.findings:
             if f.severity in ("FAIL", "WARN"):
@@ -4257,7 +4412,7 @@ def main(argv=None) -> int:
     args.compose_file = args.compose_file or []
     policy_path = Path(args.policy)
     if not policy_path.is_file():
-        _emit(sys.stderr, f"preflight: policy file not found: {policy_path}")
+        _emit(sys.stderr, f"preflight: policy file not found: {policy_path}", label="<stderr>")
         return EXIT_ERROR
     policy = json.loads(policy_path.read_text())
     if args.live_db is None:
@@ -4274,7 +4429,7 @@ def main(argv=None) -> int:
         report.data["sql_root"] = str(pf.sql_root)
         rc = pf.run()
     except OperationalError as exc:
-        _emit(sys.stderr, f"preflight: operational error: {exc}")
+        _emit(sys.stderr, f"preflight: operational error: {exc}", label="<stderr>")
         return EXIT_ERROR
 
     report.data["elapsed_s"] = round(time.monotonic() - t0, 1)
@@ -4301,14 +4456,31 @@ def main(argv=None) -> int:
             payload_error = (f"preflight: could not write the --json payload to "
                              f"{args.json_out}: {type(exc).__name__}: {exc}")
     if not args.json_only:
-        _emit(sys.stdout, _render_or_say_why(report, args))
+        # One test, the one the write above uses (PRO-341 review B1). `--json ""` is
+        # reachable: `worldserver-up.sh` forwards unrecognised operator arguments
+        # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with a blank
+        # `$TARGET` arrives here as an empty path. The truthiness test above skips the
+        # write, so an `is None` test here fell through to the `else` and told the
+        # operator the payload "is on disk" at a path that rendered as nothing. That is
+        # PRO-325 NB2's shape, an absent thing asserted as present, one layer up. Two
+        # spellings of one question is the bug; now there is one. What `--json ""` still
+        # does *not* do is reach the evidence-missing refusal below, because
+        # `payload_error` stays None — same as base, and tracked apart.
+        if not args.json_out:
+            payload_note = NO_JSON_PAYLOAD_NOTE
+        elif payload_error:
+            payload_note = f"the --json payload at {args.json_out} was NOT written"
+        else:
+            payload_note = f"the --json payload at {args.json_out} is on disk"
+        _emit(sys.stdout, _render_or_say_why(report, args, payload_note=payload_note),
+              label="<stdout>")
     if payload_error:
         # The boot path asks for the payload and trusts it as the evidence, so a run
         # that produced no evidence file refuses the boot rather than reporting
         # whatever rc the checks happened to reach.
-        _emit(sys.stderr, payload_error)
+        _emit(sys.stderr, payload_error, label="<stderr>")
         _emit(sys.stderr, "preflight: the requested evidence payload is missing, so "
-                          "the boot is refused")
+                          "the boot is refused", label="<stderr>")
         return EXIT_ERROR
     return rc
 

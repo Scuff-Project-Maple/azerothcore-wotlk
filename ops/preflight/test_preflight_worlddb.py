@@ -22,6 +22,7 @@ from pathlib import Path
 from preflight_worlddb import (
     MySQL, Preflight, REGION_NAME_STOPWORDS, Report, _ident_parts, _schema_of, mask_sql,
     parse_statement, split_qualified, split_statements, build_arg_parser, write_targets,
+    NO_JSON_PAYLOAD_NOTE,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -4853,13 +4854,21 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 policy.write_text("{}")
                 if json_target == "default":
                     out_path = Path(td) / "verdict.json"
+                    json_arg = str(out_path)
                 elif json_target == "missing-dir":
                     out_path = Path(td) / "no-such-dir" / "verdict.json"
+                    json_arg = str(out_path)
+                elif json_target == "empty":
+                    # `--json ""` as an operator's `GATE_ARGS=(--json "$VAR")` yields it:
+                    # the flag is there, the path is not, so nothing may claim a file.
+                    out_path = Path(td) / "verdict.json"
+                    json_arg = ""
                 else:
                     out_path = None
+                    json_arg = None
                 argv = ["--compose-root", str(tree), "--policy", str(policy)]
-                if out_path is not None:
-                    argv += ["--json", str(out_path)]
+                if json_arg is not None:
+                    argv += ["--json", json_arg]
                 rc = None
                 raised = None
                 try:
@@ -5068,6 +5077,410 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             self.assertEqual(0, proc.returncode,
                              f"a C-locale host could not write the payload: {proc.stderr}")
             self.assertTrue(out.read_bytes().isascii())
+
+
+    # -- what the degraded line claims about the payload (PRO-335 §2) ---------- #
+
+    def test_the_degraded_verdict_says_no_json_payload_was_requested(self):
+        """PRO-325 NB2's shape, one layer up: an absent thing must be said, not `None`d.
+
+        The degraded line used to end `...and the --json payload is unaffected` on every
+        path, including the one where nobody asked for a payload — a claim about a file
+        that does not exist and was never requested. The operator reading a failed boot
+        is the audience; `NO_JSON_PAYLOAD_NOTE` is the single wording for the absent case.
+        """
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="none")
+        text = res.out.decode("ascii")
+        self.assertIn("render() raised RuntimeError", text)
+        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertNotIn("unaffected", text,
+                         "the degraded line still promises a payload nobody asked for")
+        self.assertNotIn("None", text, "the absent payload is rendered as a word, not None")
+
+    def test_the_degraded_verdict_does_not_call_an_unwritten_payload_unaffected(self):
+        """The same sentence on the path that asked for a payload and did not get one."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="missing-dir")
+        self.assertIsNone(res.payload, "fixture: the payload was supposed to fail")
+        text = res.out.decode("ascii")
+        self.assertIn("was NOT written", text)
+        self.assertNotIn("unaffected", text,
+                         "the line that explains the failure also denies the evidence exists")
+
+    def test_the_degraded_verdict_still_points_at_the_payload_it_wrote(self):
+        """Positive control: the truthful claim survives when the payload really is there."""
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True)
+        self.assertIsNotNone(res.payload)
+        text = res.out.decode("ascii")
+        self.assertIn("is on disk", text)
+        self.assertIn("--json payload", text)
+
+    def test_the_degraded_verdict_does_not_call_a_blank_json_target_a_payload(self):
+        """PRO-341 review B1: `--json ""` skips the write, so it may not claim the disk.
+
+        `main()` gated the write on truthiness and this note on `is None`. The wrapper
+        forwards unrecognised operator arguments verbatim, so an operator's
+        `--json "$TARGET"` with a blank `$TARGET` arrives here as an empty path, and
+        that run printed `the --json payload at  is on disk` while nothing was written.
+        Same class as PRO-325 NB2 (an absent thing asserted as present), one layer up,
+        and on the line an operator reads while the boot is being refused.
+
+        The rc is deliberately not pinned here: a blank `--json` still leaves
+        `payload_error` None, so it does not reach the evidence-missing refusal either.
+        That half predates this branch and is tracked separately; pinning `EXIT_FAIL`
+        now would make the follow-up look like a regression when it lands.
+        """
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               render_raises=True, json_target="empty")
+        self.assertIsNone(res.payload, "fixture: a blank --json must write nothing")
+        text = res.out.decode("ascii")
+        self.assertIn("render() raised RuntimeError", text,
+                      "the fixture stopped exercising the degraded line")
+        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertNotIn("on disk", text,
+                         "the line still asserts evidence that was never written")
+        self.assertNotIn("unaffected", text)
+        self.assertNotIn("None", text, "a blank path must not leak as the word None")
+
+
+class TestTheGateHoldsItsOwnRc(unittest.TestCase):
+    """PRO-325 NB1: `_emit` can guard its own flush; nothing guards the interpreter's.
+
+    PRO-325's live re-measure of the PRO-301 fix captured the gate refusing a boot and
+    exiting **120** instead of its own code. The captured bytes for the early-closed
+    pipe, read from `ops/deploy/worldserver-up.sh` (`extraD.stderr`):
+
+        preflight: could not write the report to <stdout>: BrokenPipeError: [Errno 32] Broken pipe
+        Exception ignored in: <_io.TextIOWrapper name='<stdout>' mode='w' encoding='utf-8'>
+        BrokenPipeError: [Errno 32] Broken pipe
+        worldserver-up: REFUSING BOOT — pre-flight failed (exit 120).
+        worldserver-up: ac-worldserver was not started. Fix the named file(s) or escalate
+        to Scuff (SQL); do not bypass this gate.
+
+    and the `/dev/full` shape (`extraB.stderr`):
+
+        preflight: could not write the report to <stdout>: OSError: [Errno 28] No space left on device
+        Exception ignored in: <_io.TextIOWrapper name='<stdout>' mode='w' encoding='utf-8'>
+        OSError: [Errno 28] No space left on device
+
+    `_emit` printed the first line of each and then returned normally, exactly as
+    designed. The second and third lines are CPython: the bytes a refusing device would
+    not take are still in the buffer, `flush_std_files()` tries again during shutdown,
+    and `Py_Exit()` turns a failed final flush into status 120. The wrapper still fails
+    closed — every non-zero rc means refused — so nothing safety-relevant broke; what
+    broke is that the operator is told to go look at an interpreter accident instead of
+    the finding that refused the boot. These run in subprocesses because the status is
+    set by interpreter teardown; no fixture can observe it from inside.
+    """
+
+    @staticmethod
+    def _env():
+        import os
+        return {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+
+    def _run(self, body, **kwargs):
+        import subprocess
+        import sys
+        code = (
+            "import sys;"
+            "sys.path.insert(0, sys.argv[1]);"
+            "import preflight_worlddb as P;"
+            + body
+        )
+        return subprocess.run([sys.executable, "-c", code, str(HERE)], env=self._env(),
+                              capture_output=True, text=True, **kwargs)
+
+    # The real `main()` under a terminal that will not have it. `{stdout_setup}` is the
+    # one thing the two end-to-end pins differ on, so the stub exists once.
+    _MAIN_DRIVER = '''
+        import pathlib
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        import preflight_worlddb as P
+
+
+        class StubPreflight:
+            def __init__(self, args, policy, report):
+                self.args, self.policy, self.report = args, policy, report
+                self.sql_root = pathlib.Path(args.compose_root) / "data" / "sql"
+
+            def run(self):
+                self.report.fail("3", "fixture: refused on purpose",
+                                 file="x.sql", rule="dirty-worktree")
+                return P.EXIT_FAIL
+
+
+        P.Preflight = StubPreflight
+        td = pathlib.Path(sys.argv[2])
+        (td / "tree" / "data" / "sql").mkdir(parents=True)
+        (td / "policy.json").write_text("{{}}")
+        {stdout_setup}
+        sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
+                         str(td / "policy.json"), "--json", str(td / "verdict.json")]))
+    '''
+
+    def _drive_real_main(self, driver, td):
+        import subprocess
+        import sys
+        import textwrap
+        script = Path(td) / "driver.py"
+        script.write_text(textwrap.dedent(driver))
+        return subprocess.run([sys.executable, str(script), str(HERE), str(td)],
+                              env=self._env(), capture_output=True, text=True)
+
+    def test_the_reproduction_is_real_a_refusing_stdout_costs_120_without_the_fix(self):
+        """Negative control, and the PRO-325 capture reproduced rather than restated.
+
+        `_retire_broken_stream` is patched out, which is precisely the build PRO-325
+        measured: the write guard still prints the notice, and the unflushed buffer is
+        still there when the interpreter comes looking. Delete the retirement call from
+        `_emit` and every rc pin below flips to 120. If this one ever exits 1 instead,
+        the fixture has stopped reaching teardown and the pins below pin nothing.
+        """
+        proc = self._run(
+            "sys.stdout = open('/dev/full', 'w');"
+            "P._retire_broken_stream = lambda stream, label: None;"
+            "P._emit(sys.stdout, 'verdict text');"
+            "sys.exit(P.EXIT_FAIL);"
+        )
+        self.assertEqual(120, proc.returncode,
+                         f"the fixture no longer reaches the interpreter's final flush, so "
+                         f"the rc=120 pins in this class prove nothing ({proc.stderr})")
+        self.assertIn("Exception ignored", proc.stderr)
+        self.assertIn("No space left on device", proc.stderr)
+
+    def test_a_full_device_still_exits_the_gates_own_code(self):
+        """PRO-325 NB1 / `extraB`: the guard holds, so the teardown has nothing left to fail on."""
+        import preflight_worlddb as P
+        proc = self._run(
+            "sys.stdout = open('/dev/full', 'w');"
+            "P._emit(sys.stdout, 'verdict text');"
+            "sys.exit(P.EXIT_FAIL);"
+        )
+        self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                         f"a refusing terminal turned the gate's verdict into an interpreter "
+                         f"status: rc={proc.returncode} stderr={proc.stderr}")
+        self.assertIn("could not write the report to /dev/full", proc.stderr)
+        self.assertIn("No space left on device", proc.stderr,
+                      "the notice still has to name what actually went wrong")
+        self.assertNotIn("Exception ignored", proc.stderr,
+                         "the interpreter is still holding bytes for a device that refused them")
+
+    def test_an_early_closed_pipe_still_exits_the_gates_own_code(self):
+        """PRO-325 `extraD`: the wrapper's view. rc 120 reads as an accident, not a verdict."""
+        import os
+        import subprocess
+        import sys
+        import preflight_worlddb as P
+        code = (
+            "import sys;"
+            "sys.path.insert(0, sys.argv[1]);"
+            "import preflight_worlddb as P;"
+            "P._emit(sys.stdout, 'verdict text');"        # the inherited pipe is stdout
+            "sys.exit(P.EXIT_FAIL);"
+        )
+        read_end, write_end = os.pipe()
+        os.close(read_end)                 # the reader is gone before the child starts
+        try:
+            proc = subprocess.Popen([sys.executable, "-c", code, str(HERE)], stdout=write_end,
+                                    stderr=subprocess.PIPE, text=True, env=self._env())
+        finally:
+            os.close(write_end)
+        _, err = proc.communicate()
+        self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                         f"the wrapper can only print REFUSING BOOT — pre-flight failed "
+                         f"(exit {proc.returncode}) on a pipe that closed early: {err}")
+        self.assertIn("BrokenPipeError", err)
+        self.assertIn("could not write the report to", err)
+        self.assertNotIn("Exception ignored", err)
+
+    def test_the_real_main_still_lands_on_a_documented_rc_with_a_refusing_terminal(self):
+        """The end-to-end pin: presentation may fail, the rc contract may not drift.
+
+        `ops/deploy/worldserver-up.sh` treats any non-zero rc as a refusal, so 120 still
+        failed closed. That is why this is diagnosability work and not safety work — but
+        the gate documents three exit codes and a fourth arriving from the interpreter is
+        the difference between `Fix the named file(s)` and a wild goose chase.
+
+        The destination assertion is PRO-341 review N2: `main()` labels the channel it
+        aimed at (`<stdout>`), and that is not the thing the operator has to go and fix.
+        The notice has to name the device that refused, which is `/dev/full` here.
+        """
+        import preflight_worlddb as P
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup='sys.stdout = open("/dev/full", "w")   # terminal refuses us')
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main(driver, td)
+            self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                             f"the gate exited a code it does not document: "
+                             f"rc={proc.returncode} stderr={proc.stderr}")
+            self.assertNotIn("Exception ignored", proc.stderr)
+            self.assertIn("could not write the report to <stdout> (/dev/full)", proc.stderr,
+                          "the notice names a channel, not the destination that refused; "
+                          "an operator cannot act on `<stdout>`")
+            payload = Path(td) / "verdict.json"
+            self.assertTrue(payload.is_file(),
+                            "the evidence still has to survive a terminal that will not take it")
+            self.assertEqual("fail", json.loads(payload.read_bytes().decode("ascii"))["result"])
+
+    def test_the_real_main_names_the_closed_fd_1_it_has_to_report_through(self):
+        """PRO-341 review N4: the production pairing — `main()`'s label plus a `None` stream.
+
+        `1>&-` is the PRO-325 `extraA` shape, and until now the only test of it called
+        `_emit` directly with no label, which is not how `main()` ever calls it. With the
+        label in play the channel is `<stdout>` and the stream object is `None`, so the
+        sentence has to carry both: what was aimed at, and that nothing is attached.
+        """
+        import shlex
+        import subprocess
+        import sys
+        import textwrap
+        import preflight_worlddb as P
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup="pass   # fd 1 was closed by the shell before the interpreter ran")
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "driver.py"
+            script.write_text(textwrap.dedent(driver))
+            shell = (f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+                     f"{shlex.quote(str(HERE))} {shlex.quote(str(td))} 1>&-")
+            proc = subprocess.run(["/bin/sh", "-c", shell], env=self._env(),
+                                  capture_output=True, text=True)
+            self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                             f"a closed fd 1 changed the verdict too: rc={proc.returncode} "
+                             f"stderr={proc.stderr}")
+            self.assertNotIn("Exception ignored", proc.stderr)
+            self.assertNotIn("report to None", proc.stderr,
+                             "the operator is reading the word None where a destination belongs")
+            self.assertIn("could not write the report to <stdout> (nothing is attached to it)",
+                          proc.stderr,
+                          "the production line must say both what was aimed at and what is "
+                          "missing; fd 2 is how the notice still gets out")
+            self.assertTrue((Path(td) / "verdict.json").is_file(),
+                            "the evidence still has to survive a terminal that is not there")
+
+    def test_a_closed_fd_1_is_named_instead_of_rendered_as_none(self):
+        """PRO-325 NB2 (`extraA`): `1>&-` leaves `sys.stdout` None, and `repr(None)` is 'None'.
+
+        The captured line was
+        `preflight: could not write the report to None: AttributeError: 'NoneType' object
+        has no attribute 'write'` — the one sentence an operator reads under a failed boot
+        describing its own destination as `None`. The guard that was supposed to name the
+        stream never fired, because `repr()` always returns something truthy.
+        """
+        import shlex
+        import subprocess
+        import sys
+        body = ("P._emit(sys.stdout, 'verdict text');"
+                "sys.exit(P.EXIT_FAIL);")
+        code = ("import sys;"
+                "sys.path.insert(0, sys.argv[1]);"
+                "import preflight_worlddb as P;" + body)
+        shell = (f"exec {shlex.quote(sys.executable)} -c {shlex.quote(code)} "
+                 f"{shlex.quote(str(HERE))} 1>&-")
+        proc = subprocess.run(["/bin/sh", "-c", shell], env=self._env(),
+                              capture_output=True, text=True)
+        self.assertEqual(1, proc.returncode,
+                         f"a closed fd 1 changed the exit code too: {proc.stderr}")
+        self.assertIn("could not write the report to", proc.stderr)
+        self.assertNotIn("report to None", proc.stderr,
+                         "the operator is reading the word None where a destination belongs")
+        self.assertIn("nothing is attached to it", proc.stderr)
+
+    # -- the mechanism itself -------------------------------------------------- #
+
+    def test_a_retired_stream_cannot_raise(self):
+        """Whatever is left holding the interpreter's attention must be inert."""
+        import preflight_worlddb as P
+        retired = P._RetiredStream("<stdout>")
+        self.assertEqual(3, retired.write("abc"))
+        self.assertIsNone(retired.flush())
+        self.assertIsNone(retired.close())
+        self.assertIsNone(retired.writelines(["a", "b"]))
+        self.assertFalse(retired.isatty())
+        self.assertTrue(getattr(retired, "closed", False),
+                        "flush_std_files() skips a stream that reports itself closed; "
+                        "without this the rc guarantee rests only on flush() staying inert")
+        self.assertEqual("<stdout>", retired.name)
+        self.assertEqual("utf-8", retired.encoding)
+        for name in ("encoding", "errors"):
+            self.assertIsNotNone(getattr(retired, name),
+                                 f"a late third-party write reaches {name} at teardown")
+
+    def test_retiring_rebinds_the_interpreters_stream_and_never_raises(self):
+        """`closed` is a property of the stream class, so rebinding is the durable half."""
+        import sys
+        import preflight_worlddb as P
+
+        class Angry:
+            name = "<stdout>"
+            encoding = "utf-8"
+
+            def flush(self):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                raise OSError(28, "No space left on device")
+
+        angry = Angry()
+        original = sys.stdout
+        try:
+            sys.stdout = angry
+            P._retire_broken_stream(angry, "<stdout>")
+            self.assertIsInstance(sys.stdout, P._RetiredStream,
+                                  "the interpreter still holds the stream that refused us")
+            sys.stdout.write("late write")
+            sys.stdout.flush()
+        finally:
+            sys.stdout = original
+
+    def test_the_label_names_the_destination_and_never_says_none(self):
+        """`_stream_label` is the whole of PRO-325 NB2, so pin its three shapes."""
+        import preflight_worlddb as P
+
+        class Named:
+            name = "/dev/full"
+
+        class Anonymous:
+            pass
+
+        self.assertEqual("/dev/full", P._stream_label(Named()))
+        anon = Anonymous()
+        self.assertIn("Anonymous", P._stream_label(anon),
+                      "a stream with no name has to be identified by what it is")
+        label = P._stream_label(None)
+        self.assertNotEqual("None", label)
+        self.assertNotIn("None", label)
+        self.assertIn("not open", label)
+
+    def test_the_note_and_the_label_are_call_site_obligations(self):
+        """PRO-341 review N1 + N5: neither sentence may be defaulted at the callee.
+
+        `label` used to be `_emit`'s third positional and `payload_note` used to default
+        to a claim about a payload nobody had checked. Both defaults let a caller stay
+        silent and still print something authoritative about a destination. Keyword-only
+        is what forces the caller to state what it means; `payload_note` is additionally
+        required, because `main()` is the only caller and it always knows the truth.
+        """
+        import inspect
+        import preflight_worlddb as P
+
+        label_param = inspect.signature(P._emit).parameters["label"]
+        self.assertIs(inspect.Parameter.KEYWORD_ONLY, label_param.kind,
+                      "a positional label invites a caller to pass the stream twice "
+                      "and mean something else entirely")
+        with self.assertRaises(TypeError):
+            P._emit(None, "verdict text", "<stdout>")
+
+        note_param = inspect.signature(P._render_or_say_why).parameters["payload_note"]
+        self.assertIs(inspect.Parameter.KEYWORD_ONLY, note_param.kind)
+        self.assertIs(inspect.Parameter.empty, note_param.default,
+                      "a defaulted payload note is how PRO-341 B1 got written")
+        with self.assertRaises(TypeError):
+            P._render_or_say_why(object(), object())
+        with self.assertRaises(TypeError):
+            P._render_or_say_why(object(), object(), "the --json payload at  is on disk")
 
 
 class TestTheGateCompilesQuietly(unittest.TestCase):
