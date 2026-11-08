@@ -3988,11 +3988,17 @@ def _retire_broken_stream(stream, label: str) -> None:
     sets one. Never raise — this runs from inside a failure handler.
 
     Closing stdout is only safe because CPython builds the std streams with
-    `closefd=False`: measured on 3.12.3, `sys.stdout.buffer.raw.closefd` is False and
-    `os.fstat(1)` still succeeds after `sys.stdout.close()`. That is what lets the two
-    stderr notices `main()` emits afterwards still reach a live fd 2 under
-    `> /dev/full 2>&1`, where fd 2 *is* fd 1. Load-bearing, and invisible here — if a
-    future interpreter ever builds them with `closefd=True`, retiring must stop closing.
+    `closefd=False`, and what that buys is descriptor hygiene, not notice delivery.
+    Measured on 3.12.3 with fd 1 on `/dev/full`: with `closefd=False` the close leaves
+    `os.fstat(1)` succeeding and the next `os.open()` returns fd 3; with `closefd=True`
+    the same close leaves `os.fstat(1)` failing `EBADF` and **the next `os.open()` reuses
+    fd 1**, so the `--json` payload or any later probe would be written straight into the
+    descriptor the gate just retired. That reuse is why retiring may close at all. It is
+    *not* what delivers the two stderr notices `main()` emits afterwards — with fd 2 on a
+    live pipe they arrive whether or not fd 1 was really closed, and under the literal
+    `> /dev/full 2>&1` they get nowhere either way, because fd 2 is then a dup of the same
+    file description. Load-bearing, and invisible here — if a future interpreter ever
+    builds the std streams with `closefd=True`, retiring must stop closing.
     """
     for method in ("flush", "close"):
         try:

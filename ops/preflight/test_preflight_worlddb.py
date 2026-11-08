@@ -5292,6 +5292,94 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                           "a descriptor that is not open is a 'cannot help' answer, and must "
                           "not raise out of a failure handler")
 
+    def test_a_channel_named_stream_with_no_descriptor_gets_no_repeated_parenthetical(self):
+        r"""PRO-350 review NB1: the `real != name` half of `_emit`'s guard, pinned in-process.
+
+        `if real and real != name:` has two halves and only one of them had a test behind
+        it. PRO-350 review deleted `real != name` and the suite stayed at baseline, which is
+        how a documented behaviour shipped with nothing defending it: `_emit`'s own docstring
+        says "Say it only when it adds something", and `ops/preflight/README.md` says the
+        parenthetical "has to earn its place" by naming somewhere the operator can go fix.
+
+        Which half this pins, precisely. `_emit` can learn the destination two ways, and
+        only one of them can produce `real == name`:
+
+        - the descriptor answers, so `real` is a path the label is not -> the `real and`
+          half decides, and the parenthetical is wanted. Pinned end-to-end through `real
+          main()` by `test_a_shell_redirected_full_device_is_named_from_the_descriptor`
+          (a real `> /dev/full`) and, for the anonymous-inode answer, by
+          `test_a_shell_redirected_broken_pipe_stays_unnamed`.
+        - the object's answer is a channel name and there is no descriptor to ask, so
+          `_stream_destination` falls back to that same string -> `real == name`, and
+          `real != name` is the only thing standing between the operator and
+          `<stdout> (<stdout>)`. That is the case with no sentence after it: a stand-in
+          carrying the literal name CPython stamps on fd 1 and no callable `fileno`, which
+          is what `_emit` holds when the destination is genuinely unknown.
+
+        So the fixture is deliberately *not* given a `fileno`. Measured under exactly that
+        mutation (`if real and real != name:` -> `if real:`) this pin goes red, together with
+        `test_a_shell_redirected_broken_pipe_stays_unnamed` — but that one fails on its
+        `could not write the report to <stdout>: BrokenPipeError` prefix assertion, which is
+        collateral on the operator's wording rather than a claim about the guard. This is the
+        pin that asserts the suppression decision itself, in-process, with the descriptor
+        path deliberately unavailable so nothing else can be responsible for the answer.
+        """
+        import sys
+        import preflight_worlddb as P
+
+        class InheritedChannelName:
+            """`sys.stdout`'s shape when the destination cannot be recovered.
+
+            `name` is the literal CPython stamps on the std streams regardless of what the
+            shell did to fd 1 (PRO-354), and the absence of `fileno` is the point: it is the
+            shape that forces `_stream_destination` to answer with the object's own words,
+            which is the only shape where the two sides of the guard can be equal.
+            """
+
+            name = "<stdout>"
+            encoding = "utf-8"
+
+            def write(self, s):
+                raise OSError(28, "No space left on device")
+
+            def flush(self):
+                return None
+
+        class Capture:
+            """Stand-in for `sys.__stderr__`, which is where `_emit` names the failure."""
+
+            def __init__(self):
+                self.lines = []
+
+            def write(self, s):
+                self.lines.append(s)
+                return len(s)
+
+            def flush(self):
+                return None
+
+        fallback = Capture()
+        original = sys.__stderr__
+        try:
+            sys.__stderr__ = fallback
+            P._emit(InheritedChannelName(), "verdict text", label="<stdout>")
+        finally:
+            sys.__stderr__ = original
+
+        self.assertEqual(1, len(fallback.lines),
+                         f"`_emit` owes exactly one fallback line, got {fallback.lines}")
+        note = fallback.lines[0]
+        self.assertIn("could not write the report to <stdout>: ", note,
+                      f"the suppression half regressed, or the notice lost the channel it "
+                      f"was aimed at: {note!r}")
+        self.assertNotIn("<stdout> (<stdout>)", note,
+                         "the parenthetical repeated the label, which is the noise "
+                         "PRO-341 review N2's 'say it only when it adds something' rule "
+                         "and the `real != name` half of the guard exist to prevent")
+        self.assertIn("OSError", note)
+        self.assertIn("No space left on device", note,
+                      "suppressing the destination must not cost the errno")
+
     def test_the_note_and_the_label_are_call_site_obligations(self):
         """PRO-341 review N1 + N5: neither sentence may be defaulted at the callee.
 
