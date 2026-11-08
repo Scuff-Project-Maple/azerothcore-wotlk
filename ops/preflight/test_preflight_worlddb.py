@@ -5230,6 +5230,28 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         return subprocess.run([sys.executable, str(script), str(HERE), str(td)],
                               env=self._env(), capture_output=True, text=True)
 
+    def _drive_real_main_through_shell(self, driver, td, redirect):
+        """Run the real `main()` with fd 1 set up by the shell, not by the child.
+
+        PRO-354 is the reason this exists rather than another `sys.stdout = open(...)`
+        fixture. Rebinding inside the child hands `main()` an object whose `name` really is
+        `/dev/full`, so it exercises the object-naming half of `_emit` and nothing else; an
+        operator reaches the state by redirecting descriptor 1 before the interpreter is
+        built, which leaves `sys.stdout.name` as the literal `<stdout>`. Two fixtures, two
+        code paths, and only the one that never happens in the field was ever pinned. Both
+        destination shapes pinned below go through here so they cannot drift apart again.
+        """
+        import shlex
+        import subprocess
+        import sys
+        import textwrap
+        script = Path(td) / "driver.py"
+        script.write_text(textwrap.dedent(driver))
+        shell = (f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+                 f"{shlex.quote(str(HERE))} {shlex.quote(str(td))} {redirect}")
+        return subprocess.run(["/bin/sh", "-c", shell], env=self._env(),
+                              capture_output=True, text=True)
+
     def test_the_reproduction_is_real_a_refusing_stdout_costs_120_without_the_fix(self):
         """Negative control, and the PRO-325 capture reproduced rather than restated.
 
@@ -5333,20 +5355,11 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         label in play the channel is `<stdout>` and the stream object is `None`, so the
         sentence has to carry both: what was aimed at, and that nothing is attached.
         """
-        import shlex
-        import subprocess
-        import sys
-        import textwrap
         import preflight_worlddb as P
         driver = self._MAIN_DRIVER.format(
             stdout_setup="pass   # fd 1 was closed by the shell before the interpreter ran")
         with tempfile.TemporaryDirectory() as td:
-            script = Path(td) / "driver.py"
-            script.write_text(textwrap.dedent(driver))
-            shell = (f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
-                     f"{shlex.quote(str(HERE))} {shlex.quote(str(td))} 1>&-")
-            proc = subprocess.run(["/bin/sh", "-c", shell], env=self._env(),
-                                  capture_output=True, text=True)
+            proc = self._drive_real_main_through_shell(driver, td, "1>&-")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"a closed fd 1 changed the verdict too: rc={proc.returncode} "
                              f"stderr={proc.stderr}")
@@ -5359,6 +5372,83 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                           "missing; fd 2 is how the notice still gets out")
             self.assertTrue((Path(td) / "verdict.json").is_file(),
                             "the evidence still has to survive a terminal that is not there")
+
+    def test_a_shell_redirected_full_device_is_named_from_the_descriptor(self):
+        """PRO-354: the operator's real `> /dev/full`, not an `open()` stand-in.
+
+        The PRO-341 pin above reaches `/dev/full` by rebinding `sys.stdout` inside the child,
+        and that object's `name` is `/dev/full`, so it pins only the object-naming half of
+        `_emit`. Under a shell redirect the interpreter inherited an already-redirected
+        descriptor and still calls the stream `<stdout>`, so `_emit` compared `<stdout>` with
+        `<stdout>`, concluded the parenthetical "repeats the label", and dropped the one word
+        the sentence exists to carry:
+
+            preflight: could not write the report to <stdout>: OSError: [Errno 28] ...
+
+        The rc contract and the payload were untouched, which is what makes this survive
+        review — an operator reading `<stdout>` goes looking at their terminal instead of at
+        the full device. Ask the descriptor when the object cannot help.
+        """
+        import preflight_worlddb as P
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup="pass   # fd 1 was redirected by the shell, so the object cannot "
+                         "help and the descriptor has to answer")
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full")
+            self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                             f"the gate exited a code it does not document: "
+                             f"rc={proc.returncode} stderr={proc.stderr}")
+            self.assertNotIn("Exception ignored", proc.stderr,
+                             "the interpreter is still holding bytes for a device that refused them")
+            self.assertIn("could not write the report to <stdout> (/dev/full)", proc.stderr,
+                          "the device that refused the boot is never named, so the sentence "
+                          "reads like any other stdout failure")
+            self.assertNotIn("report to None", proc.stderr)
+            payload = Path(td) / "verdict.json"
+            self.assertTrue(payload.is_file(),
+                            "the evidence still has to survive a terminal that will not take it")
+            self.assertEqual("fail", json.loads(payload.read_bytes().decode("ascii"))["result"])
+
+    def test_a_shell_redirected_broken_pipe_stays_unnamed(self):
+        """PRO-341 review N2 has to survive the descriptor path: an inode is not a destination.
+
+        `/proc/self/fd/1` answers `pipe:[123456]` for a pipe, and PRO-354's fix asks the
+        descriptor precisely when the object is silent — so without the anonymous-inode
+        filter (the absolute-path test in `_descriptor_destination`) every early-closed pipe
+        would start printing `(<stdout> (pipe:[123456]))`, an inode number nobody can go and
+        fix, and the `extraD` wording the deploy path's operator recognises would change under
+        them. `main()`'s label is in play here (the PRO-325 pin calls `_emit` without one),
+        which is the pairing that could regress.
+        """
+        import os
+        import subprocess
+        import sys
+        import textwrap
+        import preflight_worlddb as P
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup="pass   # fd 1 is an inherited pipe whose reader went away")
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "driver.py"
+            script.write_text(textwrap.dedent(driver))
+            read_end, write_end = os.pipe()
+            os.close(read_end)                # the reader is gone before the child starts
+            try:
+                proc = subprocess.Popen([sys.executable, str(script), str(HERE), str(td)],
+                                        stdout=write_end, stderr=subprocess.PIPE, text=True,
+                                        env=self._env())
+            finally:
+                os.close(write_end)
+            _, err = proc.communicate()
+            self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                             f"a pipe that closed early changed the verdict too: "
+                             f"rc={proc.returncode} stderr={err}")
+            self.assertIn("could not write the report to <stdout>: BrokenPipeError", err,
+                          "the wrapper's wording for an early-closed pipe has to stay put")
+            self.assertNotIn("pipe:[", err,
+                             "the descriptor path leaked an inode number into a sentence that "
+                             "is supposed to name somewhere fixable")
+            self.assertNotIn("Exception ignored", err)
+            self.assertTrue((Path(td) / "verdict.json").is_file())
 
     def test_a_closed_fd_1_is_named_instead_of_rendered_as_none(self):
         """PRO-325 NB2 (`extraA`): `1>&-` leaves `sys.stdout` None, and `repr(None)` is 'None'.
@@ -5453,6 +5543,155 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         self.assertNotEqual("None", label)
         self.assertNotIn("None", label)
         self.assertIn("not open", label)
+
+    def test_the_descriptor_is_asked_only_when_the_object_cannot_name_the_destination(self):
+        """PRO-354: the four answers `_stream_destination` may give, and when each is correct.
+
+        `_stream_label` asks the Python object; that is right for a stream Python opened and
+        wrong for a descriptor the shell redirected first. The pair of helpers is the fix, so
+        the seam between them is what needs pinning — including the two shapes where the
+        descriptor must *not* win, because a wrong destination is worse than a vague one.
+        """
+        import os
+        import preflight_worlddb as P
+
+        class Opened:
+            name = "/dev/full"          # what an in-process open() produces
+
+        class Inherited:
+            name = "<stdout>"           # what CPython stamps on fd 1 whatever the shell did
+            fd = None
+
+            def fileno(self):
+                return self.fd
+
+        class NoDescriptor:
+            name = "<stdout>"           # a stand-in with nothing to ask
+
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "report.txt"
+            target.write_text("x")
+            real = os.path.realpath(str(target))
+            fd = os.open(real, os.O_RDONLY)
+            try:
+                self.assertEqual(real, P._descriptor_destination(fd),
+                                  "a redirected regular file is nameable only from the fd")
+                named = Inherited()
+                named.fd = fd
+                self.assertEqual(real, P._stream_destination(named),
+                                  "the operator's `> file` has to be named, not `<stdout>`")
+            finally:
+                os.close(fd)
+
+            self.assertEqual("/dev/full", P._stream_destination(Opened()),
+                             "a stream that already names itself must not be second-guessed")
+            self.assertEqual("<stdout>", P._stream_destination(NoDescriptor()),
+                             "a stream with no descriptor is back to what its object can say")
+
+            read_end, write_end = os.pipe()
+            try:
+                self.assertIsNone(P._descriptor_destination(write_end),
+                                  "`pipe:[123]` is an inode number, not somewhere to go fix")
+                anonymous = Inherited()
+                anonymous.fd = write_end
+                self.assertEqual("<stdout>", P._stream_destination(anonymous),
+                                  "an anonymous descriptor leaves the wording exactly as "
+                                  "PRO-341 review N2 settled it")
+            finally:
+                os.close(read_end)
+                os.close(write_end)
+
+        self.assertIsNone(P._descriptor_destination(1 << 20),
+                          "a descriptor that is not open is a 'cannot help' answer, and must "
+                          "not raise out of a failure handler")
+
+    def test_a_channel_named_stream_with_no_descriptor_gets_no_repeated_parenthetical(self):
+        r"""PRO-350 review NB1: the `real != name` half of `_emit`'s guard, pinned in-process.
+
+        `if real and real != name:` has two halves and only one of them had a test behind
+        it. PRO-350 review deleted `real != name` and the suite stayed at baseline, which is
+        how a documented behaviour shipped with nothing defending it: `_emit`'s own docstring
+        says "Say it only when it adds something", and `ops/preflight/README.md` says the
+        parenthetical "has to earn its place" by naming somewhere the operator can go fix.
+
+        Which half this pins, precisely. `_emit` can learn the destination two ways, and
+        only one of them can produce `real == name`:
+
+        - the descriptor answers, so `real` is a path the label is not -> the `real and`
+          half decides, and the parenthetical is wanted. Pinned end-to-end through `real
+          main()` by `test_a_shell_redirected_full_device_is_named_from_the_descriptor`
+          (a real `> /dev/full`) and, for the anonymous-inode answer, by
+          `test_a_shell_redirected_broken_pipe_stays_unnamed`.
+        - the object's answer is a channel name and there is no descriptor to ask, so
+          `_stream_destination` falls back to that same string -> `real == name`, and
+          `real != name` is the only thing standing between the operator and
+          `<stdout> (<stdout>)`. That is the case with no sentence after it: a stand-in
+          carrying the literal name CPython stamps on fd 1 and no callable `fileno`, which
+          is what `_emit` holds when the destination is genuinely unknown.
+
+        So the fixture is deliberately *not* given a `fileno`. Measured under exactly that
+        mutation (`if real and real != name:` -> `if real:`) this pin goes red, together with
+        `test_a_shell_redirected_broken_pipe_stays_unnamed` — but that one fails on its
+        `could not write the report to <stdout>: BrokenPipeError` prefix assertion, which is
+        collateral on the operator's wording rather than a claim about the guard. This is the
+        pin that asserts the suppression decision itself, in-process, with the descriptor
+        path deliberately unavailable so nothing else can be responsible for the answer.
+        """
+        import sys
+        import preflight_worlddb as P
+
+        class InheritedChannelName:
+            """`sys.stdout`'s shape when the destination cannot be recovered.
+
+            `name` is the literal CPython stamps on the std streams regardless of what the
+            shell did to fd 1 (PRO-354), and the absence of `fileno` is the point: it is the
+            shape that forces `_stream_destination` to answer with the object's own words,
+            which is the only shape where the two sides of the guard can be equal.
+            """
+
+            name = "<stdout>"
+            encoding = "utf-8"
+
+            def write(self, s):
+                raise OSError(28, "No space left on device")
+
+            def flush(self):
+                return None
+
+        class Capture:
+            """Stand-in for `sys.__stderr__`, which is where `_emit` names the failure."""
+
+            def __init__(self):
+                self.lines = []
+
+            def write(self, s):
+                self.lines.append(s)
+                return len(s)
+
+            def flush(self):
+                return None
+
+        fallback = Capture()
+        original = sys.__stderr__
+        try:
+            sys.__stderr__ = fallback
+            P._emit(InheritedChannelName(), "verdict text", label="<stdout>")
+        finally:
+            sys.__stderr__ = original
+
+        self.assertEqual(1, len(fallback.lines),
+                         f"`_emit` owes exactly one fallback line, got {fallback.lines}")
+        note = fallback.lines[0]
+        self.assertIn("could not write the report to <stdout>: ", note,
+                      f"the suppression half regressed, or the notice lost the channel it "
+                      f"was aimed at: {note!r}")
+        self.assertNotIn("<stdout> (<stdout>)", note,
+                         "the parenthetical repeated the label, which is the noise "
+                         "PRO-341 review N2's 'say it only when it adds something' rule "
+                         "and the `real != name` half of the guard exist to prevent")
+        self.assertIn("OSError", note)
+        self.assertIn("No space left on device", note,
+                      "suppressing the destination must not cost the errno")
 
     def test_the_note_and_the_label_are_call_site_obligations(self):
         """PRO-341 review N1 + N5: neither sentence may be defaulted at the callee.

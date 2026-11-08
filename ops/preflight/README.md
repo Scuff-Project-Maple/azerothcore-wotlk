@@ -126,6 +126,17 @@ becomes when `$TARGET` is blank, since the wrapper forwards unrecognised argumen
 payload requested, not a payload sitting at an empty path (PRO-341 review B1). And the refusal names the destination an operator can act on: `_emit()` adds what
 the stream actually is, so a full device reads `could not write the report to <stdout> (/dev/full)` and
 a closed fd 1 reads `<stdout> (nothing is attached to it)` (PRO-341 review N2, N4).
+"what the stream actually is" has two sources, and PRO-354 is the lesson that they are not
+interchangeable. `_stream_label()` asks the Python object, which works for a stream Python opened
+(`open("/dev/full", "w").name` really is `/dev/full`) and is worthless for a descriptor the shell
+redirected before the interpreter started — on 3.12.3 `sys.stdout.name` is still the literal
+`<stdout>` under `> /dev/full`, so the two compared equal, the parenthetical was suppressed as noise,
+and the device name never appeared. `_stream_destination()` therefore falls back to
+`os.readlink("/proc/self/fd/N")` when the object's answer is one of the interpreter's own channel
+names. An anonymous descriptor (`pipe:[…]`, `socket:[…]`) is not a place anyone can go and fix, so it
+stays unnamed and an early-closed pipe still reads plain `<stdout>`; a host without `/proc` gets the
+old wording rather than a guess. Both destination shapes are pinned through a real shell redirect, not
+an `open()` stand-in, so the two paths cannot drift apart again.
 
 ### The third tag: the tracked upstream ref (PRO-248)
 
