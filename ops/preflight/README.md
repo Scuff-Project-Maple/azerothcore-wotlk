@@ -100,10 +100,26 @@ Escaping the codec is not the whole of it, though. **Evidence before presentatio
 B1): `main()` writes the `--json` payload *first* and prints afterwards, and each half is held apart
 from the other. `_emit()` guards the whole body including `flush()`, naming a refused write on the
 fallback stream instead of raising — a pipe closed early is not a verdict; `_render_or_say_why()`
-degrades to listing the findings if `render()` itself blows up; and a payload we cannot write refuses
-the boot with `EXIT_ERROR` rather than letting it through on the checks' own rc. The rule behind all
-three: the payload is the half nobody can regenerate once the scratch schema is dropped, and the
-terminal echo is the half you can re-derive by re-running. `main()` still carries no bare `print()`.
+degrades to listing the findings if `render()` itself blows up, and that degraded listing is
+itself a guard, so it is held to the rule it exists to enforce: no line of it may raise back into
+`main()`. A report that raises while it is being read still prints the two-line
+`PRO-179 … / RESULT: …` header instead of losing the verdict (PRO-324 NB1). The same line names the
+payload's actual outcome — on disk, not requested, or not written — because `main()` hands the
+renderer the claim it actually proved, as the required keyword-only `payload_note`; the renderer
+derives nothing about the payload it did not write (PRO-324 NB2, closed on the integration line by
+PRO-335 §2 and PRO-341 review N1). The dictionary behind that payload is built *inside* the same
+guard as the write, so a report the terminal can still read but the evidence half cannot
+(`report.data`, `report.sections`, a finding with no readable `__dict__`) becomes a named
+evidence-write failure rather than a traceback out of `main()` (PRO-339 review NB-Rev-2). And a
+payload we cannot write refuses the boot with `EXIT_ERROR` rather than letting it through on the
+checks' own rc — which bites only an operator who asked for `--json`, since the shipped wrapper does
+not pass it (PRO-324 NB4). A finding with no `rule` prints no `None:` in front of its message, on
+either path (PRO-324 NB5). The rule behind all of it: the payload is the half nobody can regenerate
+once the scratch schema is dropped, and the terminal echo is the half you can re-derive by re-running.
+Because that ordering is the last line of defence, the suite does not accept a mere `is_file()` at
+presentation time — the ordering pin reads the bytes that are on disk when the presentation half runs
+and requires them to equal the final payload (PRO-339 review NB-Rev-1): *complete* before
+presentation, not merely *present*. `main()` still carries no bare `print()`.
 
 Guarding the write is not the end of the guard, though (PRO-325 NB1, PRO-335). The bytes a refusing
 device would not take are still sitting in the stream's buffer when `main()` returns, and CPython
