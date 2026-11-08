@@ -121,9 +121,18 @@ interpreter teardown is not observable from inside a fixture. The same class pin
 observation: with fd 1 closed, `sys.stdout` is `None` and the old label printed the word `None` where
 a destination belongs; an absent thing is now named as absent, including on the degraded render line,
 which says "no --json payload requested" rather than claiming a payload nobody asked for.
-That last sentence is decided on truthiness, so `--json ""` — what an operator's `--json "$TARGET"`
-becomes when `$TARGET` is blank, since the wrapper forwards unrecognised arguments verbatim — is no
-payload requested, not a payload sitting at an empty path (PRO-341 review B1). And the refusal names the destination an operator can act on: `_emit()` adds what
+That degraded line draws from **three** wordings, and all three are decided by one predicate in
+`main()` (PRO-352, Core's PRO-355 contract A): never requested → `NO_JSON_PAYLOAD_NOTE`;
+requested but blank → `BLANK_JSON_TARGET_NOTE`; requested but unwritable → "the --json payload at
+X was NOT written". The write attempt and the evidence-missing refusal read the same
+`payload_requested = args.json_out is not None`, so they cannot disagree about whether evidence was
+asked for. Blankness is `args.json_out.strip()` — not truthiness, and not `== ""` — so `--json ""`
+and `--json "   "`, what an operator's `--json "$TARGET"` becomes when `$TARGET` is blank because
+the wrapper forwards unrecognised arguments verbatim, are *requested* payloads that touch no
+filesystem at all and take the evidence-missing refusal at `EXIT_ERROR`. A gate that tested the flag
+for truth instead would accept the whitespace target, since `Path("   ").write_text` succeeds, and
+boot on a file literally named `   ` (PRO-341 review B1, closed by PRO-352 — do not restore the
+truthiness test to match older prose). And the refusal names the destination an operator can act on: `_emit()` adds what
 the stream actually is, so a full device reads `could not write the report to <stdout> (/dev/full)` and
 a closed fd 1 reads `<stdout> (nothing is attached to it)` (PRO-341 review N2, N4).
 "what the stream actually is" has two sources, and PRO-354 is the lesson that they are not

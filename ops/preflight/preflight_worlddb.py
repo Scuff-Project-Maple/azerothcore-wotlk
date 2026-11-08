@@ -3915,7 +3915,10 @@ NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
 # two lines before stderr says "the requested evidence payload is missing". Prefix
 # `preflight: ` at the standalone stderr emit; the bare sentence is shared with the
 # degraded stdout note. Blank by `strip()`, not `== ""`: a whitespace-only target is the
-# same family and the worse bug, because a real write with it would succeed.
+# same family and the worse bug, because a real write with it would succeed. `strip()` is
+# Unicode, not ASCII, so Core's PRO-355 §2 "all-whitespace target" here includes spellings
+# a POSIX filename would legally allow — `--json $'\u00a0'` is refused as blank on purpose.
+# Refusing the safe direction is the decision; do not "fix" it into a false positive.
 BLANK_JSON_TARGET_NOTE = "the --json target is blank; pass a path or omit the flag"
 
 # Names that identify the *channel* rather than the destination, so a comparison against
@@ -4234,7 +4237,10 @@ def _render_or_say_why(report: Report, args, *, payload_note: str) -> str:
     payload we could not write, the degraded line must not say the payload is fine; not
     asked for one at all, it must not imply one exists (PRO-325 NB2's shape again — an
     absent thing rendered as a bare `None`). `NO_JSON_PAYLOAD_NOTE` is the single
-    wording for the absent case so this line and any future one cannot drift apart.
+    wording for the absent case so this line and any future one cannot drift apart. It is
+    not the only wording this consumes: a requested-but-blank target arrives as its sibling
+    `BLANK_JSON_TARGET_NOTE` (PRO-352), never as `NO_JSON_PAYLOAD_NOTE`, which would tell the
+    operator nobody asked for evidence while stderr refuses the boot for lacking it.
 
     Which is why the parameter is required and keyword-only (PRO-341 review N1). It used
     to default to `None` and derive its own wording when nobody passed one — a branch no

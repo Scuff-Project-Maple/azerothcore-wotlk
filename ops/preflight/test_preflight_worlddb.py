@@ -4503,6 +4503,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         caused finding B in the first place (PRO-313 review B1). This drives the real
         function and measures both halves.
         """
+        import os
         import sys
         import types
         import preflight_worlddb as P
@@ -4555,7 +4556,10 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                     # write with this argument *succeeds* and drops a file literally
                     # named `   ` in the cwd, so a gate that only tests `== ""` would
                     # boot on it. `out_path` stays None — there is no legitimate file to
-                    # look for; the pin asserts the boot is refused and nothing is claimed.
+                    # look for. The proof is `leftovers`: the drive runs in an empty
+                    # scratch cwd, so a truthiness gate leaves `   ` in that directory and
+                    # the pin fails on a non-empty listing rather than on a `None` that was
+                    # fixed by construction.
                     out_path = None
                     json_arg = "   "
                 else:
@@ -4564,20 +4568,37 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 argv = ["--compose-root", str(tree), "--policy", str(policy)]
                 if json_arg is not None:
                     argv += ["--json", json_arg]
+                # Run the drive inside an empty scratch cwd. Everything `main()` is handed
+                # here is absolute, so no case depends on the process cwd — which is the
+                # point: a stray relative write has nowhere to land except this directory,
+                # where `leftovers` can see it. Without this the whitespace pin's
+                # "wrote no junk file" assertion is a tautology, because `out_path` is
+                # already None for that case and a real `   ` file would simply appear in
+                # the repo unnoticed (PRO-361 NB1).
+                scratch = Path(td) / "cwd"
+                scratch.mkdir()
+                cwd_before = os.getcwd()
                 rc = None
                 raised = None
+                leftovers = None
                 try:
-                    rc = P.main(argv)
-                except BaseException as exc:      # a fixture may raise one on purpose
-                    if not expect_raises:
-                        raise
-                    raised = type(exc).__name__
+                    os.chdir(scratch)
+                    try:
+                        rc = P.main(argv)
+                    except BaseException as exc:  # a fixture may raise one on purpose
+                        if not expect_raises:
+                            raise
+                        raised = type(exc).__name__
+                finally:
+                    os.chdir(cwd_before)
+                leftovers = sorted(p.name for p in scratch.iterdir())
                 payload = None
                 if out_path is not None and out_path.is_file():
                     payload = out_path.read_bytes()
         finally:
             P.Preflight, P.render, sys.stdout, sys.stderr, sys.__stderr__ = original
         return types.SimpleNamespace(rc=rc, raised=raised, payload=payload,
+                                      leftovers=leftovers,
                                       out=stdout.value(), err=stderr.value(),
                                       fallback=fallback.value())
 
@@ -4864,6 +4885,8 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                json_target="empty")
+        self.assertEqual([], res.leftovers,
+                         "a blank --json must not touch the filesystem at all")
         self.assertIsNone(res.payload, "a blank --json must write nothing")
         err = res.err.decode("ascii")
         self.assertIn(BLANK_JSON_TARGET_NOTE, err)
@@ -4884,6 +4907,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                json_target="whitespace")
+        # The headline assertion has to be able to fail. `res.payload` is None by
+        # construction for this case, so it proves nothing on its own; the scratch cwd
+        # the drive runs in is what actually witnesses "no junk file" (PRO-361 NB1).
+        self.assertEqual([], res.leftovers,
+                         "a whitespace-only target must write no junk file — a `   ` in the "
+                         "scratch cwd means the write was attempted and succeeded")
         self.assertIsNone(res.payload, "a whitespace-only target must write no junk file")
         err = res.err.decode("ascii")
         self.assertIn(BLANK_JSON_TARGET_NOTE, err)
