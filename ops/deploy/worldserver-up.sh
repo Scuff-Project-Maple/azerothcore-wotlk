@@ -169,7 +169,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-dry-run|--no-dry*|--no-copy-data|--no-copy*)
       tell "WARNING — $arg skips check 5 (the updater dry run on a scratch clone)."
-      tell "                  That is the documented restart fast path; do not use it after a SQL change."
+      tell "That is the documented restart fast path; do not use it after a SQL change."
       GATE_ARGS+=("$arg")
       shift
       ;;
@@ -279,20 +279,56 @@ if age_min > minutes:
 # direction (PRO-353). The buffer cannot be written, CPython retries it during
 # shutdown, `Py_Exit()` turns the failed final flush into status 120, and the
 # `if ! "$PYTHON" ...` above reads any non-zero status as "the lease is bad" — so a
-# *held* lease was refused by a `/dev/full` rather than by its own expiry. Same class
-# the gate retired its own streams for (PRO-325/PRO-335). Closing after the attempt
-# is what makes the guarantee hold: `flush_std_files()` skips a stream that reports
-# itself closed. Narration must never decide the verdict, so nothing here raises.
+# *held* lease was refused by a `/dev/full` rather than by its own expiry. This is the
+# wrapper's twin of `_retire_broken_stream()`/`_RetiredStream` in
+# ops/preflight/preflight_worlddb.py (PRO-325/PRO-335), and it keeps both halves: a
+# guarded `flush()`/`close()` *and* a rebind. The close is what drops the teardown
+# status back — `flush_std_files()` skips a stream that reports itself closed — and the
+# rebind is what makes the guarantee structural rather than ordering-dependent, so a
+# line added here later finds a sink that absorbs it instead of a `lost sys.stderr`
+# that the lease check would answer with rc 1. Closing is only safe because CPython
+# builds the std streams with `closefd=False`; if a future interpreter builds them with
+# `closefd=True`, retiring must stop closing (same note in the gate's docstring).
+# Narration must never decide the verdict, so nothing here raises.
+class _RetiredStream:
+    """Absorb anything written to a stream the operator's shell already refused."""
+
+    errors = "backslashreplace"
+    closed = True
+
+    def __init__(self, name, encoding="utf-8"):
+        self.name = name
+        self.encoding = encoding
+
+    def write(self, s):
+        return len(s)
+
+    def writelines(self, lines):
+        return None
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+    def close(self):
+        return None
+
+
 def say(text):
+    stream = sys.stderr
     try:
-        print(text, file=sys.stderr, flush=True)
+        print(text, file=stream, flush=True)
     except Exception:  # noqa: BLE001 - a refused stream is not a lease verdict
         pass
     for method in ("flush", "close"):
         try:
-            getattr(sys.stderr, method)()
+            getattr(stream, method)()
         except Exception:  # noqa: BLE001
             pass
+    if sys.stderr is stream:
+        sys.stderr = _RetiredStream("<stderr> (retired: it refused the lease line)")
 
 
 say(f"worldserver-up: lease held ({holder}), {minutes - age_min:.0f} min of the expected "
