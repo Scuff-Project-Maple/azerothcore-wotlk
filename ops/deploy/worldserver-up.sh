@@ -63,8 +63,27 @@ usage() {
     | sed -e '/^set -euo pipefail$/d' -e 's/^# \{0,1\}//'
 }
 
+# Status lines are presentation, never verdict. A builtin write error is a failing
+# command under `set -e`, so an unguarded `echo` aimed at `/dev/full`, a closed fd 1
+# or a dead pager aborted this script where it stood — before `"$PYTHON" "$GATE"`,
+# so the gate never ran, no `REFUSING BOOT` sentence was printed and no `--json`
+# payload was written (PRO-353). The verdict half of this script is the gate's exit
+# status and the payload the gate writes; these lines only narrate it, so a stream
+# that refuses them is allowed to swallow them and nothing else.
+say() {
+  printf '%s\n' "worldserver-up: $*" 2>/dev/null || :
+}
+
+# The same guarantee on fd 2, for the lines an operator reads when a boot is
+# refused. `>&2` duplicates fd 1 from the descriptor fd 2 has *at that moment*, then
+# `2>/dev/null` moves fd 2 away, so bash's own `write error` complaint is what gets
+# silenced and the sentence still reaches the terminal's stderr.
+tell() {
+  { printf '%s\n' "worldserver-up: $*"; } >&2 2>/dev/null || :
+}
+
 die() {
-  echo "worldserver-up: $*" >&2
+  tell "$*"
   exit 2
 }
 
@@ -149,8 +168,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --no-dry-run|--no-dry*|--no-copy-data|--no-copy*)
-      echo "worldserver-up: WARNING — $arg skips check 5 (the updater dry run on a scratch clone)." >&2
-      echo "                  That is the documented restart fast path; do not use it after a SQL change." >&2
+      tell "WARNING — $arg skips check 5 (the updater dry run on a scratch clone)."
+      tell "                  That is the documented restart fast path; do not use it after a SQL change."
       GATE_ARGS+=("$arg")
       shift
       ;;
@@ -205,7 +224,7 @@ fi
 # needs the stack nor starts it. The inner block is not indented: the `PY` heredoc
 # terminator has to sit at column 0.
 if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
-  echo "worldserver-up: PREFLIGHT_CHECK_ONLY=1 — read-only check, lease not required."
+  say "PREFLIGHT_CHECK_ONLY=1 — read-only check, lease not required."
 else
 if [[ ! -f "$LEASE_FILE" ]]; then
   die "REFUSING BOOT — no single-writer lease at $LEASE_FILE. Take it first (docs/dev-environment.md#single-writer-lease); this script verifies the lease, it does not take it."
@@ -255,30 +274,51 @@ if age_min > minutes:
     print(f"worldserver-up: REFUSING BOOT — lease {path} is STALE: held {age_min:.0f} min "
           f"> expected {minutes:.0f} min ({holder}). Renew or release it first.", file=sys.stderr)
     sys.exit(1)
-print(f"worldserver-up: lease held ({holder}), {minutes - age_min:.0f} min of the expected "
-      f"window left.")
+# Every other line this heredoc prints already aims at fd 2; the held-lease line
+# used to go to stdout, where a stream that refuses us is fatal in the wrong
+# direction (PRO-353). The buffer cannot be written, CPython retries it during
+# shutdown, `Py_Exit()` turns the failed final flush into status 120, and the
+# `if ! "$PYTHON" ...` above reads any non-zero status as "the lease is bad" — so a
+# *held* lease was refused by a `/dev/full` rather than by its own expiry. Same class
+# the gate retired its own streams for (PRO-325/PRO-335). Closing after the attempt
+# is what makes the guarantee hold: `flush_std_files()` skips a stream that reports
+# itself closed. Narration must never decide the verdict, so nothing here raises.
+def say(text):
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 - a refused stream is not a lease verdict
+        pass
+    for method in ("flush", "close"):
+        try:
+            getattr(sys.stderr, method)()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+say(f"worldserver-up: lease held ({holder}), {minutes - age_min:.0f} min of the expected "
+    f"window left.")
 PY
 then
   exit 2
 fi
 fi
 
-echo "worldserver-up: pre-flight gate (compose root $COMPOSE_ROOT)"
+say "pre-flight gate (compose root $COMPOSE_ROOT)"
 rc=0
 "$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} || rc=$?
 if (( rc != 0 )); then
-  echo "worldserver-up: REFUSING BOOT — pre-flight failed (exit $rc)." >&2
-  echo "worldserver-up: ac-worldserver was not started. Fix the named file(s) or" >&2
-  echo "                  escalate to Scuff (SQL); a 'preflight: operational error:' or" >&2
-  echo "                  'could not write the --json payload' line from the gate alone is an" >&2
-  echo "                  environment or evidence-write failure, not a finding about your SQL." >&2
-  echo "                  Any '!!' line from the gate is still a finding about your SQL." >&2
-  echo "                  Do not bypass this gate." >&2
+  tell "REFUSING BOOT — pre-flight failed (exit $rc)."
+  tell "ac-worldserver was not started. Fix the named file(s) or"
+  tell "                  escalate to Scuff (SQL); a 'preflight: operational error:' or"
+  tell "                  'could not write the --json payload' line from the gate alone is an"
+  tell "                  environment or evidence-write failure, not a finding about your SQL."
+  tell "                  Any '!!' line from the gate is still a finding about your SQL."
+  tell "                  Do not bypass this gate."
   exit "$rc"
 fi
 
 if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
-  echo "worldserver-up: gate passed; PREFLIGHT_CHECK_ONLY=1 so the stack was not touched."
+  say "gate passed; PREFLIGHT_CHECK_ONLY=1 so the stack was not touched."
   exit 0
 fi
 
@@ -297,5 +337,5 @@ if [[ ${#COMPOSE_ARGS[@]} -gt 0 ]]; then
   COMPOSE_CMD+=("${COMPOSE_ARGS[@]}")
 fi
 COMPOSE_CMD+=(ac-worldserver)
-echo "worldserver-up: gate passed and lease held; starting ac-worldserver"
+say "gate passed and lease held; starting ac-worldserver"
 exec "${COMPOSE_CMD[@]}"

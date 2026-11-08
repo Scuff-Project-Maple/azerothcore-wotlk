@@ -5483,6 +5483,162 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             P._render_or_say_why(object(), object(), "the --json payload at  is on disk")
 
 
+class TestTheWrapperSurvivesARefusingStdout(unittest.TestCase):
+    """PRO-351 QA: the boot wrapper may not die at its own status line.
+
+    `worldserver-up.sh` runs under `set -euo pipefail`, and a write error from a shell
+    builtin *is* a failing command. On a checkout whose verdict is a genuine FAIL, QA
+    got `worldserver-up.sh: line 208: echo: write error: No space left on device` and
+    nothing else: the wrapper aborted at the `PREFLIGHT_CHECK_ONLY=1` status line, so
+    the gate never ran, the `REFUSING BOOT` sentence was never printed and the `--json`
+    payload the deploy path reads back was never written (`1>&-` gave the same shape
+    with `Bad file descriptor`). rc happened to come back 1 only because `echo` fails
+    with 1 — a caller that checks rc alone was still safe, an operator and an audit
+    trail were not.
+
+    The verdict half of that script is the gate's exit status plus the payload the gate
+    writes; its own `echo`s only narrate it. These pin that the narration is not
+    load-bearing: each runs the real wrapper as a subprocess with the interpreter
+    pointed at a stand-in gate, under a stdout that refuses us.
+    """
+
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+
+    # The stand-in answers with the caller's exit code and writes the payload the real
+    # gate owns, so a pass cannot be mistaken for a refusal and the payload assertion
+    # proves the `--json` argument arrived intact rather than that it was parsed.
+    # `PYTHON` is the wrapper's only interpreter handle and the lease check shares it,
+    # so the stub has to hand the `python - <script>` form back to the real one.
+    STUB = """#!/bin/sh
+if [ "$1" = "-" ]; then exec "$PRO353_PYTHON" - "$2"; fi
+printf '%s\\n' "$*" > "$PRO353_MARKER"
+_json=
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--json" ]; then _json="$2"; fi
+  shift
+done
+if [ -n "$_json" ]; then printf '{"result": "fail", "findings": []}\\n' > "$_json"; fi
+exit "$PRO353_GATE_EXIT"
+"""
+
+    @staticmethod
+    def _stub_gate(td: str, marker: Path) -> str:
+        stub = Path(td) / "stub-gate"
+        stub.write_text(TestTheWrapperSurvivesARefusingStdout.STUB, encoding="utf-8")
+        stub.chmod(0o755)
+        return str(stub)
+
+    def _run(self, *, stdout_redirect: str, gate_exit: int, check_only: bool = True):
+        """Run the real wrapper once. `stdout_redirect` is the hostile fd 1 QA used."""
+        import os
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            (root / ".stack").mkdir(parents=True)
+            marker, err, payload = Path(td) / "gate-ran", Path(td) / "stderr.txt", Path(td) / "v.json"
+            env = dict(os.environ)
+            env.update({
+                "COMPOSE_ROOT": str(root),
+                "LEASE_FILE": str(root / ".stack" / "lease"),
+                "PYTHON": self._stub_gate(td, marker),
+                "PRO353_MARKER": str(marker),
+                "PRO353_PYTHON": sys.executable,
+                "PRO353_GATE_EXIT": str(gate_exit),
+            })
+            if check_only:
+                env["PREFLIGHT_CHECK_ONLY"] = "1"
+            else:
+                env.pop("PREFLIGHT_CHECK_ONLY", None)
+                (root / ".stack" / "lease").write_text(
+                    json.dumps({"agentId": "core", "issueId": "PRO-353", "action": "check",
+                                "acquiredAt": "2026-11-07T00:00:00Z", "expectedMinutes": 99999}),
+                    encoding="utf-8")
+            argv = ["bash", "-c", f'"$0" "$@" {stdout_redirect}', str(self.WRAPPER),
+                    "--db-access", "command", "--mysql-command", "/bin/true -uroot",
+                    "--json", str(payload)]
+            with open(err, "w", encoding="utf-8") as fh:
+                proc = subprocess.run(argv, env=env, cwd=td, stdout=None, stderr=fh)
+            return {"rc": proc.returncode,
+                    "reached_gate": marker.is_file(),
+                    "gate_argv": marker.read_text(encoding="utf-8") if marker.is_file() else "",
+                    "err": err.read_text(encoding="utf-8", errors="replace"),
+                    # Read back inside the temporary directory: the deploy path reads
+                    # this file after the wrapper exits, so a verdict that never landed
+                    # on disk is no verdict at all.
+                    "payload": payload.read_text(encoding="utf-8") if payload.is_file() else None}
+
+    def test_the_bug_is_the_shape_this_class_pins(self):
+        """Negative control: an unguarded builtin really does abort under `set -e`.
+
+        Without this the class could go vacuous the day bash learns to warn instead of
+        fail, and the pins below would keep passing while proving nothing.
+        """
+        import subprocess
+
+        proc = subprocess.run(
+            ["bash", "-c", "set -euo pipefail; echo 'worldserver-up: status line'; "
+                           "echo 'gate-was-reached' >/dev/full; echo 'gate-was-reached'"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(1, proc.returncode,
+                         "bash no longer fails on a builtin write error under `set -e`; "
+                         "re-read this class before trusting the pins below")
+        self.assertIn("write error", proc.stderr)
+        self.assertNotIn("gate-was-reached", proc.stderr,
+                         "the fixture stopped being the shape this class is about")
+
+    def test_a_full_stdout_still_reaches_the_gate_and_prints_the_refusal(self):
+        got = self._run(stdout_redirect=">/dev/full", gate_exit=1)
+        self.assertTrue(got["reached_gate"],
+                        "the wrapper died before the gate ran, which is PRO-353: " + got["err"])
+        self.assertIn("--json", got["gate_argv"],
+                      "the wrapper reached the gate but lost the payload argument")
+        self.assertEqual(1, got["rc"], "the `exit \"$rc\"` refusal semantics changed")
+        self.assertIn("worldserver-up: REFUSING BOOT — pre-flight failed (exit 1).", got["err"],
+                      "the gate ran and the boot was still refused, but the operator was "
+                      "never told why on the channel they read")
+        self.assertIsNotNone(got["payload"], "the deploy path's evidence file is absent")
+        self.assertEqual("fail", json.loads(got["payload"])["result"])
+
+    def test_a_closed_stdout_still_reaches_the_gate_and_prints_the_refusal(self):
+        got = self._run(stdout_redirect="1>&-", gate_exit=1)
+        self.assertTrue(got["reached_gate"],
+                        "a closed fd 1 pre-empted the verdict, which is PRO-353: " + got["err"])
+        self.assertEqual(1, got["rc"])
+        self.assertIn("worldserver-up: REFUSING BOOT — pre-flight failed (exit 1).", got["err"])
+        self.assertIsNotNone(got["payload"])
+        self.assertEqual("fail", json.loads(got["payload"])["result"])
+
+    def test_a_refusing_stdout_does_not_invent_a_refusal(self):
+        """The other direction: hardening the narration must not fail a passing gate."""
+        got = self._run(stdout_redirect=">/dev/full", gate_exit=0)
+        self.assertTrue(got["reached_gate"])
+        self.assertEqual(0, got["rc"],
+                         "a passing gate now reads as a refusal when stdout refuses us: "
+                         + got["err"])
+        self.assertNotIn("REFUSING BOOT", got["err"])
+
+    def test_a_refusing_stdout_does_not_refuse_a_held_lease(self):
+        """The normal boot path, where the lease check is the first interpreter call.
+
+        The held-lease line used to `print()` to stdout. With a refused stdout the
+        buffer could not be written, CPython's shutdown flush failed and `Py_Exit()`
+        answered 120 — and `if ! "$PYTHON" …` reads any non-zero status as "the lease
+        is bad", so a lease that was properly held was refused by `/dev/full`.
+        """
+        got = self._run(stdout_redirect=">/dev/full", gate_exit=0, check_only=False)
+        self.assertTrue(got["reached_gate"],
+                        "the lease check aborted on its own status line instead of "
+                        "verifying the lease: " + got["err"])
+        self.assertIn("lease held", got["err"],
+                      "the held-lease line still aims at a stream that refuses us")
+        self.assertNotIn("REFUSING BOOT — lease", got["err"],
+                         "a lease that was properly held was refused by the stdout")
+        self.assertNotEqual(120, got["rc"],
+                            "the interpreter's teardown status was read as a lease verdict")
+
+
 class TestTheGateCompilesQuietly(unittest.TestCase):
     """PRO-308 QA finding C: a SyntaxWarning here is a warning nobody reads, forever.
 
