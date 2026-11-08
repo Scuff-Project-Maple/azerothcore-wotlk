@@ -5093,7 +5093,9 @@ class TestTheWrapperSurvivesARefusingStdout(unittest.TestCase):
 
     # The stand-in answers with the caller's exit code and writes the payload the real
     # gate owns, so a pass cannot be mistaken for a refusal and the payload assertion
-    # proves the `--json` argument arrived intact rather than that it was parsed.
+    # proves the `--json` argument arrived intact rather than that it was parsed.  The
+    # payload says what the exit code says: an evidence file that disagrees with the
+    # verdict next to it is the shape this lane keeps having to unwind (PRO-353 N4).
     # `PYTHON` is the wrapper's only interpreter handle and the lease check shares it,
     # so the stub has to hand the `python - <script>` form back to the real one.
     STUB = """#!/bin/sh
@@ -5104,7 +5106,8 @@ while [ $# -gt 0 ]; do
   if [ "$1" = "--json" ]; then _json="$2"; fi
   shift
 done
-if [ -n "$_json" ]; then printf '{"result": "fail", "findings": []}\\n' > "$_json"; fi
+if [ "$PRO353_GATE_EXIT" = 0 ]; then _result=pass; else _result=fail; fi
+if [ -n "$_json" ]; then printf '{"result": "%s", "findings": []}\\n' "$_result" > "$_json"; fi
 exit "$PRO353_GATE_EXIT"
 """
 
@@ -5115,8 +5118,10 @@ exit "$PRO353_GATE_EXIT"
         stub.chmod(0o755)
         return str(stub)
 
-    def _run(self, *, stdout_redirect: str, gate_exit: int, check_only: bool = True):
+    def _run(self, *, stdout_redirect: str, gate_exit: int, check_only: bool = True,
+             write_lease: bool = True):
         """Run the real wrapper once. `stdout_redirect` is the hostile fd 1 QA used."""
+        import datetime
         import os
         import subprocess
         import sys
@@ -5136,12 +5141,18 @@ exit "$PRO353_GATE_EXIT"
             })
             if check_only:
                 env["PREFLIGHT_CHECK_ONLY"] = "1"
-            else:
+            elif write_lease:
                 env.pop("PREFLIGHT_CHECK_ONLY", None)
+                # Taken now, not hard-coded: a fixed stamp is a lease with a ~69-day
+                # fuse, and the day it burns out this test fails as a stale lease and
+                # reads like a wrapper bug (PRO-353 review N3).
+                stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 (root / ".stack" / "lease").write_text(
                     json.dumps({"agentId": "core", "issueId": "PRO-353", "action": "check",
-                                "acquiredAt": "2026-11-07T00:00:00Z", "expectedMinutes": 99999}),
+                                "acquiredAt": stamp, "expectedMinutes": 99999}),
                     encoding="utf-8")
+            else:
+                env.pop("PREFLIGHT_CHECK_ONLY", None)
             argv = ["bash", "-c", f'"$0" "$@" {stdout_redirect}', str(self.WRAPPER),
                     "--db-access", "command", "--mysql-command", "/bin/true -uroot",
                     "--json", str(payload)]
@@ -5187,6 +5198,11 @@ exit "$PRO353_GATE_EXIT"
                       "never told why on the channel they read")
         self.assertIsNotNone(got["payload"], "the deploy path's evidence file is absent")
         self.assertEqual("fail", json.loads(got["payload"])["result"])
+        # `tell`'s `2>/dev/null` is the point of `tell`: bash's own complaint is what
+        # gets silenced, never the sentence. Drop the redirection and this fails
+        # (PRO-353 review N5).
+        self.assertNotIn("write error", got["err"],
+                         "bash's own write-error complaint reached the operator")
 
     def test_a_closed_stdout_still_reaches_the_gate_and_prints_the_refusal(self):
         got = self._run(stdout_redirect="1>&-", gate_exit=1)
@@ -5196,6 +5212,8 @@ exit "$PRO353_GATE_EXIT"
         self.assertIn("worldserver-up: REFUSING BOOT — pre-flight failed (exit 1).", got["err"])
         self.assertIsNotNone(got["payload"])
         self.assertEqual("fail", json.loads(got["payload"])["result"])
+        self.assertNotIn("write error", got["err"],
+                         "bash's own write-error complaint reached the operator")
 
     def test_a_refusing_stdout_does_not_invent_a_refusal(self):
         """The other direction: hardening the narration must not fail a passing gate."""
@@ -5222,8 +5240,28 @@ exit "$PRO353_GATE_EXIT"
                       "the held-lease line still aims at a stream that refuses us")
         self.assertNotIn("REFUSING BOOT — lease", got["err"],
                          "a lease that was properly held was refused by the stdout")
+        self.assertNotIn("write error", got["err"],
+                         "bash's own write-error complaint reached the operator")
         self.assertNotEqual(120, got["rc"],
                             "the interpreter's teardown status was read as a lease verdict")
+
+    def test_a_refusing_stdout_still_refuses_a_missing_lease(self):
+        """`die()` rides on `tell`, so the whole flag-refusal surface moved onto it.
+
+        `--compose-root`, `-- -f x` and the missing-lease refusal all exit 2 through
+        `die()`, and none of them was covered by this class. This is the cheapest of
+        that family to drive, and it pins the direction the class must never soften: a
+        run with no lease is refused whatever the streams are doing (PRO-353 review N6).
+        """
+        got = self._run(stdout_redirect=">/dev/full", gate_exit=0, check_only=False,
+                        write_lease=False)
+        self.assertEqual(2, got["rc"], "the `die()` exit status changed")
+        self.assertIn("REFUSING BOOT — no single-writer lease", got["err"],
+                      "the refusal never reached the operator's stderr")
+        self.assertNotIn("write error", got["err"],
+                         "bash's own write-error complaint reached the operator")
+        self.assertFalse(got["reached_gate"],
+                         "a run with no lease reached the gate, which is a boot on air")
 
 
 class TestTheGateCompilesQuietly(unittest.TestCase):
