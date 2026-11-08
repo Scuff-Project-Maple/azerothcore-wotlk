@@ -1,0 +1,96 @@
+name: Stack lease
+
+# The single-writer lease is the only thing standing between two agents and the one
+# `ac-worldserver` on the deploy host, and its staleness test is the last check an agent
+# reads before `rm -f`-ing a lease that is not theirs. PRO-356 found that test calling a
+# live holder's lease breakable, so the classification contract is the thing worth
+# guarding: fractional-second stamps are LIVE, a genuinely past-the-window lease is
+# LEASE_STALE_BREAKABLE, and nothing unparseable is ever called breakable.
+#
+# Everything here is pure Python against the checkout: no MySQL, no Docker, no deploy
+# host, no `.stack/` directory. The tests build every fixture in a temp dir and every
+# timestamp relative to now, so the suite cannot rot into a test that only passes while
+# one calendar date sits inside a 180-minute window.
+#
+# Do not mark this job as a required status check. Both triggers are `paths:`-filtered,
+# so a PR that touches neither `ops/deploy/**` nor the lease section of the dev-environment
+# doc never starts a run, and a required check that never starts is "Expected — waiting"
+# forever (same reasoning as PRO-295 review N2 in worlddb-preflight.yml).
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    paths:
+      - ops/deploy/**
+      # The doc is the copy-paste surface: an agent runs the CHECK that is written there,
+      # not the one in the source tree. A doc-only edit that re-introduces a second
+      # timestamp parser has to be caught by the drift guards in the test file.
+      - docs/dev-environment.md
+      - .github/workflows/stack-lease.yml
+  push:
+    # Same contract on the branch itself, so a lease-tooling change that lands without a
+    # PR (direct push, rebase-and-merge, revert) is still checked.
+    branches:
+      - Playerbot
+    paths:
+      - ops/deploy/**
+      - docs/dev-environment.md
+      - .github/workflows/stack-lease.yml
+  workflow_dispatch: {}
+
+concurrency:
+  # New commits on a PR cancel the run on the old commit. github.ref is
+  # refs/pull/<N>/merge for a PR and refs/heads/<branch> for a push, so the two never
+  # share a group.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lease-classification:
+    runs-on: ubuntu-latest
+    name: Single-writer lease — LIVE / STALE / UNREADABLE contract
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup python
+        uses: actions/setup-python@v7
+        with:
+          # Pinned to the older interpreter on purpose. The lease reader has to accept the
+          # stamps real writers emit on the deploy host, and `datetime.fromisoformat` only
+          # grew "Z" and arbitrary-fraction support in 3.11 — the host runs 3.12 and the
+          # boot wrapper runs whatever `python3` the runner has. A 3.10 runner is where a
+          # reader that quietly depends on 3.11 gets caught.
+          python-version: '3.10'
+      - name: Lease classification tests
+        # ~1.3 s. Plain unittest, like ops/preflight: ops/deploy is not a package, so
+        # `-m unittest discover -s ops/deploy` does not find it.
+        run: python3 ops/deploy/test_lease_check.py
+      - name: The doc's own CHECK runs
+        # The one thing the tests cannot assert by reading files: that the command agents
+        # copy out of docs/dev-environment.md is a real invocation of the one reader. Runs
+        # it against a fixture lease in a temp dir, never a repo `.stack/`.
+        run: |
+          tmp="$(mktemp -d)"
+          # A real writer first: the doc's ACQUIRE/CHECK pair, round-tripped in a clean
+          # runner, so a writer/reader format drift fails here and not on the host.
+          python3 ops/deploy/lease_check.py acquire "$tmp/lease" --agent ci --issue PRO-356 \
+            --action e2e-suite --minutes 180 | grep -qx LEASE_ACQUIRED
+          python3 ops/deploy/lease_check.py check --quiet "$tmp/lease" | grep -qx LEASE_HELD_LIVE
+          # Then the PRO-356 fixture itself: a fractional stamp 28 min into the window.
+          fixture() {
+            json="{\"agentId\":\"ci\",\"issueId\":\"PRO-356\",\"action\":\"e2e-suite\","
+            json="$json\"acquiredAt\":\"$1\",\"expectedMinutes\":180}"
+            printf '%s\n' "$json" > "$tmp/lease"
+          }
+          fixture "$(date -u -d '28 minutes ago' +%FT%T.%6NZ)"
+          out="$(python3 ops/deploy/lease_check.py check "$tmp/lease")"
+          echo "$out"
+          echo "$out" | head -1 | grep -qx LEASE_HELD_LIVE
+          fixture "$(date -u -d '200 minutes ago' +%FT%TZ)"
+          python3 ops/deploy/lease_check.py check --quiet "$tmp/lease" | grep -qx LEASE_STALE_BREAKABLE
+          printf '{"agentId":"ci","acquiredAt":"yesterday","expectedMinutes":180}' > "$tmp/lease"
+          ! python3 ops/deploy/lease_check.py check --quiet "$tmp/lease" | grep -q LEASE_STALE_BREAKABLE

@@ -50,6 +50,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_ROOT="${COMPOSE_ROOT:-$REPO_ROOT}"
 GATE="$SCRIPT_DIR/../preflight/preflight_worlddb.py"
+LEASE_CHECKER="$SCRIPT_DIR/lease_check.py"
 PYTHON="${PYTHON:-python3}"
 # Resolved after argument parsing, so that a --compose-root given on the
 # command line cannot leave the lease check pointing at the default root.
@@ -70,6 +71,10 @@ die() {
 
 if [[ ! -f "$GATE" ]]; then
   die "pre-flight gate not found at $GATE"
+fi
+
+if [[ ! -f "$LEASE_CHECKER" ]]; then
+  die "single-writer lease checker not found at $LEASE_CHECKER"
 fi
 
 GATE_ARGS=()
@@ -202,8 +207,14 @@ fi
 # --- single-writer lease --------------------------------------------------- #
 # Refuse to boot without a lease someone is actually holding. `PREFLIGHT_CHECK_ONLY=1`
 # is the CI/rehearsal escape hatch and skips it, because a check-only run neither
-# needs the stack nor starts it. The inner block is not indented: the `PY` heredoc
-# terminator has to sit at column 0.
+# needs the stack nor starts it.
+#
+# The classification itself lives in lease_check.py — the same reader the doc's CHECK
+# calls. This script used to carry its own `datetime.fromisoformat` parser alongside the
+# doc's `jq` date predicate, and on 2026-11-07 they disagreed about the same file (PRO-356):
+# the wrapper called a fractional-second lease live, the doc called it breakable, and the
+# weaker reader was the one agents were told to trust before `rm -f`-ing it. A boot path
+# with its own second opinion about what a live lease is *is* the defect, so it has none.
 if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
   echo "worldserver-up: PREFLIGHT_CHECK_ONLY=1 — read-only check, lease not required."
 else
@@ -211,54 +222,7 @@ if [[ ! -f "$LEASE_FILE" ]]; then
   die "REFUSING BOOT — no single-writer lease at $LEASE_FILE. Take it first (docs/dev-environment.md#single-writer-lease); this script verifies the lease, it does not take it."
 fi
 
-if ! "$PYTHON" - "$LEASE_FILE" <<'PY'
-import datetime as dt
-import json
-import sys
-
-path = sys.argv[1]
-try:
-    with open(path, encoding="utf-8") as fh:
-        lease = json.load(fh)
-except Exception as exc:  # noqa: BLE001 - fail closed on anything unreadable
-    print(f"worldserver-up: REFUSING BOOT — lease {path} is unreadable ({exc}).", file=sys.stderr)
-    sys.exit(1)
-
-if not isinstance(lease, dict) or not lease.get("agentId"):
-    print(f"worldserver-up: REFUSING BOOT — lease {path} has no holder.", file=sys.stderr)
-    sys.exit(1)
-
-
-def parse_ts(raw):
-    text = str(raw)
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    stamp = dt.datetime.fromisoformat(text)
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=dt.timezone.utc)
-    return stamp
-
-
-raw = lease.get("acquiredAt") or ""
-minutes = lease.get("expectedMinutes")
-try:
-    acquired = parse_ts(raw)
-    minutes = float(minutes)
-except (TypeError, ValueError):
-    print(f"worldserver-up: REFUSING BOOT — lease {path} has an unusable "
-          f"acquiredAt={raw!r}/expectedMinutes={minutes!r}.", file=sys.stderr)
-    sys.exit(1)
-
-age_min = (dt.datetime.now(dt.timezone.utc) - acquired).total_seconds() / 60.0
-holder = f"agent {lease.get('agentId')} issue {lease.get('issueId')} action {lease.get('action')}"
-if age_min > minutes:
-    print(f"worldserver-up: REFUSING BOOT — lease {path} is STALE: held {age_min:.0f} min "
-          f"> expected {minutes:.0f} min ({holder}). Renew or release it first.", file=sys.stderr)
-    sys.exit(1)
-print(f"worldserver-up: lease held ({holder}), {minutes - age_min:.0f} min of the expected "
-      f"window left.")
-PY
-then
+if ! "$PYTHON" "$LEASE_CHECKER" verify "$LEASE_FILE" --label worldserver-up; then
   exit 2
 fi
 fi
