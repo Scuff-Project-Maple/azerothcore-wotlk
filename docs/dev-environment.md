@@ -129,12 +129,21 @@ their verification — it cost [PRO-36](/PRO/issues/PRO-36) its T4.7 e2e gate on
 `docker compose up`, apply a DB migration, **or run the e2e suite**, you MUST
 hold the lease; `action` is one of `worldserver-restart`, `e2e-suite`,
 `db-migration`, `compose-up`. If `check` below reports `LEASE_HELD_LIVE`: **do
-not proceed** — wait, or coordinate in the holder's issue thread. A lease that
-will not parse counts as stale-breakable, and breaking a stale or unparseable
-lease is the **only** time you `rm -f` a lease that is not yours — it needs a
-comment on **your** issue naming it (`agentId`, `issueId`, `acquiredAt`,
-`expectedMinutes`). Release when the action finishes, including on failure;
-`release` refuses unless the lease names you. Lease file:
+not proceed** — wait, or coordinate in the holder's issue thread. Only a
+`LEASE_STALE_BREAKABLE` lease — one the reader can **prove** is past
+`acquiredAt + expectedMinutes` — is yours to break, and breaking even that one
+is the **only** time you `rm -f` a lease that is not yours: it needs a comment on
+**your** issue naming it (`agentId`, `issueId`, `acquiredAt`,
+`expectedMinutes`). A `LEASE_UNREADABLE` lease is **not** breakable by you.
+"I cannot read it" is not evidence that it expired — a half-written file is what a
+writer that died mid-redirect leaves behind, and that writer may still be on the
+stack. Name it in a comment the same way and get the holder's owner to say it is
+safe before you touch it. The previous rule here called any unparseable lease
+stale-breakable, and that is what [PRO-356](/PRO/issues/PRO-356) caught: a live
+holder 28 min into a 180 min window was reported breakable, which is exactly the
+two-concurrent-writers collision this section exists to prevent. Release when the
+action finishes, including on failure; `release` refuses unless the lease names
+you. Lease file:
 `/mnt/data/wow-server/.stack/lease` (JSON, one line); the `.stack/` dir is
 `2775 scuff-dev:pira` so both host drivers can write it (the compose root
 became agent-writable too with
@@ -142,15 +151,38 @@ became agent-writable too with
 [Git access on the compose root](#git-access-on-the-compose-root)). No cron,
 no daemon: the read is the rule.
 
+**One reader, pinned writer format.** `check`, `acquire` and `release` all live in
+[`ops/deploy/lease_check.py`](../ops/deploy/lease_check.py), and so does the boot
+wrapper's own lease verification — `ops/deploy/worldserver-up.sh` calls
+`lease_check.py verify` rather than parsing the file itself. There is deliberately
+no second timestamp parser anywhere: two readers disagreeing about one lease file
+is how [PRO-356](/PRO/issues/PRO-356) happened, and the weaker one is the one
+agents copy-paste. `acquire` writes `acquiredAt` in the whole-second UTC form
+`date -u +%FT%TZ` produces, so writer and reader agree; the reader additionally
+**accepts** a fractional-second stamp, a `+00:00` offset and a naive stamp,
+because leases like that already exist on the host and an unusual stamp must
+never read as an expired one.
+
 ```bash
-# ACQUIRE — atomic (O_EXCL); prints LEASE_HELD + the holder and exits non-zero if someone is in there
-ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && mkdir -p .stack && ( set -o noclobber; jq -cn --arg agent "<agent-id>" --arg issue "<PRO-xx>" --arg action "<action>" --arg at "$(date -u +%FT%TZ)" --argjson mins 90 "{agentId:\$agent,issueId:\$issue,action:\$action,acquiredAt:\$at,expectedMinutes:\$mins}" > .stack/lease ) && echo LEASE_ACQUIRED || { echo LEASE_HELD; cat .stack/lease; exit 1; }'
+# ACQUIRE — atomic (O_EXCL). Never overwrites, stale or not; prints LEASE_HELD +
+# the holder and exits non-zero if someone is in there. --minutes defaults to 90.
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && python3 ops/deploy/lease_check.py acquire --agent "<agent-id>" --issue "<PRO-xx>" --action "<action>" --minutes 90'
 
-# CHECK — prints LEASE_FREE | LEASE_HELD_LIVE | LEASE_STALE_BREAKABLE (+ the lease JSON)
-ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && { [ -f .stack/lease ] && { jq -er "(.acquiredAt|fromdate)+(.expectedMinutes*60) > (now|floor)" .stack/lease >/dev/null && { echo LEASE_HELD_LIVE; cat .stack/lease; } || { echo LEASE_STALE_BREAKABLE; cat .stack/lease; }; } || echo LEASE_FREE; }'
+# CHECK — prints LEASE_HELD_LIVE | LEASE_FREE | LEASE_STALE_BREAKABLE | LEASE_UNREADABLE
+# (+ the raw lease and an `action:` line telling you what you may do). Exit status
+# 0 / 1 / 2 / 3 for those four, so a script cannot confuse "expired" with "I could
+# not read it" either. `--quiet` prints the verdict token alone.
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && python3 ops/deploy/lease_check.py check'
 
-# RELEASE — always, including on failure; refuses unless the lease names you
-ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && if jq -e --arg a "<agent-id>" --arg i "<PRO-xx>" ".agentId==\$a and .issueId==\$i" .stack/lease >/dev/null 2>&1; then rm -f .stack/lease && echo LEASE_RELEASED; else echo LEASE_NOT_YOURS; cat .stack/lease 2>/dev/null; fi'
+# RELEASE — always, including on failure; refuses unless the lease names you, and
+# never removes a lease it cannot read.
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && python3 ops/deploy/lease_check.py release --agent "<agent-id>" --issue "<PRO-xx>"'
+
+# THE CHECK BEFORE YOU `rm -f` ANY LEASE THAT IS NOT YOURS — run this and paste its
+# output into the comment that names the lease. It is also the repeatable proof of
+# the classification: a fractional-second live lease must classify LIVE and a
+# genuinely past-the-window lease must classify LEASE_STALE_BREAKABLE.
+ssh -o BatchMode=yes 192.168.1.71 'cd /mnt/data/wow-server && python3 ops/deploy/test_lease_check.py'
 ```
 
 ## Build & run
