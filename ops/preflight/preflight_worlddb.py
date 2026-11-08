@@ -3908,6 +3908,16 @@ CHECK_TITLES = {
 # rather than in two f-strings that can drift apart.
 NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
 
+# The one wording for "a `--json` target was passed but holds no path" (PRO-352, Core's
+# PRO-355 contract A). It is the blank family's answer to the same question
+# `NO_JSON_PAYLOAD_NOTE` answers for an absent flag, so both live here and `main()` reads
+# them off one predicate — the pairing that stops stdout saying "no payload requested"
+# two lines before stderr says "the requested evidence payload is missing". Prefix
+# `preflight: ` at the standalone stderr emit; the bare sentence is shared with the
+# degraded stdout note. Blank by `strip()`, not `== ""`: a whitespace-only target is the
+# same family and the worse bug, because a real write with it would succeed.
+BLANK_JSON_TARGET_NOTE = "the --json target is blank; pass a path or omit the flag"
+
 # Names that identify the *channel* rather than the destination, so a comparison against
 # `main()`'s label can never tell us whether we learned anything. CPython builds the three
 # std streams itself from the inherited descriptors and stamps them with these literals,
@@ -4355,8 +4365,24 @@ def main(argv=None) -> int:
     # the two halves are held apart from each other: a stdout the operator's codec (or
     # kernel) refuses must not cost the payload, which is finding B one layer down, and
     # a payload we cannot write must not cost the printed verdict either.
+    # One predicate answers every question about `--json` (PRO-352, Core's PRO-355
+    # contract A). The write gate below and the evidence-missing refusal at the bottom of
+    # `main()` must not be able to disagree about whether a payload was requested, so both
+    # read `payload_requested`, which is true whenever the flag was passed at all — even
+    # with a blank argument. `worldserver-up.sh` forwards unrecognised operator arguments
+    # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with an empty or whitespace
+    # `$TARGET` reaches here; the old truthiness gate skipped both the write and the
+    # refusal for it, so the boot went out on the checks' own rc with no evidence at all.
+    payload_requested = args.json_out is not None
+    # `strip()`, not `== ""`: a whitespace-only target is the same family and the worse
+    # bug. `Path("   ").write_text` *succeeds*, dropping a file literally named `   ` in
+    # the cwd, so a truthiness gate would "succeed", boot, and hand the operator evidence
+    # nobody can find. Treat the whole family as "asked for evidence, produced none" and
+    # never touch the filesystem for it.
+    blank_json_target = payload_requested and not args.json_out.strip()
+
     payload_error = None
-    if args.json_out:
+    if payload_requested and not blank_json_target:
         payload = {
             "result": "fail" if report.failed else "pass",
             "args": {k: str(v) for k, v in vars(args).items()},
@@ -4369,19 +4395,24 @@ def main(argv=None) -> int:
         except Exception as exc:
             payload_error = (f"preflight: could not write the --json payload to "
                              f"{args.json_out}: {type(exc).__name__}: {exc}")
+    elif blank_json_target:
+        # A fixed sentence with no interpolated path and no errno: an empty target renders
+        # as nothing and `Path("")` resolves to the cwd, so the generic message would name
+        # `.` — and the wrapper's next line tells the operator to fix "the named file(s)".
+        # Name the flag instead (PRO-355 §2), and reach the same refusal as any other
+        # asked-for-but-absent evidence.
+        payload_error = f"preflight: {BLANK_JSON_TARGET_NOTE}"
     if not args.json_only:
-        # One test, the one the write above uses (PRO-341 review B1). `--json ""` is
-        # reachable: `worldserver-up.sh` forwards unrecognised operator arguments
-        # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with a blank
-        # `$TARGET` arrives here as an empty path. The truthiness test above skips the
-        # write, so an `is None` test here fell through to the `else` and told the
-        # operator the payload "is on disk" at a path that rendered as nothing. That is
-        # PRO-325 NB2's shape, an absent thing asserted as present, one layer up. Two
-        # spellings of one question is the bug; now there is one. What `--json ""` still
-        # does *not* do is reach the evidence-missing refusal below, because
-        # `payload_error` stays None — same as base, and tracked apart.
-        if not args.json_out:
+        # The note is a claim about the payload, so it reads off the same predicate as the
+        # write: never-requested, requested-but-blank, requested-but-unwritable, and
+        # written each get their own wording. A blank target must not borrow
+        # `NO_JSON_PAYLOAD_NOTE` — that would tell the operator no payload was requested
+        # while stderr two lines later refuses the boot for missing evidence — and it must
+        # not claim a file is "on disk" when nothing was written.
+        if not payload_requested:
             payload_note = NO_JSON_PAYLOAD_NOTE
+        elif blank_json_target:
+            payload_note = BLANK_JSON_TARGET_NOTE
         elif payload_error:
             payload_note = f"the --json payload at {args.json_out} was NOT written"
         else:
@@ -4391,7 +4422,9 @@ def main(argv=None) -> int:
     if payload_error:
         # The boot path asks for the payload and trusts it as the evidence, so a run
         # that produced no evidence file refuses the boot rather than reporting
-        # whatever rc the checks happened to reach.
+        # whatever rc the checks happened to reach. A blank target joins this path now
+        # that the write gate and this refusal share one predicate: evidence was asked
+        # for and none exists (PRO-352).
         _emit(sys.stderr, payload_error, label="<stderr>")
         _emit(sys.stderr, "preflight: the requested evidence payload is missing, so "
                           "the boot is refused", label="<stderr>")
