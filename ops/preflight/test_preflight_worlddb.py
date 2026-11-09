@@ -6148,6 +6148,84 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                          "gate lines plus the finding marker; it is three quoted fragments "
                          "and PRO-346 rejected adding a fourth")
 
+    # Every shape `main()` can leave the operator in, so the wrapper-read test below has
+    # the complete set of lines the gate really writes to compare against: the printed
+    # verdict, the degraded verdict, the operational error, and the refused payload.
+    # `render_raises` and `op_error` are the two failure paths; `missing-dir` is the
+    # evidence-write path; the plain drive is a normal refused boot with findings.
+    OPERATOR_FACING_SHAPES = (
+        ("verdict", {}),
+        ("degraded verdict", {"render_raises": True}),
+        ("operational error", {"op_error": "cannot execute docker: [Errno 2] "
+                                           "No such file or directory"}),
+        ("refused payload", {"json_target": "missing-dir"}),
+    )
+    # Each fragment the refusal block quotes, and the one shape that has to show it.
+    # Naming the shape is not decoration: pooled into one corpus, `'!!'` is satisfied by
+    # the render-failure apology alone and the findings listing could stop marking
+    # findings without anyone noticing, which is the half of the wrapper's sentence that
+    # tells the operator what still counts as their problem.
+    WRAPPER_QUOTED_EVIDENCE = (
+        ("preflight: operational error:", "operational error"),
+        ("could not write the --json payload", "refused payload"),
+        ("!!", "verdict"),
+    )
+
+    def _lines_the_gate_really_emits(self) -> dict:
+        """shape name -> every line `main()` writes to either stream in that shape.
+
+        Driven, not read from source: the point of the test that uses this is that the
+        wrapper quotes a string the gate *actually puts on the terminal*, so the corpus
+        has to come from running the gate.
+        """
+        emitted = {}
+        for name, kwargs in self.OPERATOR_FACING_SHAPES:
+            res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                                   **kwargs)
+            lines = []
+            for blob in (res.out, res.err):
+                lines.extend(blob.decode("ascii", "replace").splitlines())
+            emitted[name] = lines
+        return emitted
+
+    def test_every_fragment_the_wrapper_quotes_is_a_line_the_gate_really_emits(self):
+        """PRO-382 §1 (PRO-370 finding F2): the wrapper's quoted prefixes have no pin.
+
+        `worldserver-up.sh` hands the operator quoted fragments of gate output and says
+        which ones are not that operator's problem. `grep -rn "escalate to Scuff"`
+        reaches only the wrapper, so before this test nothing tied those quotes to what
+        the gate writes: reword the emitter and the wrapper keeps quoting a sentence no
+        terminal will ever show, and the operator locked out of a boot is routed by a
+        string that no longer exists. The gate owns the wording; this is the half that
+        makes the wrapper's promise an assertion instead of a transcription.
+
+        Deliberately derived from the wrapper rather than from the fixture table above:
+        reading the file is what catches a fragment being *added* to the exemption, and
+        driving `main()` rather than grepping its source is what makes a rename in the
+        emitter — not an edit to this file — the thing that fails here.
+        """
+        quoted = self._wrapper_quoted_fragments()
+        self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS), quoted,
+                         "the refusal block and this suite's view of it have drifted; "
+                         "fix the wrapper and the pins together, in one change")
+        self.assertEqual({f for f, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
+                         "a quoted fragment has no witness shape, so nothing checks that "
+                         "the gate still emits it")
+        emitted = self._lines_the_gate_really_emits()
+        for name, lines in emitted.items():
+            self.assertTrue(lines, f"the gate produced nothing at all in the {name!r} "
+                                   "shape; an empty corpus passes any substring test")
+        for frag, shape in self.WRAPPER_QUOTED_EVIDENCE:
+            lines = emitted[shape]
+            self.assertTrue(
+                any(frag in ln for ln in lines),
+                f"{self.WRAPPER.name} quotes '{frag}' at the operator as though the gate "
+                f"wrote it, but no line the gate produced in the {shape!r} shape contains "
+                "it. The refusal routing turns on that string: an operator locked out is "
+                "told to escalate to Scuff (SQL) unless the gate said something like it, "
+                "and the gate no longer says it. Lines seen were:\n"
+                + "\n".join(sorted({ln for ln in lines if ln.strip()})))
+
     def test_a_render_failure_still_names_the_failing_check(self):
         """PRO-313 review B1 state S3: a `render()` crash is not a licence for silence."""
         import preflight_worlddb as P
