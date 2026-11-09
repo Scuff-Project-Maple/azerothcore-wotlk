@@ -4274,6 +4274,13 @@ def _retire_broken_stream(stream, label: str) -> None:
     `> /dev/full 2>&1` they get nowhere either way, because fd 2 is then a dup of the same
     file description. Load-bearing, and invisible here — if a future interpreter ever
     builds the std streams with `closefd=True`, retiring must stop closing.
+
+    What that shape still delivers is the rc (PRO-372 F1): both descriptors on one
+    refusing device, the fallback notice refused and retired like the refusing stream
+    itself, nothing left for `flush_std_files()`, and the gate exits 1 (`EXIT_FAIL`) or 2
+    (`EXIT_ERROR`) on the path taken — never the interpreter's 120, the one number PRO-325
+    exists to keep out of `REFUSING BOOT — pre-flight failed`. The payload on disk is the
+    evidence there; the refusing device keeps none.
     """
     for method in ("flush", "close"):
         try:
@@ -4395,7 +4402,11 @@ def _emit(stream, text: str, *, label=None) -> None:
     refused boot came to exit 120 (PRO-325 NB1, reproduced in `TestTheGateHoldsItsOwnRc`
     against a real `/dev/full` and a real early-closed pipe). So a stream that refused us
     is retired on the way out, and the rc the wrapper sees stays one of the three the gate
-    documents.
+    documents. The fallback stream is retired on the same terms (PRO-372 F1): under the
+    operator's `> /dev/full 2>&1` fd 2 dups the very same full file description, the
+    notice line is refused too, and retiring only the refusing stream would hand the
+    notice's own stranded bytes to `flush_std_files()` — the same 120, relocated. A
+    fallback that took the line is left alone; a live fd 2 must still deliver it.
 
     `label` is keyword-only (PRO-341 review N5). It used to be the third positional, which
     meant a future positional argument silently became the destination name an operator
@@ -4432,13 +4443,25 @@ def _emit(stream, text: str, *, label=None) -> None:
             stream.write("\n")
         stream.flush()
     except Exception as exc:
+        fallback = sys.__stderr__
+        fallback_refused = False
         try:
-            sys.__stderr__.write(f"preflight: could not write the report to {name}: "
-                                 f"{type(exc).__name__}: {exc}\n")
-            sys.__stderr__.flush()
+            fallback.write(f"preflight: could not write the report to {name}: "
+                           f"{type(exc).__name__}: {exc}\n")
+            fallback.flush()
         except Exception:
-            pass
+            fallback_refused = True
         _retire_broken_stream(stream, name)
+        if fallback_refused:
+            # PRO-372 F1: the notice line is the one thing that must not stay buffered for
+            # the shutdown flush. Under `> /dev/full 2>&1` fd 2 dups the same full file
+            # description as fd 1, so the fallback `flush()` above raises here and CPython
+            # leaves the bytes in `sys.__stderr__` — which at startup *is* `sys.stderr`, so
+            # `flush_std_files()` retries them at teardown and `Py_Exit()` turns the second
+            # refusal into rc 120. Retiring the fallback too (only when it refused; a live
+            # fd 2 must keep receiving the notice) leaves nothing buffered: rc stays the
+            # gate's own code.
+            _retire_broken_stream(fallback, "<stderr>")
 
 
 def _write_json_payload(path, payload: dict) -> None:
