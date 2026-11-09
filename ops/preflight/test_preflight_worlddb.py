@@ -7568,7 +7568,18 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
         self.assertEqual(P.EXIT_ERROR, proc.returncode)
         self.assertIn(self.ESCALATION, self._folded(proc.stderr),
                       "a real finding was demoted because the rc belonged to the payload")
-        self.assertIn("evidence-write failure", proc.stderr)
+        folded = self._folded(proc.stderr)
+        self.assertIn("Fix the path and re-run", folded,
+                      "the lost payload stopped being named just because a finding shared the run")
+        # PRO-390 non-blocking: with a `!!` on screen the escalation above just sent the
+        # operator to Scuff (SQL); the wrapper's own payload arm must not then contradict it
+        # by claiming the SQL lane is irrelevant. That wrapper sentence ("the SQL lane is not
+        # where it belongs") belongs only to a findings-free run. The gate's own replayed
+        # "not a finding about your SQL" notice about the payload is left verbatim — that is
+        # the gate speaking, not the wrapper misrouting.
+        self.assertNotIn("the SQL lane is not where it belongs", folded,
+                         "the wrapper told the operator to escalate to SQL and that the SQL "
+                         "lane was the wrong place in the same refusal")
 
     def test_a_degraded_render_still_routes_the_findings_it_listed(self):
         """The marker, not the exit code, is what decides — rc 2 with a listed FAIL routes to SQL."""
@@ -7618,6 +7629,208 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
         self.assertNotIn("Scuff (SQL)", proc.stderr)
         self.assertIn("Do not bypass this gate.", proc.stderr)
         self.assertIn("cannot say whether this is about your SQL", self._folded(proc.stderr))
+
+    # -- the capture-block regressions PRO-390 caught -------------------------------- #
+    #
+    # The three blocking findings all lived in the ~20 lines that capture the gate's
+    # output for the markers to read. They are reproduced here on the shape the reviewer
+    # used: the real wrapper, a stub `PYTHON` standing in for the gate, a stand-in `docker`
+    # whose only job is to prove a boot happened. Each is checked against the fixed
+    # wrapper; reverting the corresponding guard flips the assertion.
+
+    _HOSTILE_GATE_HEAD = (
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-" ]; then exec "$REALPY" - "$2"; fi\n'
+    )
+
+    def _run_hostile(self, gate_body, *, check_only=True, tmpdir=None):
+        """Run the real wrapper once against a stub gate, on PRO-390's shape.
+
+        `gate_body` is the shell the stub runs after the lease-check passthrough. The
+        stub records that the gate ran (``$GATE_MARKER``) and a fake ``docker`` on PATH
+        records that a boot happened (``$DOCKER_MARKER``), so "the gate ran" and "the
+        container started" are both observable rather than inferred.
+        """
+        import datetime
+        import os
+        import shutil
+        import subprocess
+        import sys
+
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(td), True)
+        root = td / "root"
+        (root / ".stack").mkdir(parents=True)
+        binp = td / "bin"
+        binp.mkdir()
+        docker_marker = td / "docker-ran"
+        gate_marker = td / "gate-ran"
+
+        fake = binp / "docker"
+        fake.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "compose %s\\n" "$*" > "$DOCKER_MARKER"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        gate = td / "gate"
+        gate.write_text(self._HOSTILE_GATE_HEAD + gate_body, encoding="utf-8")
+        gate.chmod(0o755)
+
+        if not check_only:
+            # The boot path refuses without a lease someone is holding, so hand it one.
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            (root / ".stack" / "lease").write_text(
+                json.dumps(
+                    {
+                        "agentId": "core",
+                        "issueId": "PRO-381",
+                        "action": "check",
+                        "acquiredAt": stamp,
+                        "expectedMinutes": 99999,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "PYTHON": str(gate),
+                "REALPY": sys.executable,
+                "COMPOSE_ROOT": str(root),
+                "LEASE_FILE": str(root / ".stack" / "lease"),
+                "DOCKER_MARKER": str(docker_marker),
+                "GATE_MARKER": str(gate_marker),
+                "PATH": f"{binp}{os.pathsep}{env['PATH']}",
+            }
+        )
+        if tmpdir is not None:
+            env["TMPDIR"] = str(tmpdir)
+        if check_only:
+            env["PREFLIGHT_CHECK_ONLY"] = "1"
+        else:
+            env.pop("PREFLIGHT_CHECK_ONLY", None)
+
+        err = td / "stderr.txt"
+        argv = ["bash", str(self.WRAPPER), "--json", str(td / "v.json")]
+        with open(err, "w", encoding="utf-8") as fh:
+            proc = subprocess.run(
+                argv, env=env, cwd=str(td), stdout=subprocess.DEVNULL, stderr=fh,
+                timeout=60,
+            )
+        return {
+            "rc": proc.returncode,
+            "docker_ran": docker_marker.is_file(),
+            "gate_ran": gate_marker.is_file(),
+            "stderr": err.read_text(encoding="utf-8", errors="replace"),
+        }
+
+    def test_a_signal_to_the_wrapper_during_the_gate_does_not_start_the_container(self):
+        # PRO-390 B1 (fail-open). `docker stop`, `systemd stop` and a plain `kill -TERM`
+        # signal this script and only this script — the gate child is never signalled. The
+        # capture trap used to be `rm -rf "$GATE_DIR"` on INT/TERM, which cleaned up and
+        # *returned*, so the unsigned gate finished rc 0 and the script walked straight into
+        # `docker compose up -d ac-worldserver`. The signal traps must leave, not continue.
+        got = self._run_hostile(
+            'echo started > "$GATE_MARKER"\n'
+            'kill -TERM "$PPID" 2>/dev/null\n'
+            "exit 0\n",
+            check_only=False,
+        )
+        self.assertTrue(got["gate_ran"], "the gate never ran, so the signal test proves nothing")
+        self.assertFalse(
+            got["docker_ran"],
+            "a SIGTERM during the gate let the script fall through and start ac-worldserver",
+        )
+        self.assertEqual(143, got["rc"], "a SIGTERM during the gate did not leave with 128+15")
+        self.assertNotIn("compose up", got["stderr"])
+
+    def test_an_unwritable_scratch_dir_still_lets_the_gate_reach_its_verdict(self):
+        # PRO-390 B2 (lost verdict). `GATE_DIR="$(mktemp -d)" || die` ran *before* the gate,
+        # and `mktemp -d` is exactly the call that dies on `No space left on device` — the
+        # PRO-351 host shape. A run that should have printed RESULT: PASS was answered with
+        # rc 2, no RESULT and no payload, because a scratch dir we cannot make is not a
+        # verdict. With no capture the gate speaks to the operator's own descriptors and the
+        # wrapper routes on rc alone.
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(self._restore_tmpdir, td)
+        td.chmod(0o555)
+        got = self._run_hostile(
+            'echo started > "$GATE_MARKER"\n'
+            'printf "RESULT: PASS\\n"\n'
+            "exit 0\n",
+            check_only=True,
+            tmpdir=td,
+        )
+        self.assertTrue(
+            got["gate_ran"],
+            "an unwritable scratch dir stopped the gate from running at all — the verdict "
+            "was lost before it could be reached",
+        )
+        self.assertEqual(0, got["rc"], "a passing run was turned into a failure by TMPDIR")
+        self.assertNotIn("REFUSING BOOT", got["stderr"])
+
+    def _restore_tmpdir(self, td):
+        td.chmod(0o755)
+        import shutil
+
+        shutil.rmtree(str(td), True)
+
+    def test_a_capture_removed_under_the_arms_leaks_no_tool_diagnostics(self):
+        # PRO-390 B3 (diagnostic leak). The cleanup trap used to delete the capture before
+        # the advice arms read it, and the finding probe ran `awk` over files that were
+        # already gone — so a raw `awk: cannot open ...` landed in the middle of the
+        # operator's refusal (the tmpfiles-daemon-reclaims-it-underneath-a-long-run shape
+        # bites the same way). The probe must treat a missing capture as "no finding here",
+        # and the rc-1 verdict must still route to the SQL lane even though the `!!` line is
+        # no longer readable.
+        import shutil
+
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(td), True)
+        got = self._run_hostile(
+            "printf '    !! unbounded-write: planted\\n'\n"
+            'rm -rf "$TMPDIR"/tmp.* 2>/dev/null\n'
+            "exit 1\n",
+            check_only=True,
+            tmpdir=td,
+        )
+        self.assertEqual(1, got["rc"])
+        self.assertNotIn(
+            "awk:", got["stderr"],
+            "the finding probe printed its own file-open error into the refusal",
+        )
+        self.assertNotIn(
+            "cat:", got["stderr"],
+            "the replay printed its own file-open error into the refusal",
+        )
+        self.assertIn(
+            "escalate to Scuff (SQL)", self._folded(got["stderr"]),
+            "losing the capture must not cost a real rc-1 verdict its SQL routing",
+        )
+
+    def test_a_missing_policy_file_is_not_answered_with_the_sql_escalation(self):
+        # PRO-390 non-blocking: `preflight: policy file not found: {path}` is as
+        # unambiguously environmental as an operational error — a mis-deployed checkout is
+        # missing its policy JSON — so it gets its own arm rather than the "cannot say
+        # whether this is about your SQL" catch-all, and never routes to the SQL lane.
+        proc = self._replay_through_wrapper(
+            2,
+            "",
+            "preflight: policy file not found: /opt/world/config/preflight.json\n",
+            self._writable_target(),
+        )
+        self.assertEqual(2, proc.returncode)
+        self.assertIn("policy file", self._folded(proc.stderr))
+        self.assertIn("not a finding about your SQL", self._folded(proc.stderr))
+        self.assertNotIn("escalate to Scuff (SQL)", self._folded(proc.stderr))
+        self.assertNotIn(
+            "cannot say whether this is about your SQL", self._folded(proc.stderr)
+        )
 
 
 if __name__ == "__main__":
