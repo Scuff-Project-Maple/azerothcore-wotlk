@@ -4183,6 +4183,19 @@ CHECK_TITLES = {
 # rather than in two f-strings that can drift apart.
 NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
 
+# The one wording for "a `--json` target was passed but holds no path" (PRO-352, Core's
+# PRO-355 contract A). It is the blank family's answer to the same question
+# `NO_JSON_PAYLOAD_NOTE` answers for an absent flag, so both live here and `main()` reads
+# them off one predicate — the pairing that stops stdout saying "no payload requested"
+# two lines before stderr says "the requested evidence payload is missing". Prefix
+# `preflight: ` at the standalone stderr emit; the bare sentence is shared with the
+# degraded stdout note. Blank by `strip()`, not `== ""`: a whitespace-only target is the
+# same family and the worse bug, because a real write with it would succeed. `strip()` is
+# Unicode, not ASCII, so Core's PRO-355 §2 "all-whitespace target" here includes spellings
+# a POSIX filename would legally allow — `--json $'\u00a0'` is refused as blank on purpose.
+# Refusing the safe direction is the decision; do not "fix" it into a false positive.
+BLANK_JSON_TARGET_NOTE = "the --json target is blank; pass a path or omit the flag"
+
 # Names that identify the *channel* rather than the destination, so a comparison against
 # `main()`'s label can never tell us whether we learned anything. CPython builds the three
 # std streams itself from the inherited descriptors and stamps them with these literals,
@@ -4541,7 +4554,10 @@ def _render_or_say_why(report: Report, args, *, payload_note: str) -> str:
     payload we could not write, the degraded line must not say the payload is fine; not
     asked for one at all, it must not imply one exists (PRO-325 NB2's shape again — an
     absent thing rendered as a bare `None`). `NO_JSON_PAYLOAD_NOTE` is the single
-    wording for the absent case so this line and any future one cannot drift apart.
+    wording for the absent case so this line and any future one cannot drift apart. It is
+    not the only wording this consumes: a requested-but-blank target arrives as its sibling
+    `BLANK_JSON_TARGET_NOTE` (PRO-352), never as `NO_JSON_PAYLOAD_NOTE`, which would tell the
+    operator nobody asked for evidence while stderr refuses the boot for lacking it.
 
     Which is why the parameter is required and keyword-only (PRO-341 review N1). It used
     to default to `None` and derive its own wording when nobody passed one — a branch no
@@ -4709,15 +4725,33 @@ def main(argv=None) -> int:
     # the two halves are held apart from each other: a stdout the operator's codec (or
     # kernel) refuses must not cost the payload, which is finding B one layer down, and
     # a payload we cannot write must not cost the printed verdict either.
+    # One predicate answers every question about `--json` (PRO-352, Core's PRO-355
+    # contract A). The write gate below and the evidence-missing refusal at the bottom of
+    # `main()` must not be able to disagree about whether a payload was requested, so both
+    # read `payload_requested`, which is true whenever the flag was passed at all — even
+    # with a blank argument. `worldserver-up.sh` forwards unrecognised operator arguments
+    # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with an empty or whitespace
+    # `$TARGET` reaches here; the old truthiness gate skipped both the write and the
+    # refusal for it, so the boot went out on the checks' own rc with no evidence at all.
+    payload_requested = args.json_out is not None
+    # `strip()`, not `== ""`: a whitespace-only target is the same family and the worse
+    # bug. `Path("   ").write_text` *succeeds*, dropping a file literally named `   ` in
+    # the cwd, so a truthiness gate would "succeed", boot, and hand the operator evidence
+    # nobody can find. Treat the whole family as "asked for evidence, produced none" and
+    # never touch the filesystem for it.
+    blank_json_target = payload_requested and not args.json_out.strip()
+
     payload_error = None
-    if args.json_out:
+    if payload_requested and not blank_json_target:
         # The build is inside the guard with the write (PRO-339 review NB-Rev-2). It is
         # not reachable on a real `Report` — `Finding`/`Report` are plain dataclasses and
         # `failed` is a property over `severity` — but neither was the degraded listing
         # until a fixture proved otherwise, and a raise here would escape `main()` as a
         # traceback: the same shape PRO-308 finding B and PRO-313 review B1 exist to
         # forbid, one half earlier. Reading the payload off the report is therefore done
-        # where a failure becomes a named evidence-write failure instead.
+        # where a failure becomes a named evidence-write failure instead. The gate is the
+        # shared predicate above, not `args.json_out` — a truthiness test here is what let
+        # a blank target skip both the write and the refusal (PRO-352).
         try:
             payload = {
                 "result": "fail" if report.failed else "pass",
@@ -4730,19 +4764,24 @@ def main(argv=None) -> int:
         except Exception as exc:
             payload_error = (f"preflight: could not write the --json payload to "
                              f"{args.json_out}: {type(exc).__name__}: {exc}")
+    elif blank_json_target:
+        # A fixed sentence with no interpolated path and no errno: an empty target renders
+        # as nothing and `Path("")` resolves to the cwd, so the generic message would name
+        # `.` — and the wrapper's next line tells the operator to fix "the named file(s)".
+        # Name the flag instead (PRO-355 §2), and reach the same refusal as any other
+        # asked-for-but-absent evidence.
+        payload_error = f"preflight: {BLANK_JSON_TARGET_NOTE}"
     if not args.json_only:
-        # One test, the one the write above uses (PRO-341 review B1). `--json ""` is
-        # reachable: `worldserver-up.sh` forwards unrecognised operator arguments
-        # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with a blank
-        # `$TARGET` arrives here as an empty path. The truthiness test above skips the
-        # write, so an `is None` test here fell through to the `else` and told the
-        # operator the payload "is on disk" at a path that rendered as nothing. That is
-        # PRO-325 NB2's shape, an absent thing asserted as present, one layer up. Two
-        # spellings of one question is the bug; now there is one. What `--json ""` still
-        # does *not* do is reach the evidence-missing refusal below, because
-        # `payload_error` stays None — same as base, and tracked apart.
-        if not args.json_out:
+        # The note is a claim about the payload, so it reads off the same predicate as the
+        # write: never-requested, requested-but-blank, requested-but-unwritable, and
+        # written each get their own wording. A blank target must not borrow
+        # `NO_JSON_PAYLOAD_NOTE` — that would tell the operator no payload was requested
+        # while stderr two lines later refuses the boot for missing evidence — and it must
+        # not claim a file is "on disk" when nothing was written.
+        if not payload_requested:
             payload_note = NO_JSON_PAYLOAD_NOTE
+        elif blank_json_target:
+            payload_note = BLANK_JSON_TARGET_NOTE
         elif payload_error:
             payload_note = f"the --json payload at {args.json_out} was NOT written"
         else:
@@ -4751,9 +4790,12 @@ def main(argv=None) -> int:
               label="<stdout>")
     if payload_error:
         # `--json` is an operator opt-in — the shipped boot wrapper does not pass it —
-        # but an operator who does ask for the payload trusts it as the evidence. So a
-        # run that was asked for evidence and produced none refuses the boot rather than
-        # reporting whatever rc the checks happened to reach.
+        # but it forwards one verbatim when the operator supplies it
+        # (`GATE_ARGS+=("$arg")`), and an operator who does ask for the payload trusts it
+        # as the evidence. So a run that was asked for evidence and produced none refuses
+        # the boot rather than reporting whatever rc the checks happened to reach. A blank
+        # target joins this path now that the write gate and this refusal share one
+        # predicate: evidence was asked for and none exists (PRO-352).
         _emit(sys.stderr, payload_error, label="<stderr>")
         _emit(sys.stderr, "preflight: the requested evidence payload is missing, so the "
                           "boot is refused; this is an evidence-write failure, not a "

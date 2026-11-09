@@ -22,7 +22,7 @@ from pathlib import Path
 from preflight_worlddb import (
     MySQL, Preflight, REGION_NAME_STOPWORDS, Report, _ident_parts, _schema_of, mask_sql,
     parse_statement, split_qualified, split_statements, build_arg_parser, write_targets,
-    NO_JSON_PAYLOAD_NOTE,
+    NO_JSON_PAYLOAD_NOTE, BLANK_JSON_TARGET_NOTE,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -5761,6 +5761,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         now that it genuinely cannot, the ordering gets a test of its own rather than
         inheriting one.
         """
+        import os
         import sys
         import types
         import preflight_worlddb as P
@@ -5847,20 +5848,47 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                     # the flag is there, the path is not, so nothing may claim a file.
                     out_path = Path(td) / "verdict.json"
                     json_arg = ""
+                elif json_target == "whitespace":
+                    # `--json "   "` is the same family and the dangerous one: a real
+                    # write with this argument *succeeds* and drops a file literally
+                    # named `   ` in the cwd, so a gate that only tests `== ""` would
+                    # boot on it. `out_path` stays None — there is no legitimate file to
+                    # look for. The proof is `leftovers`: the drive runs in an empty
+                    # scratch cwd, so a truthiness gate leaves `   ` in that directory and
+                    # the pin fails on a non-empty listing rather than on a `None` that was
+                    # fixed by construction.
+                    out_path = None
+                    json_arg = "   "
                 else:
                     out_path = None
                     json_arg = None
                 argv = ["--compose-root", str(tree), "--policy", str(policy)]
                 if json_arg is not None:
                     argv += ["--json", json_arg]
+                # Run the drive inside an empty scratch cwd. Everything `main()` is handed
+                # here is absolute, so no case depends on the process cwd — which is the
+                # point: a stray relative write has nowhere to land except this directory,
+                # where `leftovers` can see it. Without this the whitespace pin's
+                # "wrote no junk file" assertion is a tautology, because `out_path` is
+                # already None for that case and a real `   ` file would simply appear in
+                # the repo unnoticed (PRO-361 NB1).
+                scratch = Path(td) / "cwd"
+                scratch.mkdir()
+                cwd_before = os.getcwd()
                 rc = None
                 raised = None
+                leftovers = None
                 try:
-                    rc = P.main(argv)
-                except BaseException as exc:      # a fixture may raise one on purpose
-                    if not expect_raises:
-                        raise
-                    raised = type(exc).__name__
+                    os.chdir(scratch)
+                    try:
+                        rc = P.main(argv)
+                    except BaseException as exc:  # a fixture may raise one on purpose
+                        if not expect_raises:
+                            raise
+                        raised = type(exc).__name__
+                finally:
+                    os.chdir(cwd_before)
+                leftovers = sorted(p.name for p in scratch.iterdir())
                 payload = None
                 if out_path is not None and out_path.is_file():
                     payload = out_path.read_bytes()
@@ -5868,6 +5896,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             (P.Preflight, P.render, P._render_or_say_why,
              sys.stdout, sys.stderr, sys.__stderr__) = original
         return types.SimpleNamespace(rc=rc, raised=raised, payload=payload,
+                                      leftovers=leftovers,
                                       out=stdout.value(), err=stderr.value(),
                                       fallback=fallback.value(),
                                       payload_existed_at_render=seen.get("payload_existed"),
@@ -6352,31 +6381,91 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertIn("--json payload", text)
 
     def test_the_degraded_verdict_does_not_call_a_blank_json_target_a_payload(self):
-        """PRO-341 review B1: `--json ""` skips the write, so it may not claim the disk.
+        """PRO-341 review B1 + PRO-352: `--json ""` is "evidence asked for, none produced".
 
-        `main()` gated the write on truthiness and this note on `is None`. The wrapper
+        `main()` once gated the write on truthiness and this note on `is None`. The wrapper
         forwards unrecognised operator arguments verbatim, so an operator's
-        `--json "$TARGET"` with a blank `$TARGET` arrives here as an empty path, and
-        that run printed `the --json payload at  is on disk` while nothing was written.
-        Same class as PRO-325 NB2 (an absent thing asserted as present), one layer up,
-        and on the line an operator reads while the boot is being refused.
+        `--json "$TARGET"` with a blank `$TARGET` arrives here as an empty path, and that
+        run printed `the --json payload at  is on disk` while nothing was written —
+        PRO-325 NB2's shape (an absent thing asserted as present) on the line an operator
+        reads while the boot is being refused.
 
-        The rc is deliberately not pinned here: a blank `--json` still leaves
-        `payload_error` None, so it does not reach the evidence-missing refusal either.
-        That half predates this branch and is tracked separately; pinning `EXIT_FAIL`
-        now would make the follow-up look like a regression when it lands.
+        PRO-352 (Core's PRO-355 contract A) closes the other half: the write gate and the
+        evidence-missing refusal now read one predicate, so a blank target counts as
+        requested, the refusal fires, and the rc is `EXIT_ERROR` — no longer a value this
+        pin declines to name. Blank is *not* "not requested", so the degraded line must say
+        the target is blank, never borrow `NO_JSON_PAYLOAD_NOTE`, and never claim the
+        payload is on disk.
         """
+        import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                render_raises=True, json_target="empty")
         self.assertIsNone(res.payload, "fixture: a blank --json must write nothing")
         text = res.out.decode("ascii")
         self.assertIn("render() raised RuntimeError", text,
                       "the fixture stopped exercising the degraded line")
-        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertIn(BLANK_JSON_TARGET_NOTE, text,
+                      "a blank target must be named on the line that explains the refusal")
+        self.assertNotIn(NO_JSON_PAYLOAD_NOTE, text,
+                         "blank means evidence was requested; saying 'none requested' here "
+                         "contradicts the refusal stderr raises two lines later")
         self.assertNotIn("on disk", text,
                          "the line still asserts evidence that was never written")
         self.assertNotIn("unaffected", text)
         self.assertNotIn("None", text, "a blank path must not leak as the word None")
+        err = res.err.decode("ascii")
+        self.assertIn(BLANK_JSON_TARGET_NOTE, err)
+        self.assertIn("boot is refused", err)
+        self.assertEqual(P.EXIT_ERROR, res.rc,
+                         "evidence was asked for and none exists — the boot must not go "
+                         "out on the checks' own rc")
+
+    def test_a_blank_json_target_refuses_the_boot(self):
+        """PRO-352: `--json ""` is "evidence asked for, none produced" — refuse at EXIT_ERROR.
+
+        This is the half the PRO-335 pin above deliberately left unpinned. The single
+        predicate in `main()` makes a blank target reach the same evidence-missing refusal
+        an unwritable path already took, so the boot cannot slip out on the checks' rc. The
+        operator's stderr names `--json` rather than an empty path or the cwd (`.`), and no
+        filesystem write is attempted for the blank family.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="empty")
+        self.assertEqual([], res.leftovers,
+                         "a blank --json must not touch the filesystem at all")
+        self.assertIsNone(res.payload, "a blank --json must write nothing")
+        err = res.err.decode("ascii")
+        self.assertIn(BLANK_JSON_TARGET_NOTE, err)
+        self.assertIn("boot is refused", err)
+        self.assertNotIn("could not write the --json payload to", err,
+                         "a blank target must be refused by the predicate, not by a failed "
+                         "write against the cwd")
+        self.assertEqual(P.EXIT_ERROR, res.rc)
+
+    def test_a_whitespace_json_target_refuses_the_boot(self):
+        """PRO-355 §2: the blank family is tested with `strip()`, not `== ""`.
+
+        `--json "   "` is the worse shape of the same bug: `Path("   ").write_text`
+        *succeeds*, so a truthiness gate boots and hands the operator a file literally
+        named `   ` that nobody can find. The predicate treats any whitespace-only target
+        as blank and refuses it exactly like the empty string.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="whitespace")
+        # The headline assertion has to be able to fail. `res.payload` is None by
+        # construction for this case, so it proves nothing on its own; the scratch cwd
+        # the drive runs in is what actually witnesses "no junk file" (PRO-361 NB1).
+        self.assertEqual([], res.leftovers,
+                         "a whitespace-only target must write no junk file — a `   ` in the "
+                         "scratch cwd means the write was attempted and succeeded")
+        self.assertIsNone(res.payload, "a whitespace-only target must write no junk file")
+        err = res.err.decode("ascii")
+        self.assertIn(BLANK_JSON_TARGET_NOTE, err)
+        self.assertIn("boot is refused", err)
+        self.assertNotIn("could not write the --json payload to", err)
+        self.assertEqual(P.EXIT_ERROR, res.rc)
 
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
