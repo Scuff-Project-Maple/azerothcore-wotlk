@@ -6048,6 +6048,15 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # `REFUSING BOOT` lines from the lease checks, and the guard below has to cover one
     # sentence, not a 300-line shell script (PRO-359 review B1).
     REFUSAL_BLOCK_ANCHOR = "REFUSING BOOT — pre-flight failed"
+    # Shell block tokens, matched on word boundaries and *position-free*. Position is what
+    # PRO-403 B1 walked through: a line-leading match cannot see `  true; if :; then`, so
+    # the nested block it opened hid a fourth exempted quote and the suite stayed green. The
+    # lookbehind and lookahead are what keep operator-facing prose honest — `pre-flight`,
+    # `finding` and `file(s)` are not block tokens — and they are verified by the control run
+    # over the pristine block, not by an allowlist of the current wording.
+    _SHELL_BLOCK_KEYWORD = re.compile(
+        r"(?<![\w./-])(?:if|elif|else|fi|then|do|done|case|esac"
+        r"|for|while|until|select)(?![\w-])")
 
     def _wrapper_refusal_block(self) -> str:
         """The lines the wrapper prints when the gate exits non-zero — that block only.
@@ -6070,6 +6079,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         # the opener and the anchor sits outside the scan, and the whole suite stays green
         # without any nested conditional at all. So require the anchor to be the first thing
         # the `if` does, which leaves no room above it for a line the guard cannot see.
+        #
+        # Kept alongside the token checks below, which otherwise imply it for any opener
+        # that survives `bash -n`: the one spelling only this regex catches is an opener
+        # whose `then` is not the last token on the line -- `if (( rc != 0 )); then \` with
+        # the anchor arrived at by line continuation. Measured; that spelling fails here and
+        # nowhere else, so this is a bound and not a duplicate.
         if anchor == 0:
             self.fail(f"{self.REFUSAL_BLOCK_ANCHOR!r} is the first line of "
                       f"{self.WRAPPER.name}, so nothing opens the refusal block.")
@@ -6087,27 +6102,45 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
                       f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
                       "the claim about what it quotes")
-        # The bound above is the FIRST bare `fi`, which is only the right bound while the
-        # block holds no block keyword of its own. If it grows one, that nested `fi` becomes
-        # the bound and every line below it silently leaves the scan — including a new
-        # exempted quote, which is exactly the widening this block exists to refuse
-        # (PRO-346: no third exempted line). Measured on PRO-388 NB2: the block extended
-        # with a nested `if`/`fi` and a fourth quoted fragment passed the whole suite
-        # green, while the same fragment added flat fails two tests.
+        # The bound above is the FIRST bare `fi`, which is the right bound only while that
+        # `fi` is the one closing the `if` on the opener line. PRO-403 B1 measured two
+        # spellings where it is not, and both keep `Ran 368 tests` / OK: a nested block whose
+        # opener follows another command on the same line (`  true; if :; then`) is invisible
+        # to a line-leading keyword match, and a second `if` opened *on the opener line* is
+        # invisible to a sweep that starts below it. Either way the first bare `fi` is a
+        # nested close, so every line under it — a fourth exempted quote included, which is
+        # the PRO-346 widening this block exists to refuse — silently leaves the scan.
         #
-        # Match any line-leading shell block keyword rather than an `if … then` shape:
-        # PRO-403 P2 showed a `then`-on-its-own-line spelling walks through a pattern that
-        # demands `then` at end of line, and a lone `else`/`do`/`case` breaks the bound just
-        # as hard. The block as it stands is seven `tell` lines plus `exit "$rc"`, so a hit
-        # here always means the block outgrew what this helper can bound.
+        # So pin the two properties that make the bound exact instead of re-deriving the
+        # bound a second way and comparing the answers: the opener line is exactly one `if`
+        # and its `then`, and the body carries no shell block token at all. Given those, the
+        # nesting depth between the opener and the first bare `fi` can only run 1 then 0, so
+        # that `fi` *is* the closer — a depth walk over the same text could not report
+        # anything the two checks below did not, which is the standard PRO-403 applied to P7
+        # and to the window-emptiness guard. Each check is exercised by its own probe: the
+        # opener by `if (( rc != 0 )); then if :; then`, the sweep by `true; if :; then` and
+        # by a balanced `if …; then …; fi` written on one line, which leaves the depth bound
+        # intact and adds no quote, so nothing else in the suite can see it.
+        opener_keywords = self._SHELL_BLOCK_KEYWORD.findall(opener)
+        if opener_keywords != ["if", "then"]:
+            self.fail(
+                f"the refusal block does not open on a single `if`: the line before "
+                f"{self.REFUSAL_BLOCK_ANCHOR!r} is {opener!r}, which carries the shell block "
+                f"tokens {opener_keywords} and must carry exactly ['if', 'then']. A second "
+                "block token on that line moves the first bare `fi` inside it, so the "
+                "no-widening guard scans part of the sentence and calls it all of it — "
+                "flatten the block or move the wording out of it, but do not let the scan "
+                "shrink (PRO-388 NB2, PRO-403 P2/B1).")
         nested = [ln for ln in lines[start + 1:end]
-                  if re.search(r"^\s*(if|elif|else|fi|then|do|done|case|esac)\b", ln)]
+                  if self._SHELL_BLOCK_KEYWORD.search(ln)]
         if nested:
-            self.fail(f"the refusal block at {self.REFUSAL_BLOCK_ANCHOR!r} contains a nested "
-                      f"block keyword {nested[0]!r}; the first `fi` no longer bounds the block, "
-                      "so the no-widening guard scans part of the sentence and calls it all "
-                      "of it. Flatten the block or bound it structurally — do not let the "
-                      "scan shrink (PRO-388 NB2, PRO-403 P2).")
+            self.fail(f"the refusal block at {self.REFUSAL_BLOCK_ANCHOR!r} carries the shell "
+                      f"block token "
+                      f"{self._SHELL_BLOCK_KEYWORD.search(nested[0]).group(0)!r} on "
+                      f"{nested[0]!r}; the first `fi` no longer bounds the block, so the "
+                      "no-widening guard scans part of the sentence and calls it all of it. "
+                      "Flatten the block, or move the wording that reads like shell out of "
+                      "it — do not let the scan shrink (PRO-388 NB2, PRO-403 P2/B1).")
         return "\n".join(lines[start:end])
 
     def _wrapper_quoted_fragments(self) -> list:
