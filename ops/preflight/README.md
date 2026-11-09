@@ -132,7 +132,7 @@ degrades to listing the findings if `render()` itself blows up, and that degrade
 itself a guard, so it is held to the rule it exists to enforce: no line of it may raise back into
 `main()`. A report that raises while it is being read still prints the two-line
 `PRO-179 … / RESULT: …` header instead of losing the verdict (PRO-324 NB1). The same line names the
-payload's actual outcome — on disk, not requested, or not written — because `main()` hands the
+payload's actual outcome — on disk, not requested, blank, or not written — because `main()` hands the
 renderer the claim it actually proved, as the required keyword-only `payload_note`; the renderer
 derives nothing about the payload it did not write (PRO-324 NB2, closed on the integration line by
 PRO-335 §2 and PRO-341 review N1). The dictionary behind that payload is built *inside* the same
@@ -165,10 +165,13 @@ interpreter teardown is not observable from inside a fixture. The same class pin
 observation: with fd 1 closed, `sys.stdout` is `None` and the old label printed the word `None` where
 a destination belongs; an absent thing is now named as absent, including on the degraded render line,
 which says "no --json payload requested" rather than claiming a payload nobody asked for.
-That degraded line draws from **three** wordings, and all three are decided by one predicate in
-`main()` (PRO-352, Core's PRO-355 contract A): never requested → `NO_JSON_PAYLOAD_NOTE`;
-requested but blank → `BLANK_JSON_TARGET_NOTE`; requested but unwritable → "the --json payload at
-X was NOT written". The write attempt and the evidence-missing refusal read the same
+That degraded line draws from **four** wordings, three of which say the evidence is not there, and
+all four are decided by one predicate in `main()` (PRO-352, Core's PRO-355 contract A): never
+requested → `NO_JSON_PAYLOAD_NOTE`; requested but blank → `BLANK_JSON_TARGET_NOTE`; requested but
+unwritable → "the --json payload at X was NOT written"; written → "the --json payload at X is on
+disk". The fourth is not hypothetical — it is what that line says when `render()` raises *after* the
+payload landed, which is the shape `test_the_degraded_verdict_still_points_at_the_payload_it_wrote`
+holds. The write attempt and the evidence-missing refusal read the same
 `payload_requested = args.json_out is not None`, so they cannot disagree about whether evidence was
 asked for. Blankness is `args.json_out.strip()` — not truthiness, and not `== ""` — so `--json ""`
 and `--json "   "`, what an operator's `--json "$TARGET"` becomes when `$TARGET` is blank because
