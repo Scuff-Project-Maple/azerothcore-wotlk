@@ -691,8 +691,10 @@ class TestDirtyWorktree(unittest.TestCase):
 
     def _file(self, pf, sql):
         # git_root is the temp dir so is_dirty() sees a real repo-relative path
+        import shutil
         import tempfile
         d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         p = d / "upstream.sql"
         p.write_text(sql, encoding="utf-8")
         pf.git_root = d
