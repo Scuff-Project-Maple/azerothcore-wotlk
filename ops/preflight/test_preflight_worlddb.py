@@ -7605,19 +7605,20 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
     # route is reached by naming a path that is not there — the operator's typo, which is
     # how it happens in the field. The driver still builds `policy.json` and the tree;
     # `main()` returns before either is reached, which is the point: the shape under test
-    # is the earliest `_emit`-backed exit `main()` has, and the one whose report goes to
-    # `sys.stderr`. `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4691` is
-    # earlier still and writes its usage error to `sys.stderr` directly — never through
-    # `_emit`, so nothing retires it — which is a separate gap (PRO-389 review N-a) and not
-    # what these pins drive.
+    # is the earliest `_emit`-backed exit `main()` has, and one of the two whose report goes
+    # to `sys.stderr` — the other is the operational-error return at
+    # `preflight_worlddb.py:4716-4717`, which this family does not drive.
+    # `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4692` is earlier still
+    # and writes its usage error to `sys.stderr` directly — never through `_emit`, so nothing
+    # retires it — which is a separate gap (PRO-389 review N-a) and not what these pins drive.
     _MAIN_ARGV = ('["--compose-root", str(td / "tree"), "--policy", str(td / "policy.json"), '
                   '"--json", str(td / "verdict.json")]')
     _MAIN_ARGV_MISSING_POLICY = ('["--compose-root", str(td / "tree"), "--policy", '
                                  'str(td / "absent.json"), "--json", str(td / "verdict.json")]')
     # The third route, for the `EXIT_ERROR` return whose report does *not* go to
     # `sys.stderr`: `--json ""` is "evidence asked for, produced none" (PRO-352), so the
-    # report is emitted on `sys.stdout` (`preflight_worlddb.py:4789`) and the two notice
-    # lines on `sys.stderr` (`:4799-4800`). There primary and fallback are two objects,
+    # report is emitted on `sys.stdout` (`preflight_worlddb.py:4795-4796`) and the two notice
+    # lines on `sys.stderr` (`:4805-4808`). There primary and fallback are two objects,
     # which is the pairing the missing-policy return cannot show.
     _MAIN_ARGV_BLANK_JSON = ('["--compose-root", str(td / "tree"), "--policy", '
                              'str(td / "policy.json"), "--json", ""]')
@@ -7864,7 +7865,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` still costs the gate its rc: "
-                             f"rc={proc.returncode} stderr={proc.stderr}")
+                             f"rc={proc.returncode} "
+                             f"(stderr is empty by construction under 2>&1)")
             payload = Path(td) / "verdict.json"
             self.assertTrue(payload.is_file(),
                             "the evidence has to survive both descriptors being full")
@@ -7891,7 +7893,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=120 story in the pair test proves nothing ({proc.stderr})")
+                             f"the rc=120 story in the pair test proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertTrue((Path(td) / "verdict.json").is_file(),
                             "even the pre-fix build wrote the payload before presenting")
 
@@ -7909,7 +7912,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         different stream, so none of them reaches that identity — which is why this route
         could sit unpinned while looking covered. (The three in-process `EXIT_ERROR` rc
         pins in the blank/whitespace `--json` family — `test_a_blank_json_target_refuses_the_boot`
-        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 360
+        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 440-510
         lines and a class boundary above this one — are not end-to-end: they run `main()`
         under `_drive_main`, which swaps the streams inside the child and so cannot see the
         interpreter's teardown flush that costs 120.)
@@ -7920,7 +7923,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         not by itself show which half of the fix saves the route, and this pin credits
         neither. The controls carry the asymmetry instead: on the `EXIT_FAIL` route either
         call removed on its own costs 120, while on the other `EXIT_ERROR` return — the
-        payload write failure / blank `--json` at `preflight_worlddb.py:4791-4803`, whose
+        payload write failure / blank `--json` at `preflight_worlddb.py:4797-4809`, whose
         report goes to `sys.stdout` — leaving only the `sys.stdout` retirement is no longer
         enough, which is what that route's own control below pins. "Passes today" is not a pin
         either way, and the failure class is the one `flush_std_files()` owns: bytes a device
@@ -7941,7 +7944,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_ERROR, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
-                             f"the error route too: rc={proc.returncode} stderr={proc.stderr}")
+                             f"the error route too: rc={proc.returncode} "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the missing-policy return happens before the evidence write, so "
                              "the rc is the only thing this route can report")
@@ -7963,7 +7967,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the pre-fix build returned before the payload too; if this flips "
                              "the two tests are no longer driving the same route")
@@ -7972,10 +7977,10 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self):
         """PRO-389 review B1/N-b: the `EXIT_ERROR` return whose primary is *not* `sys.stderr`.
 
-        `main()`'s third `EXIT_ERROR` return (`preflight_worlddb.py:4791-4803`) is reached
+        `main()`'s third `EXIT_ERROR` return (`preflight_worlddb.py:4797-4809`) is reached
         with `--json ""` — evidence asked for and none produced (PRO-352) — and it presents
-        the other way round: the report goes to `sys.stdout` (`:4789`) and the two notice
-        lines to `sys.stderr` (`:4799-4800`). Primary and fallback are two different
+        the other way round: the report goes to `sys.stdout` (`:4795-4796`) and the two notice
+        lines to `sys.stderr` (`:4805-4808`). Primary and fallback are two different
         objects there, so the one-object identity that lets the missing-policy return above
         survive either retirement call alone does not exist. Measured on 3.12.3 under
         `> /dev/full 2>&1`: unpatched it exits **2**. The control below patches
@@ -7985,7 +7990,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         does *not* cost it 120 is blocking only the second call, nor the genuine pre-PRO-372
         `_emit` with nothing but the `if fallback_refused:` retirement deleted: both exit
         **2**, because this route runs more than one `_emit` and the pair at
-        `preflight_worlddb.py:4799-4800` carries its own *primary* retirement, which in the
+        `preflight_worlddb.py:4805-4808` carries its own *primary* retirement, which in the
         pre-372 build lands on the same `sys.__stderr__` the skipped fallback call would have
         covered. That is also why the control's predicate is strictly stronger than pre-372
         rather than equal to it — it drops that second primary call too.
@@ -8013,7 +8018,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self.assertEqual(P.EXIT_ERROR, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
                              f"the evidence-write route too: rc={proc.returncode} "
-                             f"stderr={proc.stderr}")
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "a blank `--json` target must never touch the filesystem, so the "
                              "rc is the only thing this route can report")
@@ -8048,7 +8053,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the suppressed-retirement build never wrote the payload either; "
                              "if this flips the two tests are no longer driving the same route")
@@ -8058,7 +8064,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
 
         The two pins above can only claim their rc — under `2>&1` fd 2 delivers nothing to
         the parent, and an `argparse` usage error exits 2 as well
-        (`preflight_worlddb.py:4691`, the gap PRO-389 review N-a routed to PRO-406), so rc
+        (`preflight_worlddb.py:4692`, the gap PRO-389 review N-a routed to PRO-406), so rc
         alone does not say which `EXIT_ERROR` return ran. Here only fd 1 sits on the refusing
         device, so fd 2 is live and the route can name itself: the `_emit` notice about the
         report, the PRO-352 blank-target line and the evidence-write refusal all have to
