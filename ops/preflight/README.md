@@ -60,6 +60,34 @@ gitignored root `docker-compose.override.yml` (which `scripts/compose-sync.sh` k
 the tracked `wrath-unbound/docker-compose.override.yml`), and it is `:ro`. Check 0b asserts that
 at run time instead of trusting the file.
 
+### The two roots, and which one decides what was read (PRO-307 A3)
+
+`--compose-root` is the only root the boot path needs, and both flags below default to it. They
+are **not** interchangeable, and only one of them chooses what the gate looked at:
+
+| flag | what it actually steers |
+| --- | --- |
+| `--git-root` | the tracked tree the gate reads: every `git` probe runs here, and the `$`-relative `updates_include` paths resolve against it (`$/data/sql/db_world` → `<git-root>/data/sql/db_world`). **This is the set of files the scan walks.** |
+| `--sql-root` | the directory check 0b compares against the container's `/azerothcore/data/sql` bind, and the base the report prints as "sql root". It does **not** choose the scan. |
+
+So `--git-root /mnt/data/wow-server --sql-root <worktree>/data/sql` is a coherent thing to ask for
+only if you read the report carefully: PRO-303 ran exactly that and the banner printed the
+*worktree* as "sql root" while the gate counted 3060 files from `/mnt/data/wow-server` — the
+trigger file in the other tree was never opened, and the run said `RESULT: PASS`. Check 0b was
+still doing its job (it compares `realpath(sql_root)` to the bind, which is why the combination
+is not inert); the line that answers "which files did you actually look at" was the one lying.
+
+The report therefore now prints both, each labelled with what it is for:
+
+```
+  sql root     : /worktree/data/sql (what check 0b compares to the container's sql bind)
+  scanned from : /mnt/data/wow-server (the $-relative updates_include paths the scan walked resolve here)
+```
+
+Making the scan follow `--sql-root` instead would be a behaviour change to a gate whose whole
+value is that it reads what the boot will apply, and it would need its own test that the scanned
+set still equals the applied set; the flags and this section are the fix that was actually made.
+
 ## Provenance (who is "company")
 
 Check 4 is enforced on company-owned files. A file is company-owned when **either** its directory
@@ -194,8 +222,8 @@ directory+author rule.
 
 | state | what git actually said | what the gate does |
 | --- | --- | --- |
-| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref — no reflog, no `FETCH_HEAD`, no sibling reflog and no `last-verified` record naming it | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state |
-| `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD`, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
+| `unchecked` | `git rev-parse --verify --quiet <ref>` finds nothing at all, **and** this clone has no local trace of the ref — no reflog, no `FETCH_HEAD` naming a fetched ref, no sibling reflog and no `last-verified` record naming it | `WARN`, exemption kept — a clone that has genuinely never fetched still boots offline, and the report names `refreshCommand`. A plain `git clone` of a remote that never carried the ref is exactly this state, and so is one whose only fetch attempt failed on transport |
+| `indeterminate` / `ref-deleted` | the ref is gone **but** this clone has fetch history: `ref`'s own reflog, a `FETCH_HEAD` that names at least one fetched ref, or a sibling ref that still carries a reflog of its own | `FAIL`, failing closed, naming `refreshCommand`; only `--allow-missing-upstream-ref` walks it back to the `WARN` |
 | `indeterminate` / `attested-missing` | the ref is gone and none of those three signals is present, **but** this clone's `last-verified` record says a satisfied run of this gate read this very ref at a named commit at a named time | `FAIL`, failing closed, naming the attested oid, the timestamp, the record path and `refreshCommand`. A clone that genuinely never fetched has no attestation to lose, so this is one whose fetch fingerprints were removed after the fact; `--allow-missing-upstream-ref` walks it back to the `WARN` exactly as it does `ref-deleted`, because it is the same claim with a different witness |
 | `indeterminate` / `attestation-untrusted` | the ref is gone and a record for it exists that this gate cannot vouch for — unreadable, too large for the bounded read to have seen all of it, holding a line it cannot parse, unversioned or of a version it does not read, or written for another repo or another remote url | `FAIL`, failing closed, naming the record path and the reason. "The record is unreadable" must not be the same sentence as "there is no record", or truncating a file is all it takes to buy back the exemption the record was blocking |
 | `indeterminate` / `oid-mismatch` | the ref resolves to a commit, and the commit recorded for it is neither that commit nor an ancestor of it, and the ref carries no reflog of its own | `FAIL`, failing closed, naming both oids. A fetch fast-forwards a remote-tracking ref and a real force-push leaves a reflog, so this is the shape of `git update-ref` pointing the tracked ref at commits of the operator's choosing — and `ls-tree` is never asked of it |
@@ -223,11 +251,26 @@ The `ref-deleted` discrimination is local history only — three signals, no net
 tests is *fetching*, so each is a file a fetch writes and `git clone` does not:
 
 - the ref's own reflog, at `git rev-parse --git-path logs/<ref>`;
-- `FETCH_HEAD`, which `git fetch`/`git pull` writes and `git clone` does not — and which counts as a
-  fetch only when it holds something, for the same reason a reflog does;
+- `FETCH_HEAD`, but only what a fetch actually **wrote** — at least one line opening with a
+  fetched object id (`git fetch` writes `<sha>\t\tbranch 'Playerbot' of <url>` per ref). Its
+  mere existence is not evidence: `git fetch` opens the file before it has anything to record,
+  so a fetch that fails on transport leaves it present and empty. Measured on git 2.43.0,
+  `GIT_ALLOW_PROTOCOL=none git fetch origin Playerbot` exits 128 and leaves a 0-byte
+  `.git/FETCH_HEAD` (sha256 `e3b0c44298fc…`, the empty digest), and reading `exists()` as
+  "this clone has fetched" turned that never-fetched clone into a `upstream-ref-deleted`
+  refusal that accused the operator of a deletion they had not made (PRO-307 A1). A file with
+  content that parses as no fetched ref is still evidence — the gate does not hand the
+  exemption back because a file holds something unexpected — but it is reported as that, and
+  never as a fetch the gate observed;
 - any sibling ref under the same `refs/remotes/<remote>/` namespace other than `<remote>/HEAD`
   that **carries its own reflog** (`for-each-ref`, not `show-ref` — `show-ref` matches anchored
   whole ref names, so a bare namespace prefix answers "no refs").
+
+`FETCH_HEAD` is also not monotone, which is the second reason it is one of three probes rather
+than the answer: one good fetch writes it and the next failed fetch truncates it back to 0
+bytes, destroying that signal on its own. Nothing in the gate can tell "fetched, then a failed
+fetch" from "attempted one fetch and it failed" from that file alone, which is why the durable
+`last-verified` record below exists (PRO-307 A1).
 
 The reflog is what makes the third signal honest, and it is the reason the probe is not simply
 "any sibling ref" (PRO-291 review B1). `git clone` populates `refs/remotes/<remote>/*` itself, so a
@@ -443,12 +486,31 @@ then prints **nothing on stdout** (warning on stderr, error on stderr) while sti
 remote-tracking test is therefore "exit 0 **and** a name starting with `refs/remotes/`"; anything
 else is answered as *not remote-tracking* and refuses the boot, because the person whose forged
 `--author` this rule exists to catch can create exactly that shadow branch. `audit_policy_schema.py`
-exits 1 when `verifiedRef` is deleted, empty, or does not start with `refs/remotes/`, so the
-qualifier cannot be dropped silently. It also exits 1 on a name carrying a revision selector
+exits 1 when the `verifiedRef` **field** is deleted, empty, or does not start with `refs/remotes/`,
+so the qualifier cannot be dropped silently. It also exits 1 on a name carrying a revision selector
 (`refs/remotes/origin/Playerbot^{tree}`, `~1`, `@{0}`) or on a bare object name: those pass the
 prefix test but name something the gate cannot peel to a commit, and it refuses the boot on
 exactly that (`not-a-commit`), so an audit that accepted them would exit 0 on a policy the gate
 rejects (PRO-291).
+
+"Deleted" above has always meant a deleted *field*, and a name that is well-formed but no longer
+resolvable is not something a text check can see. A well-formed `refs/remotes/...` name whose
+object is a tree, and a ref deleted from the clone, both used to audit clean — `0 problem(s)`,
+exit 0 — while the gate refused the boot they describe (`PRO-303` measured the first on the
+deployhost: `refs/remotes/origin/pro303-drill-tree` made from `git rev-parse 194697d5d^{tree}`;
+`PRO-307` A2/A3 the pair). So the auditor now runs at **two depths** and prints which one ran:
+
+- **SHAPE-ONLY** — with no `--repo`, or a `--repo` that is not a git tree: the text checks above,
+  and nothing else. The output says so on its own line, because `0 problem(s)` from this pass does
+  not mean `verifiedRef` resolves, is a commit, or is even still in the clone.
+- **RESOLVED** — when a git repo is available: the shape checks **and** the same two-step peel the
+  gate performs. A name that resolves to no object at all exits 1 as the gate's
+  `upstream-ref-deleted` (or `upstream-ref-attested-missing`, once a `last-verified` record names
+  it), naming `refreshCommand`; a name that resolves to something that is not a commit exits 1 as
+  `not-a-commit`, naming the oid and what `cat-file -t` called it.
+
+Neither depth fetches, and a probe git cannot answer is a problem rather than a pass — an audit
+that cannot ask the question must not report the answer either (PRO-300's fail-closed rule).
 
 Content **is** consulted. The ref is listed with `git ls-tree -z -r` — NUL-delimited, so a genuine
 upstream filename like `2026_11_04_00_érfar.sql` is compared byte-for-byte instead of against git's
@@ -785,6 +847,10 @@ dry run. There is no operator-settable scratch prefix.
    `--policy /some/other.json` would be audited against a document it is not enforcing — a
    policy the auditor never opened can pass while the file that decides the boot is not (PRO-248
    review N5). `python3 ops/preflight/audit_policy_schema.py --policy "$POLICY" --repo "$TREE"`.
+   Read the `provenance check:` line before believing `0 problem(s)`: `SHAPE-ONLY` means the
+   auditor only read the `verifiedRef` *name* and never asked git whether it resolves, is a
+   commit, or is still in the clone; `RESOLVED` means it asked, in the `--repo` you named
+   (PRO-307 A2/A3 — see "the two depths" above).
 4. `PYTHONPATH=ops/preflight python3 ops/preflight/test_preflight_worlddb.py` before committing
    (plain `python3 -m unittest discover -s ops/preflight` fails: the directory is not a package).
 
