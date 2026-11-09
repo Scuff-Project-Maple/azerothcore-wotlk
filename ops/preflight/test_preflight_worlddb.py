@@ -6058,12 +6058,29 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         (PRO-359 review B1).
         """
         lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
-        start = next((i for i, ln in enumerate(lines)
-                      if self.REFUSAL_BLOCK_ANCHOR in ln), None)
-        if start is None:
+        anchor = next((i for i, ln in enumerate(lines)
+                       if self.REFUSAL_BLOCK_ANCHOR in ln), None)
+        if anchor is None:
             self.fail(f"{self.WRAPPER.name} no longer prints {self.REFUSAL_BLOCK_ANCHOR!r}. "
                       "The gate's exit-code contract and this suite's view of the refusal "
                       "wording both key on that line, so a rename here is not cosmetic.")
+        # The right bound is the first bare `fi`; the left bound has to be the `if` that
+        # opens the block, not the anchor line. Bounding at the anchor is what PRO-388's
+        # re-review (PRO-403 P11) walked through: a fourth exempted quote inserted between
+        # the opener and the anchor sits outside the scan, and the whole suite stays green
+        # without any nested conditional at all. So require the anchor to be the first thing
+        # the `if` does, which leaves no room above it for a line the guard cannot see.
+        if anchor == 0:
+            self.fail(f"{self.REFUSAL_BLOCK_ANCHOR!r} is the first line of "
+                      f"{self.WRAPPER.name}, so nothing opens the refusal block.")
+        opener = lines[anchor - 1]
+        if not re.search(r"\bif\b.*\bthen\b\s*$", opener):
+            self.fail(f"the refusal block does not open immediately above "
+                      f"{self.REFUSAL_BLOCK_ANCHOR!r}: the line before it is {opener!r}, "
+                      "so the scan would silently exclude lines that are part of the same "
+                      "refusal sentence. Put the anchor first after the `if`, or bound this "
+                      "helper structurally — do not let the scan shrink (PRO-403 P11).")
+        start = anchor - 1
         end = next((i for i in range(start, len(lines))
                     if lines[i].strip() == "fi"), None)
         if end is None:
@@ -6071,21 +6088,26 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                       f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
                       "the claim about what it quotes")
         # The bound above is the FIRST bare `fi`, which is only the right bound while the
-        # block holds no conditional of its own. If it grows one, that nested `fi` becomes
+        # block holds no block keyword of its own. If it grows one, that nested `fi` becomes
         # the bound and every line below it silently leaves the scan — including a new
         # exempted quote, which is exactly the widening this block exists to refuse
         # (PRO-346: no third exempted line). Measured on PRO-388 NB2: the block extended
-        # with a nested `if`/`fi` and a fourth quoted fragment passes the whole suite
-        # green, while the same fragment added flat fails two tests. So refuse a block
-        # this helper cannot bound rather than bound it wrongly and call the part we
-        # scanned the whole of it.
-        nested = [ln for ln in lines[start:end] if re.search(r"\bif\b.*\bthen\b\s*$", ln)]
+        # with a nested `if`/`fi` and a fourth quoted fragment passed the whole suite
+        # green, while the same fragment added flat fails two tests.
+        #
+        # Match any line-leading shell block keyword rather than an `if … then` shape:
+        # PRO-403 P2 showed a `then`-on-its-own-line spelling walks through a pattern that
+        # demands `then` at end of line, and a lone `else`/`do`/`case` breaks the bound just
+        # as hard. The block as it stands is seven `tell` lines plus `exit "$rc"`, so a hit
+        # here always means the block outgrew what this helper can bound.
+        nested = [ln for ln in lines[start + 1:end]
+                  if re.search(r"^\s*(if|elif|else|fi|then|do|done|case|esac)\b", ln)]
         if nested:
             self.fail(f"the refusal block at {self.REFUSAL_BLOCK_ANCHOR!r} contains a nested "
-                      f"conditional {nested[0]!r}; the first `fi` no longer bounds the block, "
+                      f"block keyword {nested[0]!r}; the first `fi` no longer bounds the block, "
                       "so the no-widening guard scans part of the sentence and calls it all "
                       "of it. Flatten the block or bound it structurally — do not let the "
-                      "scan shrink (PRO-388 NB2).")
+                      "scan shrink (PRO-388 NB2, PRO-403 P2).")
         return "\n".join(lines[start:end])
 
     def _wrapper_quoted_fragments(self) -> list:
@@ -6238,7 +6260,9 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # `_render_or_say_why()`, so a bare prefix would still be satisfied after the finding
     # marker is renamed, provided the row is pointed at a shape that renders degraded. The
     # decoy column pins this row to the formatted-listing emitter by excluding the
-    # fallback's `    !! [<check>] <severity> ` shape. (Pointing this row at
+    # fallback's `    !! [<check>] <severity> ` shape, and the decoy is itself pinned to a
+    # line the fallback really writes: a decoy nothing matches excludes nothing, which is
+    # how PRO-403 P7 left the row unguarded with the suite green. (Pointing this row at
     # `"refused payload"` stays a genuine witness: that shape reaches the same formatted
     # listing and only then fails the payload write, so it is the same emitter, not a
     # second one.)
@@ -6322,6 +6346,20 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                                 f"the fixture drifted: the decoy {decoy!r} does not even "
                                 f"start with the prefix {line_prefix!r} it is meant to "
                                 "exclude")
+                # A decoy that no line the gate writes can ever match excludes nothing, and
+                # the two asserts below cannot see that: `elsewhere` only asks for the
+                # *prefix* to turn up in another shape, which the `refused payload` shape
+                # still reaches through the same formatted listing. Measured on PRO-403 P7:
+                # rename the degraded fallback's `    !! [` marker and the decoy becomes
+                # fiction while the suite stays green — an excluded shape that was never
+                # real, which is PRO-369 NB1's self-answering defect again.
+                self.assertTrue(
+                    [ln for other_lines in emitted.values() for ln in other_lines
+                     if ln.startswith(decoy)],
+                    f"the decoy {decoy!r} on the {frag!r} row matches no line the gate "
+                    "actually writes, so it excludes nothing and the witness set is "
+                    "unguarded: point it at a shape the fallback emitter really produces or "
+                    "drop the column (PRO-403 P7).")
                 elsewhere = [ln for other, other_lines in emitted.items()
                              if other != shape
                              for ln in other_lines if ln.startswith(line_prefix)]
