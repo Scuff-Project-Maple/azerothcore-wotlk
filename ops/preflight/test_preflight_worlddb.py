@@ -6060,8 +6060,66 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # `REFUSING BOOT` lines from the lease checks, and the guard below has to cover one
     # sentence, not a 300-line shell script (PRO-359 review B1).
     REFUSAL_BLOCK_ANCHOR = "REFUSING BOOT — pre-flight failed"
+    # Structural `if`/`fi` tokens, matched only against a comment-stripped line and only
+    # where the keyword IS the statement. Both halves of that matter: `# rc 1 IS a verdict
+    # even if the capture came back empty` is a real line of the refusal block, and a
+    # `\bif\b` anywhere-in-line count books it as an opener, which then needs a `fi` that
+    # never comes and hides the tail of the block from the guard.
+    SHELL_IF_TOKEN = re.compile(r"if(\s|$)")
+    SHELL_FI_TOKEN = re.compile(r"fi(\s|$)")
 
-    def _wrapper_refusal_block(self) -> str:
+    @staticmethod
+    def _without_shell_comment(line: str) -> str:
+        """`line` up to the first `#` that can actually start a shell comment.
+
+        Quote-aware, because `tell "… # …"` is operator prose and not a comment. It is
+        line-local though — it does not carry a quote opened on an earlier line — which is
+        why the bound built on it is cross-checked against an independent second bound
+        rather than trusted on its own (PRO-413).
+        """
+        out = []
+        quote = ""
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if quote:
+                if quote == '"' and ch == "\\":
+                    out.append(ch)
+                    i += 1
+                    if i < len(line):
+                        out.append(line[i])
+                        i += 1
+                    continue
+                if ch == quote:
+                    quote = ""
+            elif ch == "\\":
+                out.append(ch)
+                i += 1
+                if i < len(line):
+                    out.append(line[i])
+                    i += 1
+                continue
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def _shell_if_fi(self, line: str) -> tuple:
+        """(opens, closes) for one line — a structural `if` and/or `fi`, 0 or 1 each.
+
+        One token of each kind per line, which is the shape `worldserver-up.sh` is written
+        in and the shape a reviewer can read at a glance. A `if …; then …; fi` one-liner
+        would be read as unbalanced, and the two-bound cross-check below turns that into a
+        loud failure rather than a quietly shortened region.
+        """
+        stripped = self._without_shell_comment(line).strip()
+        return (1 if self.SHELL_IF_TOKEN.match(stripped) else 0,
+                1 if self.SHELL_FI_TOKEN.match(stripped) else 0)
+
+    def _refusal_block_from_lines(self, lines: list, name: str) -> str:
         """The lines the wrapper prints when the gate exits non-zero — that block only.
 
         The exemption is one sentence inside one `if`; the no-widening guard and the
@@ -6069,33 +6127,72 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         let PRO-359's guard miss a fragment for reasons unrelated to the exemption
         (PRO-359 review B1).
 
-        The bound is a `fi` in COLUMN 0, not any line that strips to `fi`. PRO-381 gave
-        the refusal arms a capture-reading block of nested `if`s, and an
-        indentation-blind bound cut the region at the first arm — which hid every quote
-        below it from the guard and made the two-sided seam fire on a block that had
-        already ended. That is the PRO-359 review B1 failure mode arriving from the other
-        direction: a guard that cannot see the sentence it protects. The frozen wording
-        this guard was written against closes in column 0 too, so the stricter bound
-        costs nothing it used to cover.
+        The end used to be "the first `fi` in column 0", which was right at every head it
+        has seen but sound only while someone else kept the arms' `fi`s indented: PRO-381
+        gave the refusal arms a capture-reading block of nested `if`s, and de-indenting
+        one arm's `fi` to column 0 leaves `bash -n` happy while truncating this region at
+        that line — every quote below it disappears from the guard and both seam tests
+        stay green on a block that has already ended (PRO-407 review, reproduced on
+        `9ac7a80fd`). Nothing in the `worlddb-preflight` job runs shellcheck, so that is a
+        fail-open with no backstop.
+
+        So the end now comes from `if`/`fi` nesting balance, which cannot be fooled by
+        indentation, and the column-0 `fi` is kept as a SECOND, independent bound that has
+        to agree with it. Either bound moving on its own is a failure — the balance bound
+        alone would still be trusting this method's own token counter, and the agreement
+        is what makes a mis-indentation, a stray quoted `fi`, or a whole-block re-indent
+        fail closed instead of silently narrowing what gets scanned.
         """
-        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
         start = next((i for i, ln in enumerate(lines)
                       if self.REFUSAL_BLOCK_ANCHOR in ln), None)
         if start is None:
-            self.fail(f"{self.WRAPPER.name} no longer prints {self.REFUSAL_BLOCK_ANCHOR!r}. "
+            self.fail(f"{name} no longer prints {self.REFUSAL_BLOCK_ANCHOR!r}. "
                       "The gate's exit-code contract and this suite's view of the refusal "
                       "wording both key on that line, so a rename here is not cosmetic.")
-        end = next((i for i in range(start, len(lines))
-                    if lines[i] == "fi"), None)
+        anchor_opens, anchor_closes = self._shell_if_fi(lines[start])
+        if anchor_opens or anchor_closes:
+            self.fail(f"the {name} line holding {self.REFUSAL_BLOCK_ANCHOR!r} is itself a "
+                      f"structural `if`/`fi` ({lines[start]!r}), so the depth the refusal "
+                      "block sits at is ambiguous and the region cannot be bounded")
+        depth = 1  # the anchor sits in the body of the `if` this block is bounded by
+        end = None
+        for i in range(start + 1, len(lines)):
+            opens, closes = self._shell_if_fi(lines[i])
+            depth += opens - closes
+            if depth == 0:
+                end = i
+                break
         if end is None:
             self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
-                      f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
+                      f"in {name}; the block cannot be bounded, so neither can "
                       "the claim about what it quotes")
+        col0 = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
+        if col0 != end:
+            where = ("there is no `fi` in column 0 at or below the anchor at all"
+                     if col0 is None else
+                     f"the first `fi` in column 0 is line {col0 + 1}: {lines[col0]!r}")
+            self.fail(f"the refusal block in {name} cannot be bounded by a single rule: "
+                      f"`if`/`fi` nesting balance closes it at line {end + 1}, but "
+                      f"{where}. Both bounds have to land on the same `fi`; until they do, "
+                      "one of them is cutting the region short and the guard would be "
+                      "scanning a block that has already ended (PRO-413). Either re-indent "
+                      "the arm that closes in column 0, or fix the nesting — do not relax "
+                      "this check.")
         return "\n".join(lines[start:end])
+
+    def _wrapper_refusal_block(self) -> str:
+        return self._refusal_block_from_lines(
+            self.WRAPPER.read_text(encoding="utf-8").splitlines(), self.WRAPPER.name)
+
+    def _quoted_fragments_from_lines(self, lines: list, name: str) -> list:
+        """Every single-quoted fragment inside the refusal block, deduplicated."""
+        return sorted(set(re.findall(
+            r"'([^']*)'", self._refusal_block_from_lines(lines, name))))
 
     def _wrapper_quoted_fragments(self) -> list:
         """Every single-quoted fragment inside the refusal block, in first-seen order."""
-        return sorted(set(re.findall(r"'([^']*)'", self._wrapper_refusal_block())))
+        return self._quoted_fragments_from_lines(
+            self.WRAPPER.read_text(encoding="utf-8").splitlines(), self.WRAPPER.name)
 
     def _line_the_operator_matches(self, err: str, *, quoted: str, prefix: str) -> str:
         """The stderr line the wrapper's exemption is about, or a failure that says so.
@@ -6275,6 +6372,130 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 "told to escalate to Scuff (SQL) unless the gate said something like it, "
                 "and the gate no longer says it. Lines seen were:\n"
                 + "\n".join(sorted({ln for ln in lines if ln.strip()})))
+
+    # A fourth notice, worded like the three the block really quotes and inserted below a
+    # `fi` so it is the last thing in the block. The fragment is single-quoted because that
+    # is the quoting the scan reads; the apostrophes are balanced so the mutant cannot pass
+    # or fail on a parity accident.
+    WRAPPER_MUTANT_NOTICE = ("  tell \"a fourth notice: 'extra notice' "
+                             "is not one of the gate lines\"")
+    WRAPPER_MUTANT_FRAGMENT = "extra notice"
+
+    def _arm_closing_fis(self, lines: list, start: int) -> list:
+        """Every structural `fi` below the anchor that is NOT in column 0 — the arms."""
+        return [i for i in range(start + 1, len(lines))
+                if self._shell_if_fi(lines[i])[1] and lines[i] != "fi"]
+
+    def _region_and_fragments_as_before_PRO_413(self, lines: list, start: int) -> list:
+        """The pre-PRO-413 bound, reproduced rather than restated: first `fi` in column 0.
+
+        This is deliberately a second, weaker implementation of the same scan. It exists so
+        the negative control below can show its own teeth: if the old rule already caught a
+        mutant, asserting the new rule fails on it would prove nothing.
+        """
+        end = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
+        return sorted(set(re.findall(
+            r"'([^']*)'", "\n".join(lines[start:end]) if end is not None else "")))
+
+    def test_a_column_zero_arm_fi_fails_the_bound_instead_of_the_pipeline(self):
+        """PRO-413: the three-fragment property must not rest on an indentation convention.
+
+        PRO-407 reproduced this on `9ac7a80fd`: de-indent one arm's `  fi` to column 0 and
+        put a fourth single-quoted notice under it, and the refusal block is still balanced
+        bash, the column-0 bound still cuts the region above the new notice, the scan still
+        reports exactly the three frozen fragments, and both seam tests stay green. A
+        fail-open with no backstop — the `worlddb-preflight` job does not run shellcheck.
+
+        So the mutants here are the finding, and the assertions are about failing. The head
+        is checked first only so each mutant means what it claims, and the old bound is run
+        over the same mutants to prove the new one is what bites.
+        """
+        import subprocess
+
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        start = next((i for i, ln in enumerate(lines)
+                      if self.REFUSAL_BLOCK_ANCHOR in ln), None)
+        self.assertIsNotNone(start, "the mutants have nothing to mutate without the anchor")
+        arms = self._arm_closing_fis(lines, start)
+        self.assertTrue(arms, "no indented arm-closing `fi` below the anchor, so there is "
+                              "no arm left to mis-indent and this test is vacuous")
+        # The last arm is the one that still leaves all three frozen fragments above it, so
+        # truncating there is the mutation that hides rather than the one that shouts.
+        last_arm = arms[-1]
+
+        misindented = list(lines)
+        misindented[last_arm] = "fi"
+        misindented_with_notice = list(misindented)
+        misindented_with_notice.insert(last_arm + 1, self.WRAPPER_MUTANT_NOTICE)
+        notice_only = list(lines)
+        notice_only.insert(arms[0] + 1, self.WRAPPER_MUTANT_NOTICE)
+
+        # The head first: three fragments, one bound, and the mutant sites where this test
+        # thinks they are. Without this the failures below could be a fixture accident.
+        self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS),
+                         self._wrapper_quoted_fragments())
+        self.assertEqual("fi", lines[last_arm].strip())
+        self.assertNotEqual("fi", lines[last_arm])
+
+        # `bash -n` is indifferent to the de-indent. That is the whole reason this needed a
+        # pin of its own: no tool already in the pipeline sees the edit.
+        with tempfile.TemporaryDirectory() as td:
+            for label, mutant in (("mis-indented arm", misindented),
+                                  ("mis-indented arm with a fourth notice",
+                                   misindented_with_notice)):
+                path = Path(td) / f"{label.replace(' ', '-')}.sh"
+                path.write_text("\n".join(mutant) + "\n", encoding="utf-8")
+                res = subprocess.run(["bash", "-n", str(path)],
+                                     capture_output=True, text=True)
+                self.assertEqual(0, res.returncode,
+                                 f"{label}: the mutant is not even valid bash, so it does "
+                                 f"not reproduce the fail-open — it is just a broken script. "
+                                 f"bash said: {res.stderr}")
+
+        # The negative control, and the honest half of this test: the bound this suite used
+        # until PRO-413 still reports the frozen three on both mutants. Green before the
+        # fix, red after it — which is the only thing that makes the assertions below worth
+        # having.
+        for label, mutant in (("mis-indented arm", misindented),
+                              ("mis-indented arm with a fourth notice",
+                               misindented_with_notice)):
+            self.assertEqual(
+                sorted(self.WRAPPER_QUOTED_FRAGMENTS),
+                self._region_and_fragments_as_before_PRO_413(mutant, start),
+                f"the negative control has gone soft: the column-0 bound alone already "
+                f"catches the {label!r} mutant, so asserting a failure here would not show "
+                "that the nesting bound is doing any work")
+
+        # The pin. Either arm closing in column 0 is a failure on its own, with or without
+        # the notice below it — the notice is what makes it dangerous, not what makes it
+        # detectable.
+        for label, mutant in (("mis-indented arm", misindented),
+                              ("mis-indented arm with a fourth notice",
+                               misindented_with_notice)):
+            with self.assertRaises(AssertionError) as cm:
+                self._refusal_block_from_lines(mutant, name=f"{self.WRAPPER.name} "
+                                                            f"({label})")
+            msg = str(cm.exception)
+            self.assertIn("column 0", msg,
+                          f"{label}: the bound failed, but not for the indentation reason "
+                          f"this test is about: {msg}")
+            self.assertIn("nesting balance", msg,
+                          f"{label}: the bound has stopped comparing the column-0 `fi` "
+                          f"against the nesting balance: {msg}")
+
+        # And the widening half still bites on its own: a fourth quote below the FIRST arm
+        # is inside the block, so both bounds agree and it is the fragment set that has to
+        # refuse it. Both scans see it, which is the seam test's job — asserted here so a
+        # reader can see the two halves of the guard fail for two different reasons.
+        mutant_name = f"{self.WRAPPER.name} (fourth notice only)"
+        four = sorted(list(self.WRAPPER_QUOTED_FRAGMENTS) + [self.WRAPPER_MUTANT_FRAGMENT])
+        self.assertEqual(four, self._region_and_fragments_as_before_PRO_413(notice_only, start),
+                         "a fourth single-quoted notice below the first arm is invisible to "
+                         "the old bound too, so the widening guard has lost its teeth")
+        self.assertEqual(four, self._quoted_fragments_from_lines(notice_only, mutant_name),
+                         "a fourth single-quoted notice below the first arm is invisible to "
+                         "the nesting bound, so `test_the_wrapper_still_quotes_both_gate_lines_"
+                         "the_gate_emits` is no longer able to refuse it either")
 
     def test_a_render_failure_still_names_the_failing_check(self):
         """PRO-313 review B1 state S3: a `render()` crash is not a licence for silence."""
