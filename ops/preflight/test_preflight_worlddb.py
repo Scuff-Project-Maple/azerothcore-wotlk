@@ -6338,6 +6338,83 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                       "(PRO-403 B1, PRO-422 B1).")
         return "\n".join(lines[start:end])
 
+    # A refusal block of the shape the wrapper has, written for the walk to read: one
+    # nested arm, one comment that contains the word `if`, and the same tail the real
+    # wrapper ends on. These are the pins PRO-422 N1 asked for — the strip and the counter
+    # the bound is built from are tested as things in their own right, not only through the
+    # wrapper they happen to be reading today (PRO-414's lesson on this same bound).
+    _WALKED_BLOCK = (
+        "if (( rc != 0 )); then",
+        '  tell "REFUSING BOOT — pre-flight failed (exit $rc)."',
+        "  # rc 1 IS a verdict even if the capture came back empty",
+        '  if [[ -n "$GATE_DIR" ]]; then',
+        "    has_finding=1",
+        "  fi",
+        '  tell "                  Do not bypass this gate."',
+        '  exit "$rc"',
+        "fi",
+    )
+
+    def test_the_block_walk_closes_a_nested_block_on_its_own_column_zero_fi(self):
+        """The nested arm is the whole point of the walk, so it is walked here directly."""
+        self.assertEqual(self._refusal_block_end(list(self._WALKED_BLOCK), 0, "synthetic"),
+                         len(self._WALKED_BLOCK) - 1)
+
+    def test_the_command_counter_sees_a_block_sharing_a_line_with_another_command(self):
+        """PRO-403 B1 in unit form: `true; if :; then` is two commands, not one.
+
+        A line-leading keyword match reports `true` and the nested block never enters the
+        count, which is how a fourth exempted quote used to leave the scan with the suite
+        green. The counter has to see the `if` regardless of what precedes it on the line.
+        """
+        self.assertEqual(self._shell_command_first_words("  true; if :; then"),
+                         ("true", "if", "then"))
+
+    def test_the_command_counter_reads_a_semicolon_inside_quotes_as_prose(self):
+        """The other half of the same rule: quoting is what tells an operator's sentence
+        from a command boundary, so a `;` in a quoted string starts nothing."""
+        self.assertEqual(
+            self._shell_command_first_words('  tell "the; if the gate; fi refused"'),
+            ("tell",))
+
+    def test_the_comment_strip_books_no_opener_for_a_sentence_about_if(self):
+        """The line PRO-413 measured: a comment about `if` is not an `if`.
+
+        Counting over raw lines closes the block one `fi` early on this sentence, and an
+        early close is the direction that shrinks the scan rather than failing it.
+        """
+        stripped, balanced = self._shell_line_without_comment(
+            "  # rc 1 IS a verdict even if the capture came back empty")
+        self.assertTrue(balanced)
+        self.assertEqual(self._shell_command_first_words(stripped), ())
+
+    def test_an_unterminated_quote_is_refused_rather_than_guessed_through(self):
+        """PRO-422 N1: a stripper that guesses past an unbalanced quote is the bypass.
+
+        Every rule in the walk is a rule about unquoted text, so parity is a precondition
+        the caller can act on instead of a property the strip quietly assumes.
+        """
+        _, balanced = self._shell_line_without_comment('  tell "never closed')
+        self.assertFalse(balanced)
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_end(["if (( rc != 0 )); then", '  tell "never closed',
+                                     "  exit \"$rc\"", "fi"], 0, "synthetic")
+        self.assertIn("quote", str(got.exception))
+
+    def test_the_two_bounds_have_to_agree_and_a_stray_fi_in_a_body_is_caught(self):
+        """PRO-414's here-doc counterexample, pinned as a detected case.
+
+        A `fi` written in a here-doc body is block structure to a token walk and closes the
+        scan early on its own — which is the unsafe direction, a guard that quietly reads
+        half a sentence. The column-0 bound is what makes it loud: the two answers differ,
+        and the helper refuses to choose between them.
+        """
+        crossed = ["if (( rc != 0 )); then", "  cat <<'EOF'", "  fi", "EOF",
+                   '  exit "$rc"', "fi"]
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_end(crossed, 0, "synthetic")
+        self.assertIn("column-0", str(got.exception))
+
     def _wrapper_quoted_fragments(self) -> list:
         """Every distinct single-quoted fragment inside the refusal block, sorted.
 
