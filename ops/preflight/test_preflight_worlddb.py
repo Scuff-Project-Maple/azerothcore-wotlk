@@ -6815,8 +6815,9 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         return subprocess.run([sys.executable, "-c", code, str(HERE)], env=self._env(),
                               capture_output=True, text=True, **kwargs)
 
-    # The real `main()` under a terminal that will not have it. `{stdout_setup}` is the
-    # one thing the two end-to-end pins differ on, so the stub exists once.
+    # The real `main()` under a terminal that will not have it. `{stdout_setup}` and
+    # `{argv}` are the only two things the end-to-end pins differ on, so the stub exists
+    # once and the shapes cannot drift apart the way PRO-354's two fixtures did.
     _MAIN_DRIVER = '''
         import pathlib
         import sys
@@ -6841,9 +6842,28 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         (td / "tree" / "data" / "sql").mkdir(parents=True)
         (td / "policy.json").write_text("{{}}")
         {stdout_setup}
-        sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
-                         str(td / "policy.json"), "--json", str(td / "verdict.json")]))
+        sys.exit(P.main({argv}))
     '''
+
+    # `--policy` defaults to the file that ships next to the gate, so the `EXIT_ERROR`
+    # route is reached by naming a path that is not there — the operator's typo, which is
+    # how it happens in the field. The driver still builds `policy.json` and the tree;
+    # `main()` returns before either is reached, which is the point: the shape under test
+    # is the earliest exit `main()` has, and the one whose report goes to `sys.stderr`.
+    _MAIN_ARGV = ('["--compose-root", str(td / "tree"), "--policy", str(td / "policy.json"), '
+                  '"--json", str(td / "verdict.json")]')
+    _MAIN_ARGV_MISSING_POLICY = ('["--compose-root", str(td / "tree"), "--policy", '
+                                 'str(td / "absent.json"), "--json", str(td / "verdict.json")]')
+
+    def _driver(self, stdout_setup, *, missing_policy=False):
+        """One driver template, the two argv shapes `main()` can be driven through.
+
+        Everything the pins share lives in `_MAIN_DRIVER`; a pin that needed its own copy
+        of the stub would be a second fixture to keep honest, which is the PRO-354 bug.
+        """
+        return self._MAIN_DRIVER.format(
+            stdout_setup=stdout_setup,
+            argv=self._MAIN_ARGV_MISSING_POLICY if missing_policy else self._MAIN_ARGV)
 
     def _drive_real_main(self, driver, td):
         import subprocess
@@ -6965,8 +6985,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         The notice has to name the device that refused, which is `/dev/full` here.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup='sys.stdout = open("/dev/full", "w")   # terminal refuses us')
+        driver = self._driver('sys.stdout = open("/dev/full", "w")   # terminal refuses us')
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main(driver, td)
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
@@ -6990,8 +7009,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         sentence has to carry both: what was aimed at, and that nothing is attached.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # fd 1 was closed by the shell before the interpreter ran")
+        driver = self._driver(
+            "pass   # fd 1 was closed by the shell before the interpreter ran")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "1>&-")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
@@ -7024,9 +7043,9 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         the full device. Ask the descriptor when the object cannot help.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # fd 1 was redirected by the shell, so the object cannot "
-                         "help and the descriptor has to answer")
+        driver = self._driver(
+            "pass   # fd 1 was redirected by the shell, so the object cannot "
+            "help and the descriptor has to answer")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
@@ -7058,17 +7077,28 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         symptom from the operator's most natural redirect, and no pin had ever put fd 2 on
         the refusing descriptor. The refusing device keeps the notice in this shape; rc is
         the one number that still reaches the operator, and the payload is the evidence.
+
+        There is deliberately no stderr assertion here (PRO-389 N1). Under `2>&1` fd 2 is a
+        dup of the same full file description as fd 1, so nothing the interpreter writes to
+        fd 2 can reach the parent: an `assertNotIn("Exception ignored", proc.stderr)` on this
+        shape was unsatisfiable by construction, passed whether or not the regression it
+        appeared to guard against had come back, and read like coverage while pinning
+        nothing. The load-bearing claims are the rc and the on-disk payload below. The
+        sibling pins that *do* assert on stderr all leave fd 2 live (`> /dev/full`, `1>&-`,
+        the early-closed pipe) — that is the precondition that makes those able to fail, and
+        it does not hold here. What shows the two claims that remain can still move is
+        `test_the_devfull_pair_costs_120_without_the_fallback_retirement`, and the same
+        argument for the error route is
+        `test_the_error_route_costs_120_when_nothing_is_retired`.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # the shell put fd 2 on the same full description as fd 1")
+        driver = self._driver(
+            "pass   # the shell put fd 2 on the same full description as fd 1")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` still costs the gate its rc: "
                              f"rc={proc.returncode} stderr={proc.stderr}")
-            self.assertNotIn("Exception ignored", proc.stderr,
-                             "the interpreter is still holding bytes for a device that refused them")
             payload = Path(td) / "verdict.json"
             self.assertTrue(payload.is_file(),
                             "the evidence has to survive both descriptors being full")
@@ -7083,10 +7113,10 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         pin ever exits 1, the fixture has stopped reaching the interpreter's final flush
         and the rc assertion above proves nothing.
         """
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="_orig = P._retire_broken_stream; "
-                         "P._retire_broken_stream = "
-                         "(lambda s, l: _orig(s, l) if s is sys.stdout else None)")
+        driver = self._driver(
+            "_orig = P._retire_broken_stream; "
+            "P._retire_broken_stream = "
+            "(lambda s, l: _orig(s, l) if s is sys.stdout else None)")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
@@ -7094,6 +7124,72 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                              f"the rc=120 story in the pair test proves nothing ({proc.stderr})")
             self.assertTrue((Path(td) / "verdict.json").is_file(),
                             "even the pre-fix build wrote the payload before presenting")
+
+    def test_the_real_main_holds_its_rc_on_the_error_route_when_fd_2_is_the_refusing_device(
+            self):
+        """PRO-389 N2: the `EXIT_ERROR` route under `> /dev/full 2>&1` — the unpinned half.
+
+        `_emit` has a second primary. `main()`'s two `EXIT_ERROR` returns aim the report at
+        `sys.stderr`, and at startup `sys.stderr is sys.__stderr__`, so inside `_emit` the
+        primary and the fallback are the *same object*: the report line and the notice line
+        land in one buffer on one refusing descriptor, and there is no second stream to
+        retire. Every rc pin above drives the `EXIT_FAIL` route, where the primary is
+        `sys.stdout` and the fallback is a different stream, so none of them reaches that
+        identity — which is why this route could sit unpinned while looking covered.
+
+        Measured on 3.12.3 at `d97932345` this exits **2**, not 120, and the reason is worth
+        recording rather than glossing: it is PRO-325's retirement of the refusing stream
+        that saves it, and PRO-372's extra fallback call is redundant here precisely
+        *because* the two streams are one object (measured: blocking only that second call
+        still gives rc 2, while the same patch on the `EXIT_FAIL` route gives 120). So the
+        guarantee on this route rests on the older half of the fix, and a reader who assumed
+        PRO-372 owns it would be wrong. "Passes today" is not a pin, and the failure class
+        is exactly the one PRO-325 exists for: `flush_std_files()` retrying bytes a device
+        already refused, and `Py_Exit()` answering with 120. The companion below removes the
+        retirement and lands on 120, so the assertion here is able to fail.
+
+        No stderr assertion, for the PRO-389 N1 reason stated on the `EXIT_FAIL` pin above:
+        under `2>&1` fd 2 cannot deliver anything to the parent. This route also returns
+        before the payload write, so the assertion below says so rather than leaving it
+        implied — on this shape the rc is the whole claim the gate gets to make.
+        """
+        import preflight_worlddb as P
+        driver = self._driver(
+            "pass   # the shell put fd 2 on the same full description as fd 1",
+            missing_policy=True)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                             f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
+                             f"the error route too: rc={proc.returncode} stderr={proc.stderr}")
+            self.assertNotEqual(120, proc.returncode,
+                                "the interpreter's own status reached the wrapper on the route "
+                                "where primary and fallback are one stream")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "the missing-policy return happens before the evidence write, so "
+                             "the rc is the only thing this route can report")
+
+    def test_the_error_route_costs_120_when_nothing_is_retired(self):
+        """Negative control for the `EXIT_ERROR` pin — proof it is not another vacuous pass.
+
+        `_retire_broken_stream` is patched out entirely, which is the pre-PRO-325 build: the
+        report line and the notice line both strand their bytes in the one wrapper CPython
+        built on the full descriptor, `flush_std_files()` retries them at teardown and
+        `Py_Exit()` returns 120. PRO-389 N1 is about pins that cannot fail; this is the
+        version of the error-route pin that can. If it ever exits 2, the fixture has stopped
+        reaching the interpreter's final flush and the rc=2 above proves nothing.
+        """
+        driver = self._driver(
+            "P._retire_broken_stream = lambda stream, label: None   # pre-PRO-325 build",
+            missing_policy=True)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(120, proc.returncode,
+                             f"the fixture no longer reaches the interpreter's final flush, so "
+                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "the pre-fix build returned before the payload too; if this flips "
+                             "the two tests are no longer driving the same route")
 
     def test_a_shell_redirected_broken_pipe_stays_unnamed(self):
         """PRO-341 review N2 has to survive the descriptor path: an inode is not a destination.
@@ -7111,8 +7207,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         import sys
         import textwrap
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # fd 1 is an inherited pipe whose reader went away")
+        driver = self._driver(
+            "pass   # fd 1 is an inherited pipe whose reader went away")
         with tempfile.TemporaryDirectory() as td:
             script = Path(td) / "driver.py"
             script.write_text(textwrap.dedent(driver))
@@ -7292,9 +7388,13 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         class Live:
             name = "<stderr>"
             encoding = "utf-8"
-            closed = False
 
             def __init__(self):
+                # `closed` is an instance attribute here for the same reason `Full` above
+                # declares it in `__init__`: a class attribute would be shadowed the moment
+                # anything sets it, and the fixture would invite a reader to trust the
+                # declaration instead of the instance.
+                self.closed = False
                 self.lines = []
 
             def write(self, s):
