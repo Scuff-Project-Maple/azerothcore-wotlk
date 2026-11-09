@@ -4725,11 +4725,14 @@ def main(argv=None) -> int:
     # the two halves are held apart from each other: a stdout the operator's codec (or
     # kernel) refuses must not cost the payload, which is finding B one layer down, and
     # a payload we cannot write must not cost the printed verdict either.
-    # One predicate answers every question about `--json` (PRO-352, Core's PRO-355
-    # contract A). The write gate below and the evidence-missing refusal at the bottom of
-    # `main()` must not be able to disagree about whether a payload was requested, so both
-    # read `payload_requested`, which is true whenever the flag was passed at all — even
-    # with a blank argument. `worldserver-up.sh` forwards unrecognised operator arguments
+    # One predicate answers the question of whether `--json` was asked for at all
+    # (PRO-352, Core's PRO-355 contract A). The write gate below and the evidence-missing
+    # refusal at the bottom of `main()` must not be able to disagree about that, and the
+    # way they cannot is a chain rather than a shared read: the refusal is gated on
+    # `payload_error`, which is only ever set from inside a branch that already required
+    # `payload_requested`. `payload_requested` itself is true whenever the flag was passed
+    # at all — even with a blank argument. `worldserver-up.sh` forwards unrecognised
+    # operator arguments
     # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with an empty or whitespace
     # `$TARGET` reaches here; the old truthiness gate skipped both the write and the
     # refusal for it, so the boot went out on the checks' own rc with no evidence at all.
@@ -4772,8 +4775,10 @@ def main(argv=None) -> int:
         # asked-for-but-absent evidence.
         payload_error = f"preflight: {BLANK_JSON_TARGET_NOTE}"
     if not args.json_only:
-        # The note is a claim about the payload, so it reads off the same predicate as the
-        # write: never-requested, requested-but-blank, requested-but-unwritable, and
+        # The note is a claim about the payload, so it reads off the same three names the
+        # write and the refusal sit behind — `payload_requested`, `blank_json_target`, and
+        # `payload_error` (only the build/write above can set it) — and not off one flag:
+        # never-requested, requested-but-blank, requested-but-unwritable, and
         # written each get their own wording. A blank target must not borrow
         # `NO_JSON_PAYLOAD_NOTE` — that would tell the operator no payload was requested
         # while stderr two lines later refuses the boot for missing evidence — and it must

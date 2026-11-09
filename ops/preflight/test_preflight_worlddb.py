@@ -6606,9 +6606,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         path, including the one where nobody asked for a payload — a claim about a file
         that does not exist and was never requested. The operator reading a failed boot
         is the audience; `NO_JSON_PAYLOAD_NOTE` is the gate's single wording for the
-        absent case, and the assertion below quotes what that wording says rather than
-        the constant, because an assertion written against the same constant the emitter
-        reads is self-consistent under a reword (PRO-369 review N1).
+        never-requested case — "absent" is only the umbrella, and *not written* and
+        *blank* are the other two arms with their own wordings — and the assertion below
+        quotes what that wording says rather than the constant, because an assertion
+        written against the same constant the emitter reads is self-consistent under a
+        reword (PRO-369 review N1; the enumeration is the one the README carries after
+        PRO-392 NB-A).
 
         The `leftovers` assertion is the same claim measured off the filesystem instead of
         off the string. `res.payload` is `None` by construction here — there is no path
@@ -6752,7 +6755,14 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         verdict.json` while chdir-ed into it. The payload must land there, the listing must
         name it, and the bytes the listing names must be the evidence — otherwise the
         positive control would pass on an unrelated file.
+
+        The `rc` pin (PRO-404 N3) closes the other way this control can go soft: it holds
+        that the very run which produced its own evidence still refused the boot. A drive
+        that drifted to a passing rc while the payload kept landing would leave every
+        listing/bytes assertion above green while the thing under test stopped being a
+        refusal, which is the whole job of the gate.
         """
+        import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                json_target="relative")
         self.assertEqual(
@@ -6766,6 +6776,11 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertEqual("fail", back["result"],
                          "the positive control must point at the run's own evidence")
         self.assertEqual(self.RAW, back["findings"][0]["file"])
+        self.assertEqual(
+            P.EXIT_FAIL, res.rc,
+            "the positive-control run wrote its own evidence and still refused the boot; an "
+            "rc of 0 here means the witness is pointing at a run that booted, and a gate "
+            "that boots is not the gate this class pins")
 
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
