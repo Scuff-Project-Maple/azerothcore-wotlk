@@ -5859,6 +5859,16 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                     # fixed by construction.
                     out_path = None
                     json_arg = "   "
+                elif json_target == "relative":
+                    # A *legitimately* relative `--json` target. The drive chdirs into the
+                    # empty scratch cwd below, so `verdict.json` names a file inside it and
+                    # the payload really is written there. That makes this the one case whose
+                    # `leftovers` listing is supposed to come back non-empty — the positive
+                    # control for the witness every other pin uses only to assert emptiness
+                    # (PRO-378 NB-C). A `leftovers` that had quietly degraded to always
+                    # returning `[]` would pass all of those and fail here.
+                    out_path = Path(td) / "cwd" / "verdict.json"
+                    json_arg = "verdict.json"
                 else:
                     out_path = None
                     json_arg = None
@@ -6351,6 +6361,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         path, including the one where nobody asked for a payload — a claim about a file
         that does not exist and was never requested. The operator reading a failed boot
         is the audience; `NO_JSON_PAYLOAD_NOTE` is the single wording for the absent case.
+
+        The `leftovers` assertion is the same claim measured off the filesystem instead of off
+        the string. `res.payload` is `None` by construction here — there is no path handed to
+        the drive to look at — so on its own this pin would not notice a regression that wrote
+        a payload with no `--json` flag at all. The drive runs in an empty scratch cwd, so the
+        listing is what actually witnesses "no file, wherever it would land".
         """
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                render_raises=True, json_target="none")
@@ -6360,6 +6376,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertNotIn("unaffected", text,
                          "the degraded line still promises a payload nobody asked for")
         self.assertNotIn("None", text, "the absent payload is rendered as a word, not None")
+        self.assertEqual([], res.leftovers, "no --json means no file, wherever it would land")
 
     def test_the_degraded_verdict_does_not_call_an_unwritten_payload_unaffected(self):
         """The same sentence on the path that asked for a payload and did not get one."""
@@ -6466,6 +6483,36 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertIn("boot is refused", err)
         self.assertNotIn("could not write the --json payload to", err)
         self.assertEqual(P.EXIT_ERROR, res.rc)
+
+    def test_the_scratch_cwd_witness_can_report_a_file_it_found(self):
+        """PRO-378 NB-C: the `leftovers` witness needs a positive control.
+
+        Every other pin on `leftovers` asserts `[]`, including the two that hold the
+        "a blank/whitespace `--json` must touch no filesystem" claims and the one that holds
+        "no `--json`, no file". A witness that had silently degraded to always returning
+        `[]` — a listing pointed at the wrong directory, an early `break`, a refactor of the
+        scratch cwd the drive chdirs into — keeps every one of them green, and with them the
+        PRO-361 NB1 "no junk file" claim it exists to hold. That is the same
+        witness-that-cannot-fail shape as PRO-378 NB1, one layer down.
+
+        So drive the one run that legitimately writes *into* the scratch cwd: `--json
+        verdict.json` while chdir-ed into it. The payload must land there, the listing must
+        name it, and the bytes the listing names must be the evidence — otherwise the
+        positive control would pass on an unrelated file.
+        """
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="relative")
+        self.assertEqual(
+            ["verdict.json"], res.leftovers,
+            "a relative --json target wrote into the scratch cwd and the witness did not "
+            "see it; a bare [] here means every emptiness pin in this class has stopped "
+            "witnessing anything")
+        self.assertIsNotNone(res.payload,
+                             "the listing named a file the drive could not read back")
+        back = json.loads(res.payload.decode("ascii"))
+        self.assertEqual("fail", back["result"],
+                         "the positive control must point at the run's own evidence")
+        self.assertEqual(self.RAW, back["findings"][0]["file"])
 
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
