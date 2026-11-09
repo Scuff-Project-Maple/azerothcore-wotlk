@@ -6221,24 +6221,33 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                                            "No such file or directory"}),
         ("refused payload", {"json_target": "missing-dir"}),
     )
-    # Each fragment the refusal block quotes, the one shape that has to show it, and the
-    # prefix the gate must put on that line. Naming the shape is not decoration: pooled
-    # into one corpus, `'!!'` is satisfied by the render-failure apology alone and the
-    # findings listing could stop marking findings without anyone noticing, which is the
-    # half of the wrapper's sentence that tells the operator what still counts as their
-    # problem. Naming the prefix is not decoration either: a shape name alone is a lever,
-    # because `'!!'` also turns up in the `render()`-failure apology, so repointing this
-    # row at `"degraded verdict"` keeps the test green with the findings listing unmarked.
-    # That is `WRAPPER_EXEMPTED_GATE_LINES`'s pairing rule arriving in this table — the
-    # two exempted lines already cross-check fragment against prefix before either half
-    # is trusted (PRO-359 review B1), and the finding marker had no such check (PRO-388
-    # NB1, the same self-consistency defect PRO-369 NB1 was about).
+    # Each fragment the refusal block quotes, the one shape that has to show it, the prefix
+    # the gate must put on that line, and — where a second emitter writes a line with that
+    # same prefix — the prefix that marks the decoy, which does not count as a witness.
+    # Naming the shape is not decoration: pooled into one corpus, `'!!'` is satisfied by
+    # the render-failure apology alone and the findings listing could stop marking findings
+    # without anyone noticing, which is the half of the wrapper's sentence that tells the
+    # operator what still counts as their problem.
+    #
+    # Naming the prefix is not decoration either, and neither is naming which emitter is
+    # being witnessed (PRO-388 NB1, the same self-consistency defect PRO-369 NB1 was about).
+    # The two exempted lines are safe from a shape-column repoint because their prefixes
+    # are emitted by exactly one shape each — the check below asserts that, so the shape
+    # cell cannot be moved without losing the witness. `'!!'` is not: `    !! ` is written
+    # by two emitters, the formatted listing in `render()` and the degraded fallback in
+    # `_render_or_say_why()`, so a bare prefix would still be satisfied after the finding
+    # marker is renamed, provided the row is pointed at a shape that renders degraded. The
+    # decoy column pins this row to the formatted-listing emitter by excluding the
+    # fallback's `    !! [<check>] <severity> ` shape. (Pointing this row at
+    # `"refused payload"` stays a genuine witness: that shape reaches the same formatted
+    # listing and only then fails the payload write, so it is the same emitter, not a
+    # second one.)
     WRAPPER_QUOTED_EVIDENCE = (
         ("preflight: operational error:", "operational error",
-         "preflight: operational error: "),
+         "preflight: operational error: ", None),
         ("could not write the --json payload", "refused payload",
-         "preflight: could not write the --json payload to "),
-        ("!!", "verdict", "    !! "),
+         "preflight: could not write the --json payload to ", None),
+        ("!!", "verdict", "    !! ", "    !! ["),
     )
 
     def _lines_the_gate_really_emits(self) -> dict:
@@ -6278,28 +6287,63 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS), quoted,
                          "the refusal block and this suite's view of it have drifted; "
                          "fix the wrapper and the pins together, in one change")
-        self.assertEqual({f for f, _, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
+        self.assertEqual({f for f, _, _, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
                          "a quoted fragment has no witness shape, so nothing checks that "
                          "the gate still emits it")
         emitted = self._lines_the_gate_really_emits()
         for name, lines in emitted.items():
             self.assertTrue(lines, f"the gate produced nothing at all in the {name!r} "
                                    "shape; an empty corpus passes any substring test")
-        for frag, shape, line_prefix in self.WRAPPER_QUOTED_EVIDENCE:
+        for frag, shape, line_prefix, decoy in self.WRAPPER_QUOTED_EVIDENCE:
             self.assertIn(frag, line_prefix,
                           f"the fixture drifted: {frag} is not a fragment of "
                           f"{line_prefix!r}, so this row no longer describes gate and "
                           "wrapper (compare the pairing rule in "
                           "`_line_the_operator_matches`)")
             lines = emitted[shape]
+            if decoy is None:
+                # The prefix is carrying this row on its own, so it has to identify the
+                # shape. If another shape ever emits it too, the shape cell becomes a
+                # lever again: repoint it and the witness survives without the emitter
+                # this row is supposed to be watching.
+                for other, other_lines in emitted.items():
+                    if other == shape:
+                        continue
+                    self.assertFalse(
+                        [ln for ln in other_lines if ln.startswith(line_prefix)],
+                        f"{line_prefix!r} is not exclusive to the {shape!r} shape: the "
+                        f"{other!r} shape emits a line with it too, so this row's shape "
+                        "column can be repointed at a corpus the named emitter never "
+                        "wrote. Give the row a decoy if a second emitter really does "
+                        "write this prefix.")
+                witnesses = [ln for ln in lines if ln.startswith(line_prefix)]
+            else:
+                self.assertTrue(decoy.startswith(line_prefix),
+                                f"the fixture drifted: the decoy {decoy!r} does not even "
+                                f"start with the prefix {line_prefix!r} it is meant to "
+                                "exclude")
+                elsewhere = [ln for other, other_lines in emitted.items()
+                             if other != shape
+                             for ln in other_lines if ln.startswith(line_prefix)]
+                self.assertTrue(
+                    elsewhere,
+                    f"the decoy {decoy!r} on the {frag!r} row is decoration: no shape "
+                    f"outside {shape!r} emits {line_prefix!r} at all, so nothing outside "
+                    "this row's own shape could have satisfied it and there is no second "
+                    "emitter to exclude. Drop the decoy rather than keep a check that "
+                    "checks nothing (PRO-369 NB1's shape).")
+                witnesses = [ln for ln in lines if ln.startswith(line_prefix)
+                             and not ln.startswith(decoy)]
             self.assertTrue(
-                any(ln.startswith(line_prefix) for ln in lines),
+                witnesses,
                 f"{self.WRAPPER.name} quotes '{frag}' at the operator as though the gate "
                 f"wrote it, but no line the gate produced in the {shape!r} shape starts "
-                f"with {line_prefix!r}. The refusal routing turns on that string: an "
-                "operator locked out is told to escalate to Scuff (SQL) unless the gate "
-                "said something like it, and the gate no longer says it. Lines seen "
-                "were:\n"
+                f"with {line_prefix!r}"
+                + (f" without also starting with the decoy {decoy!r}"
+                   if decoy is not None else "")
+                + ". The refusal routing turns on that string: an operator locked out is "
+                "told to escalate to Scuff (SQL) unless the gate said something like it, "
+                "and the gate no longer says it. Lines seen were:\n"
                 + "\n".join(sorted({ln for ln in lines if ln.strip()})))
 
     def test_a_render_failure_still_names_the_failing_check(self):
