@@ -22,7 +22,7 @@ from pathlib import Path
 from preflight_worlddb import (
     MySQL, Preflight, REGION_NAME_STOPWORDS, Report, _ident_parts, _schema_of, mask_sql,
     parse_statement, split_qualified, split_statements, build_arg_parser, write_targets,
-    NO_JSON_PAYLOAD_NOTE,
+    NO_JSON_PAYLOAD_NOTE, BLANK_JSON_TARGET_NOTE,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -5735,7 +5735,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
 
     def _drive_main(self, stdout, stderr, *, render_raises=False, json_target="default",
                     stub_rc=None, stub_findings=True, hostile_report=False,
-                    hostile_payload=False, expect_raises=False):
+                    hostile_payload=False, op_error=None, expect_raises=False):
         """Run the real `main()` with the gate stubbed and the operator's streams swapped.
 
         `main()` had no test before this class, which is why the first version of these
@@ -5760,7 +5760,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         survive the suite, because the ordering rested on that function never raising;
         now that it genuinely cannot, the ordering gets a test of its own rather than
         inheriting one.
+
+        `op_error` is the shape where the checks never ran at all because the environment
+        refused them: the stub raises the gate's own `OperationalError` rather than
+        returning a finding (PRO-359 / PRO-382 §1).
         """
+        import os
         import sys
         import types
         import preflight_worlddb as P
@@ -5778,6 +5783,8 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                 self.git_root = Path(args.compose_root)
 
             def run(self):
+                if op_error is not None:
+                    raise P.OperationalError(op_error)
                 if stub_findings:
                     self.report.fail("3",
                                      f"{raw} is upstream-provenanced at HEAD but has "
@@ -5847,20 +5854,47 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                     # the flag is there, the path is not, so nothing may claim a file.
                     out_path = Path(td) / "verdict.json"
                     json_arg = ""
+                elif json_target == "whitespace":
+                    # `--json "   "` is the same family and the dangerous one: a real
+                    # write with this argument *succeeds* and drops a file literally
+                    # named `   ` in the cwd, so a gate that only tests `== ""` would
+                    # boot on it. `out_path` stays None — there is no legitimate file to
+                    # look for. The proof is `leftovers`: the drive runs in an empty
+                    # scratch cwd, so a truthiness gate leaves `   ` in that directory and
+                    # the pin fails on a non-empty listing rather than on a `None` that was
+                    # fixed by construction.
+                    out_path = None
+                    json_arg = "   "
                 else:
                     out_path = None
                     json_arg = None
                 argv = ["--compose-root", str(tree), "--policy", str(policy)]
                 if json_arg is not None:
                     argv += ["--json", json_arg]
+                # Run the drive inside an empty scratch cwd. Everything `main()` is handed
+                # here is absolute, so no case depends on the process cwd — which is the
+                # point: a stray relative write has nowhere to land except this directory,
+                # where `leftovers` can see it. Without this the whitespace pin's
+                # "wrote no junk file" assertion is a tautology, because `out_path` is
+                # already None for that case and a real `   ` file would simply appear in
+                # the repo unnoticed (PRO-361 NB1).
+                scratch = Path(td) / "cwd"
+                scratch.mkdir()
+                cwd_before = os.getcwd()
                 rc = None
                 raised = None
+                leftovers = None
                 try:
-                    rc = P.main(argv)
-                except BaseException as exc:      # a fixture may raise one on purpose
-                    if not expect_raises:
-                        raise
-                    raised = type(exc).__name__
+                    os.chdir(scratch)
+                    try:
+                        rc = P.main(argv)
+                    except BaseException as exc:  # a fixture may raise one on purpose
+                        if not expect_raises:
+                            raise
+                        raised = type(exc).__name__
+                finally:
+                    os.chdir(cwd_before)
+                leftovers = sorted(p.name for p in scratch.iterdir())
                 payload = None
                 if out_path is not None and out_path.is_file():
                     payload = out_path.read_bytes()
@@ -5868,6 +5902,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             (P.Preflight, P.render, P._render_or_say_why,
              sys.stdout, sys.stderr, sys.__stderr__) = original
         return types.SimpleNamespace(rc=rc, raised=raised, payload=payload,
+                                      leftovers=leftovers,
                                       out=stdout.value(), err=stderr.value(),
                                       fallback=fallback.value(),
                                       payload_existed_at_render=seen.get("payload_existed"),
@@ -5984,6 +6019,242 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                          "a run that was asked for evidence and produced none must not "
                          "let the boot through on the checks' own rc")
 
+    # PRO-359 (PRO-348 review N2). `ops/deploy/worldserver-up.sh` refuses the boot on any
+    # non-zero gate exit, then tells the operator to escalate to Scuff (SQL) *unless* the
+    # gate printed one of two quoted lines — those two are an environment failure or an
+    # evidence-write failure, not a finding about anyone's SQL. Nothing on the gate side
+    # pinned either string, so a rename here silently mis-routes whoever is locked out:
+    # the wrapper quotes fragments of what the gate emits, so the gate owns the wording
+    # and the wrapper owns the promise. Each pair is (the fragment the wrapper quotes
+    # verbatim, the prefix the gate must put on the line); the halves are checked against
+    # each other before either test trusts them. The fragments are stored bare; the
+    # wrapper-side check adds the quoting quotes back, so a reworded quote style in the
+    # shell is still a failure rather than an accidental substring hit.
+    WRAPPER_EXEMPTED_GATE_LINES = (
+        ("preflight: operational error:", "preflight: operational error: "),
+        ("could not write the --json payload",
+         "preflight: could not write the --json payload to "),
+    )
+    # The third thing the refusal block quotes is not exempted at all: `'!!'` is what
+    # still *counts* as a finding about the operator's SQL. It is in the pinned set
+    # because PRO-359 review B1 showed a guard that only looked at `preflight:`-prefixed
+    # quotes cannot see the rest of the sentence it is supposed to be protecting.
+    WRAPPER_FINDING_MARKER_QUOTED = "!!"
+    WRAPPER_QUOTED_FRAGMENTS = tuple(
+        frag for frag, _ in WRAPPER_EXEMPTED_GATE_LINES
+    ) + (WRAPPER_FINDING_MARKER_QUOTED,)
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+    # Anchor for the refusal block, and nothing looser: the wrapper prints other
+    # `REFUSING BOOT` lines from the lease checks, and the guard below has to cover one
+    # sentence, not a 300-line shell script (PRO-359 review B1).
+    REFUSAL_BLOCK_ANCHOR = "REFUSING BOOT — pre-flight failed"
+
+    def _wrapper_refusal_block(self) -> str:
+        """The lines the wrapper prints when the gate exits non-zero — that block only.
+
+        The exemption is one sentence inside one `if`; the no-widening guard and the
+        wrapper-read test both need exactly that scope. Scanning the whole file is what
+        let PRO-359's guard miss a fragment for reasons unrelated to the exemption
+        (PRO-359 review B1).
+        """
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        start = next((i for i, ln in enumerate(lines)
+                      if self.REFUSAL_BLOCK_ANCHOR in ln), None)
+        if start is None:
+            self.fail(f"{self.WRAPPER.name} no longer prints {self.REFUSAL_BLOCK_ANCHOR!r}. "
+                      "The gate's exit-code contract and this suite's view of the refusal "
+                      "wording both key on that line, so a rename here is not cosmetic.")
+        end = next((i for i in range(start, len(lines))
+                    if lines[i].strip() == "fi"), None)
+        if end is None:
+            self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
+                      f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
+                      "the claim about what it quotes")
+        return "\n".join(lines[start:end])
+
+    def _wrapper_quoted_fragments(self) -> list:
+        """Every single-quoted fragment inside the refusal block, in first-seen order."""
+        return sorted(set(re.findall(r"'([^']*)'", self._wrapper_refusal_block())))
+
+    def _line_the_operator_matches(self, err: str, *, quoted: str, prefix: str) -> str:
+        """The stderr line the wrapper's exemption is about, or a failure that says so.
+
+        The wrapper does not grep: the exemption is prose inside an `echo`, and the
+        operator is the matcher. So the relation pinned here is the one the operator
+        performs — a quoted fragment has to turn up inside a line the gate really wrote
+        to stderr — with the stricter half on top of it, because the line *starts with*
+        the prefix and that is what a rename breaks first.
+        """
+        self.assertIn(quoted, prefix,
+                      f"the fixture drifted: {quoted} is not a fragment of {prefix!r}, "
+                      "so the pairing above no longer describes gate and wrapper")
+        lines = [ln for ln in err.splitlines() if ln.startswith(prefix)]
+        if not lines:
+            self.fail(f"the gate wrote no line starting with {prefix!r} to stderr. The "
+                      f"refusal block exempts '{quoted}' from the 'escalate to Scuff (SQL)' "
+                      "routing by quoting that line, so an operator who hits this shape "
+                      "is now being routed by a string the gate does not emit. stderr "
+                      f"held: {err!r}")
+        self.assertIn(quoted, lines[0],
+                      f"the line opens with {prefix!r} but no longer carries the "
+                      f"fragment '{quoted}' the wrapper quotes")
+        return lines[0]
+
+    def test_the_operational_error_line_carries_the_prefix_the_wrapper_exempts(self):
+        """PRO-359: the environment half of a refused boot has a name, and it is pinned.
+
+        `main()` catches `OperationalError` around the whole run — a docker that is not
+        there, a query that timed out, a scratch schema it dare not touch — and answers
+        with `EXIT_ERROR` and one line on stderr. That line is the only thing standing
+        between an environment failure and a finding about someone's SQL, which is the
+        exact distinction the wrapper is drawing to whoever is locked out.
+        """
+        import preflight_worlddb as P
+        quoted, prefix = self.WRAPPER_EXEMPTED_GATE_LINES[0]
+        reason = "cannot execute docker: [Errno 2] No such file or directory"
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               op_error=reason)
+        self.assertEqual(P.EXIT_ERROR, res.rc,
+                         "an operational failure has to be the wrapper's non-zero exit; "
+                         "a check-derived rc here means this is not that path")
+        line = self._line_the_operator_matches(res.err.decode("ascii"),
+                                               quoted=quoted, prefix=prefix)
+        self.assertIn("cannot execute docker", line,
+                      "the prefix arrived without the reason, which is PRO-308 finding B "
+                      "in the wrapper's clothing")
+
+    def test_the_payload_write_line_carries_the_prefix_the_wrapper_exempts(self):
+        """PRO-359: the evidence half, pinned the same way.
+
+        `test_a_payload_we_cannot_write_costs_the_boot_but_not_the_verdict` above holds
+        the two halves apart and greps part of the line; what it cannot do is notice a
+        rename, because its needle is a phrase from the sentence rather than the prefix
+        the wrapper quotes. This is the emit-side assertion PRO-348 review N2 asked for,
+        on the shape PRO-349 measured on the deploy host.
+        """
+        import preflight_worlddb as P
+        quoted, prefix = self.WRAPPER_EXEMPTED_GATE_LINES[1]
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="missing-dir")
+        self.assertEqual(P.EXIT_ERROR, res.rc,
+                         "no evidence and no refusal is the hole this pair exists to keep")
+        self.assertIsNone(res.payload)
+        line = self._line_the_operator_matches(res.err.decode("ascii"),
+                                               quoted=quoted, prefix=prefix)
+        self.assertIn("no-such-dir", line,
+                      "the line no longer names the path the operator has to go and fix")
+        self.assertRegex(line, r": \w+Error: \S",
+                         "an untyped write failure leaves the operator unable to tell a "
+                         "missing directory from a full disk")
+
+    def test_the_wrapper_still_quotes_both_gate_lines_the_gate_emits(self):
+        """The pairing is two-sided, so the other half is pinned too (PRO-359).
+
+        This suite does not own the wrapper's wording — `worldserver-up.sh` is frozen as
+        merged and its exemption is prose — but it does own the claim that these are the
+        two fragments an operator locked out is handed. Read it as the seam: whenever the
+        wrapper is reworded, its exemption and the two emitter lines move together, or a
+        one-sided rename routes an environment failure to Scuff (SQL) and a real finding
+        to nobody.
+        """
+        block = self._wrapper_refusal_block()
+        for frag in self.WRAPPER_QUOTED_FRAGMENTS:
+            self.assertIn(f"'{frag}'", block,
+                          f"'{frag}' is no longer quoted in the refusal block of "
+                          f"{self.WRAPPER.name}, yet the gate still emits that line and "
+                          "the block still routes everything else to Scuff (SQL). Rename "
+                          "both sides or neither (PRO-348 review N2).")
+        # Widening is the other direction this seam can fail, and PRO-346 already
+        # answered it: no taxonomy an operator has to parse while locked out, so no third
+        # exempted gate line may join the sentence. The scan is scoped to the refusal
+        # block and compares the WHOLE quoted set, not the `preflight:`-prefixed subset —
+        # PRO-359 review B1: the earlier guard could not see `'could not write the --json
+        # payload'` (no `preflight:` prefix), could not see widening through a non-
+        # `preflight:` quote, and fired on quoted prose anywhere else in the file.
+        self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS),
+                         self._wrapper_quoted_fragments(),
+                         "the refusal block quotes something other than the two exempted "
+                         "gate lines plus the finding marker; it is three quoted fragments "
+                         "and PRO-346 rejected adding a fourth")
+
+    # Every shape `main()` can leave the operator in, so the wrapper-read test below has
+    # the complete set of lines the gate really writes to compare against: the printed
+    # verdict, the degraded verdict, the operational error, and the refused payload.
+    # `render_raises` and `op_error` are the two failure paths; `missing-dir` is the
+    # evidence-write path; the plain drive is a normal refused boot with findings.
+    OPERATOR_FACING_SHAPES = (
+        ("verdict", {}),
+        ("degraded verdict", {"render_raises": True}),
+        ("operational error", {"op_error": "cannot execute docker: [Errno 2] "
+                                           "No such file or directory"}),
+        ("refused payload", {"json_target": "missing-dir"}),
+    )
+    # Each fragment the refusal block quotes, and the one shape that has to show it.
+    # Naming the shape is not decoration: pooled into one corpus, `'!!'` is satisfied by
+    # the render-failure apology alone and the findings listing could stop marking
+    # findings without anyone noticing, which is the half of the wrapper's sentence that
+    # tells the operator what still counts as their problem.
+    WRAPPER_QUOTED_EVIDENCE = (
+        ("preflight: operational error:", "operational error"),
+        ("could not write the --json payload", "refused payload"),
+        ("!!", "verdict"),
+    )
+
+    def _lines_the_gate_really_emits(self) -> dict:
+        """shape name -> every line `main()` writes to either stream in that shape.
+
+        Driven, not read from source: the point of the test that uses this is that the
+        wrapper quotes a string the gate *actually puts on the terminal*, so the corpus
+        has to come from running the gate.
+        """
+        emitted = {}
+        for name, kwargs in self.OPERATOR_FACING_SHAPES:
+            res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                                   **kwargs)
+            lines = []
+            for blob in (res.out, res.err):
+                lines.extend(blob.decode("ascii", "replace").splitlines())
+            emitted[name] = lines
+        return emitted
+
+    def test_every_fragment_the_wrapper_quotes_is_a_line_the_gate_really_emits(self):
+        """PRO-382 §1 (PRO-370 finding F2): the wrapper's quoted prefixes have no pin.
+
+        `worldserver-up.sh` hands the operator quoted fragments of gate output and says
+        which ones are not that operator's problem. `grep -rn "escalate to Scuff"`
+        reaches only the wrapper, so before this test nothing tied those quotes to what
+        the gate writes: reword the emitter and the wrapper keeps quoting a sentence no
+        terminal will ever show, and the operator locked out of a boot is routed by a
+        string that no longer exists. The gate owns the wording; this is the half that
+        makes the wrapper's promise an assertion instead of a transcription.
+
+        Deliberately derived from the wrapper rather than from the fixture table above:
+        reading the file is what catches a fragment being *added* to the exemption, and
+        driving `main()` rather than grepping its source is what makes a rename in the
+        emitter — not an edit to this file — the thing that fails here.
+        """
+        quoted = self._wrapper_quoted_fragments()
+        self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS), quoted,
+                         "the refusal block and this suite's view of it have drifted; "
+                         "fix the wrapper and the pins together, in one change")
+        self.assertEqual({f for f, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
+                         "a quoted fragment has no witness shape, so nothing checks that "
+                         "the gate still emits it")
+        emitted = self._lines_the_gate_really_emits()
+        for name, lines in emitted.items():
+            self.assertTrue(lines, f"the gate produced nothing at all in the {name!r} "
+                                   "shape; an empty corpus passes any substring test")
+        for frag, shape in self.WRAPPER_QUOTED_EVIDENCE:
+            lines = emitted[shape]
+            self.assertTrue(
+                any(frag in ln for ln in lines),
+                f"{self.WRAPPER.name} quotes '{frag}' at the operator as though the gate "
+                f"wrote it, but no line the gate produced in the {shape!r} shape contains "
+                "it. The refusal routing turns on that string: an operator locked out is "
+                "told to escalate to Scuff (SQL) unless the gate said something like it, "
+                "and the gate no longer says it. Lines seen were:\n"
+                + "\n".join(sorted({ln for ln in lines if ln.strip()})))
+
     def test_a_render_failure_still_names_the_failing_check(self):
         """PRO-313 review B1 state S3: a `render()` crash is not a licence for silence."""
         import preflight_worlddb as P
@@ -6003,9 +6274,10 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # same finding on a better design: `main()` states the payload outcome and hands it to
     # the renderer as the required keyword-only `payload_note`, so no wording is derived
     # inside the presentation half at all (PRO-335 §2, PRO-341 review N1/B1). The four
-    # tests in `test_the_degraded_verdict_*_` below pin its three shapes plus the blank
-    # `--json ""` case; this issue's `_payload_fortune()` helper was dropped in the merge
-    # rather than kept as a second, competing source of the same claim.
+    # tests in `test_the_degraded_verdict_*` below pin its three shapes plus the blank
+    # `--json ""` case; the `_payload_fortune()` helper that branch carried was dropped
+    # in the PRO-331 merge rather than kept as a second, competing source of the same
+    # claim.
 
     def test_checks_that_pass_still_refuse_the_boot_when_the_payload_cannot_be_written(self):
         """PRO-324 NB3: the case that actually changes what boots.
@@ -6321,13 +6593,16 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         The degraded line used to end `...and the --json payload is unaffected` on every
         path, including the one where nobody asked for a payload — a claim about a file
         that does not exist and was never requested. The operator reading a failed boot
-        is the audience; `NO_JSON_PAYLOAD_NOTE` is the single wording for the absent case.
+        is the audience; `NO_JSON_PAYLOAD_NOTE` is the gate's single wording for the
+        absent case, and the assertion below quotes what that wording says rather than
+        the constant, because an assertion written against the same constant the emitter
+        reads is self-consistent under a reword (PRO-369 review N1).
         """
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                render_raises=True, json_target="none")
         text = res.out.decode("ascii")
         self.assertIn("render() raised RuntimeError", text)
-        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertIn("no --json payload requested", text)
         self.assertNotIn("unaffected", text,
                          "the degraded line still promises a payload nobody asked for")
         self.assertNotIn("None", text, "the absent payload is rendered as a word, not None")
@@ -6352,31 +6627,95 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertIn("--json payload", text)
 
     def test_the_degraded_verdict_does_not_call_a_blank_json_target_a_payload(self):
-        """PRO-341 review B1: `--json ""` skips the write, so it may not claim the disk.
+        """PRO-341 review B1 + PRO-352: `--json ""` is "evidence asked for, none produced".
 
-        `main()` gated the write on truthiness and this note on `is None`. The wrapper
+        `main()` once gated the write on truthiness and this note on `is None`. The wrapper
         forwards unrecognised operator arguments verbatim, so an operator's
-        `--json "$TARGET"` with a blank `$TARGET` arrives here as an empty path, and
-        that run printed `the --json payload at  is on disk` while nothing was written.
-        Same class as PRO-325 NB2 (an absent thing asserted as present), one layer up,
-        and on the line an operator reads while the boot is being refused.
+        `--json "$TARGET"` with a blank `$TARGET` arrives here as an empty path, and that
+        run printed `the --json payload at  is on disk` while nothing was written —
+        PRO-325 NB2's shape (an absent thing asserted as present) on the line an operator
+        reads while the boot is being refused.
 
-        The rc is deliberately not pinned here: a blank `--json` still leaves
-        `payload_error` None, so it does not reach the evidence-missing refusal either.
-        That half predates this branch and is tracked separately; pinning `EXIT_FAIL`
-        now would make the follow-up look like a regression when it lands.
+        PRO-352 (Core's PRO-355 contract A) closes the other half: the write gate and the
+        evidence-missing refusal now read one predicate, so a blank target counts as
+        requested, the refusal fires, and the rc is `EXIT_ERROR` — no longer a value this
+        pin declines to name. Blank is *not* "not requested", so the degraded line must say
+        the target is blank, never borrow `NO_JSON_PAYLOAD_NOTE`, and never claim the
+        payload is on disk.
         """
+        import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                render_raises=True, json_target="empty")
         self.assertIsNone(res.payload, "fixture: a blank --json must write nothing")
         text = res.out.decode("ascii")
         self.assertIn("render() raised RuntimeError", text,
                       "the fixture stopped exercising the degraded line")
-        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertIn(BLANK_JSON_TARGET_NOTE, text,
+                      "a blank target must be named on the line that explains the refusal")
+        # Literal, not the constant (PRO-369 review N1): PRO-352 made this the negative
+        # half of the same operator-facing pair — blank means evidence WAS requested, so
+        # the not-requested wording must never appear here. Asserting the literal is what
+        # keeps a reword of `NO_JSON_PAYLOAD_NOTE` from surviving the suite.
+        self.assertNotIn("no --json payload requested", text,
+                         "blank means evidence was requested; saying 'none requested' here "
+                         "contradicts the refusal stderr raises two lines later")
         self.assertNotIn("on disk", text,
                          "the line still asserts evidence that was never written")
         self.assertNotIn("unaffected", text)
         self.assertNotIn("None", text, "a blank path must not leak as the word None")
+        err = res.err.decode("ascii")
+        self.assertIn(BLANK_JSON_TARGET_NOTE, err)
+        self.assertIn("boot is refused", err)
+        self.assertEqual(P.EXIT_ERROR, res.rc,
+                         "evidence was asked for and none exists — the boot must not go "
+                         "out on the checks' own rc")
+
+    def test_a_blank_json_target_refuses_the_boot(self):
+        """PRO-352: `--json ""` is "evidence asked for, none produced" — refuse at EXIT_ERROR.
+
+        This is the half the PRO-335 pin above deliberately left unpinned. The single
+        predicate in `main()` makes a blank target reach the same evidence-missing refusal
+        an unwritable path already took, so the boot cannot slip out on the checks' rc. The
+        operator's stderr names `--json` rather than an empty path or the cwd (`.`), and no
+        filesystem write is attempted for the blank family.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="empty")
+        self.assertEqual([], res.leftovers,
+                         "a blank --json must not touch the filesystem at all")
+        self.assertIsNone(res.payload, "a blank --json must write nothing")
+        err = res.err.decode("ascii")
+        self.assertIn(BLANK_JSON_TARGET_NOTE, err)
+        self.assertIn("boot is refused", err)
+        self.assertNotIn("could not write the --json payload to", err,
+                         "a blank target must be refused by the predicate, not by a failed "
+                         "write against the cwd")
+        self.assertEqual(P.EXIT_ERROR, res.rc)
+
+    def test_a_whitespace_json_target_refuses_the_boot(self):
+        """PRO-355 §2: the blank family is tested with `strip()`, not `== ""`.
+
+        `--json "   "` is the worse shape of the same bug: `Path("   ").write_text`
+        *succeeds*, so a truthiness gate boots and hands the operator a file literally
+        named `   ` that nobody can find. The predicate treats any whitespace-only target
+        as blank and refuses it exactly like the empty string.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="whitespace")
+        # The headline assertion has to be able to fail. `res.payload` is None by
+        # construction for this case, so it proves nothing on its own; the scratch cwd
+        # the drive runs in is what actually witnesses "no junk file" (PRO-361 NB1).
+        self.assertEqual([], res.leftovers,
+                         "a whitespace-only target must write no junk file — a `   ` in the "
+                         "scratch cwd means the write was attempted and succeeded")
+        self.assertIsNone(res.payload, "a whitespace-only target must write no junk file")
+        err = res.err.decode("ascii")
+        self.assertIn(BLANK_JSON_TARGET_NOTE, err)
+        self.assertIn("boot is refused", err)
+        self.assertNotIn("could not write the --json payload to", err)
+        self.assertEqual(P.EXIT_ERROR, res.rc)
 
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
