@@ -6056,6 +6056,15 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         wrapper-read test both need exactly that scope. Scanning the whole file is what
         let PRO-359's guard miss a fragment for reasons unrelated to the exemption
         (PRO-359 review B1).
+
+        The bound is a `fi` in COLUMN 0, not any line that strips to `fi`. PRO-381 gave
+        the refusal arms a capture-reading block of nested `if`s, and an
+        indentation-blind bound cut the region at the first arm — which hid every quote
+        below it from the guard and made the two-sided seam fire on a block that had
+        already ended. That is the PRO-359 review B1 failure mode arriving from the other
+        direction: a guard that cannot see the sentence it protects. The frozen wording
+        this guard was written against closes in column 0 too, so the stricter bound
+        costs nothing it used to cover.
         """
         lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
         start = next((i for i, ln in enumerate(lines)
@@ -6065,7 +6074,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                       "The gate's exit-code contract and this suite's view of the refusal "
                       "wording both key on that line, so a rename here is not cosmetic.")
         end = next((i for i in range(start, len(lines))
-                    if lines[i].strip() == "fi"), None)
+                    if lines[i] == "fi"), None)
         if end is None:
             self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
                       f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "

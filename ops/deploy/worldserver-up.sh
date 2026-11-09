@@ -125,6 +125,17 @@ gate_printed() {
   grep -qF -- "$needle" "$@" 2>/dev/null
 }
 
+# The third environmental notice, and the one the refusal sentence does NOT quote:
+# `preflight: policy file not found: {path}` (preflight_worlddb.py) means the checkout it
+# was called from is missing its policy JSON, which is as unambiguously a deployment
+# problem as a missing docker. It is matched here rather than inline so the refusal block
+# keeps quoting exactly the three fragments PRO-346 fixed and PRO-382 pinned — the two
+# exempted gate lines plus `'!!'` — and a fourth exempted line stays a deliberate edit to
+# that pin instead of a side effect of adding an arm.
+gate_printed_a_policy_notice() {
+  gate_printed 'preflight: policy file not found:' "$@"
+}
+
 if [[ ! -f "$GATE" ]]; then
   die "pre-flight gate not found at $GATE"
 fi
@@ -461,13 +472,16 @@ if (( rc != 0 )); then
     if gate_printed_a_finding "$GATE_OUT" "$GATE_ERR"; then
       has_finding=1
     fi
-    if gate_printed "could not write the --json payload" "$GATE_OUT" "$GATE_ERR"; then
+    # Single-quoted, and load-bearing as quotes: the refusal block is pinned to quote
+    # these two fragments verbatim because the operator-facing sentence below quotes them
+    # too (PRO-382 §1), so the matcher and the promise have to be the same string.
+    if gate_printed 'could not write the --json payload' "$GATE_OUT" "$GATE_ERR"; then
       has_payload_failure=1
     fi
-    if gate_printed "preflight: operational error:" "$GATE_OUT" "$GATE_ERR"; then
+    if gate_printed 'preflight: operational error:' "$GATE_OUT" "$GATE_ERR"; then
       has_operational_error=1
     fi
-    if gate_printed "preflight: policy file not found:" "$GATE_OUT" "$GATE_ERR"; then
+    if gate_printed_a_policy_notice "$GATE_OUT" "$GATE_ERR"; then
       has_policy_missing=1
     fi
   fi
@@ -503,11 +517,8 @@ if (( rc != 0 )); then
     tell "                  and this is not a finding about your SQL."
   fi
   if (( has_policy_missing == 1 )); then
-    # `preflight: policy file not found: {path}` (preflight_worlddb.py) is as
-    # unambiguously environmental as the operational error — a mis-deployed checkout is
-    # missing its policy JSON — so it gets its own arm rather than the unclassified one,
-    # and like the other environment arms it never routes the operator to the SQL lane
-    # (PRO-381 review NB).
+    # Routed like the other environment arms and never to the SQL lane (PRO-381 review
+    # NB); the notice it matches lives with `gate_printed_a_policy_notice`.
     tell "the gate could not find its policy file, so the checkout it was called from is"
     tell "                  incomplete or mis-deployed. Nothing was started, and this is"
     tell "                  not a finding about your SQL."
@@ -518,9 +529,9 @@ if (( rc != 0 )); then
     # it also cannot prove there was one it failed to capture.
     tell "ac-worldserver was not started, and the gate printed neither a finding line nor"
     tell "                  one of its own failure notices, so the wrapper cannot say"
-    tell "                  whether this is about your SQL. A '!!' line in the gate's output"
-    tell "                  above is a finding about your SQL; a line about the gate's own"
-    tell "                  environment is not."
+    tell "                  whether this is about your SQL. A '!!' line in the output above"
+    tell "                  is a finding about your SQL; a line about the environment of"
+    tell "                  the gate itself is not."
   fi
   tell "                  Do not bypass this gate."
   exit "$rc"
