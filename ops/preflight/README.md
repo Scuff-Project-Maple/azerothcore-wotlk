@@ -191,8 +191,11 @@ and the device name never appeared. `_stream_destination()` therefore falls back
 `os.readlink("/proc/self/fd/N")` when the object's answer is one of the interpreter's own channel
 names. An anonymous descriptor (`pipe:[…]`, `socket:[…]`) is not a place anyone can go and fix, so it
 stays unnamed and an early-closed pipe still reads plain `<stdout>`; a host without `/proc` gets the
-old wording rather than a guess. Both destination shapes are pinned through a real shell redirect, not
-an `open()` stand-in, so the two paths cannot drift apart again.
+old wording rather than a guess. Three destination shapes are pinned from outside the child: a shell
+`1>&-`, a shell `> /dev/full`, and an early-closed pipe the parent hands over with `Popen(stdout=…)`.
+Each pins the same property — fd 1 is set before the interpreter is built, never by an `open()`
+rebinding inside it — and only the two shell shapes go through the one helper, because no shell
+redirect can hand a child a descriptor whose reader is already gone.
 
 ### The third tag: the tracked upstream ref (PRO-248)
 

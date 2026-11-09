@@ -6855,15 +6855,25 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                               env=self._env(), capture_output=True, text=True)
 
     def _drive_real_main_through_shell(self, driver, td, redirect):
-        """Run the real `main()` with fd 1 set up by the shell, not by the child.
+        """Run the real `main()` with fd 1 set up outside the child, not by the child.
 
         PRO-354 is the reason this exists rather than another `sys.stdout = open(...)`
         fixture. Rebinding inside the child hands `main()` an object whose `name` really is
         `/dev/full`, so it exercises the object-naming half of `_emit` and nothing else; an
         operator reaches the state by redirecting descriptor 1 before the interpreter is
         built, which leaves `sys.stdout.name` as the literal `<stdout>`. Two fixtures, two
-        code paths, and only the one that never happens in the field was ever pinned. Both
-        destination shapes pinned below go through here so they cannot drift apart again.
+        code paths, and only the one that never happens in the field was ever pinned.
+
+        Three destination shapes are pinned that way (PRO-373 F2, naming them rather than
+        saying "both"): a shell `1>&-` in
+        `test_the_real_main_names_the_closed_fd_1_it_has_to_report_through`, a shell
+        `> /dev/full` in `test_a_shell_redirected_full_device_is_named_from_the_descriptor`,
+        and an early-closed pipe in `test_a_shell_redirected_broken_pipe_stays_unnamed`. Only
+        the two shell shapes come through here. The pipe cannot, because there is no shell
+        redirect that hands a child a descriptor whose reader is already gone; that test sets
+        fd 1 from the parent with `Popen(stdout=write_end)` instead. What all three pin is the
+        substantive half the shell was only ever a means to: the descriptor is set outside the
+        child, never by an `open()` rebinding in it.
         """
         import shlex
         import subprocess
@@ -7118,11 +7128,15 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"a pipe that closed early changed the verdict too: "
                              f"rc={proc.returncode} stderr={err}")
-            self.assertIn("could not write the report to <stdout>: BrokenPipeError", err,
-                          "the wrapper's wording for an early-closed pipe has to stay put")
+            # PRO-373 F2: this ordering is load-bearing. The prefix assertion below also
+            # breaks when an unwanted parenthetical turns up, so if it ran first it would
+            # swallow the regression and the engineer would read a complaint about the
+            # wrapper's wording instead of the one that explains the rule.
             self.assertNotIn("pipe:[", err,
                              "the descriptor path leaked an inode number into a sentence that "
                              "is supposed to name somewhere fixable")
+            self.assertIn("could not write the report to <stdout>: BrokenPipeError", err,
+                          "the wrapper's wording for an early-closed pipe has to stay put")
             self.assertNotIn("Exception ignored", err)
             self.assertTrue((Path(td) / "verdict.json").is_file())
 
@@ -7331,12 +7345,23 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         wrong for a descriptor the shell redirected first. The pair of helpers is the fix, so
         the seam between them is what needs pinning — including the two shapes where the
         descriptor must *not* win, because a wrong destination is worse than a vague one.
+
+        The must-not-win shapes are the ones that need a witness. A fixture that has no
+        descriptor to offer passes whether or not the early return is there, because both
+        branches end in `return label`; PRO-373 F2 measured that deleting it left the whole
+        suite at baseline. So `Opened` carries a `fileno` pointing at a second regular file
+        that is deliberately not `/dev/full`: the object and the descriptor now give different
+        answers, and only the early return can keep the object's.
         """
         import os
         import preflight_worlddb as P
 
         class Opened:
             name = "/dev/full"          # what an in-process open() produces
+            other_fd = None             # wired to a different file below; see the pin
+
+            def fileno(self):
+                return self.other_fd
 
         class Inherited:
             name = "<stdout>"           # what CPython stamps on fd 1 whatever the shell did
@@ -7352,7 +7377,18 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             target = Path(td) / "report.txt"
             target.write_text("x")
             real = os.path.realpath(str(target))
+            # PRO-373 F2: `Opened` has to be handed a descriptor that *disagrees* with its own
+            # `name`, and it has to still be open when the pin runs. Left without one — the
+            # shape this pin shipped with — deleting the early return at the top of
+            # `_stream_destination` only moves the answer two lines down, from
+            # `return label` to the "`fileno` is not callable" `return label`: still
+            # `/dev/full`, still green, and the "asked *only* when" this test is named after
+            # ships unpinned. With a live descriptor on a different regular file, dropping the
+            # early return lets the descriptor answer and this assertion is what goes red.
+            elsewhere = os.path.realpath(str(Path(td) / "elsewhere.txt"))
+            Path(elsewhere).write_text("y")
             fd = os.open(real, os.O_RDONLY)
+            Opened.other_fd = os.open(elsewhere, os.O_RDONLY)
             try:
                 self.assertEqual(real, P._descriptor_destination(fd),
                                   "a redirected regular file is nameable only from the fd")
@@ -7360,11 +7396,15 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                 named.fd = fd
                 self.assertEqual(real, P._stream_destination(named),
                                   "the operator's `> file` has to be named, not `<stdout>`")
+                self.assertEqual("/dev/full", P._stream_destination(Opened()),
+                                 "a stream that already names itself must not be "
+                                 "second-guessed — and the only way to know whether it is "
+                                 "being second-guessed is to hand it a descriptor worth "
+                                 "asking, which is `elsewhere.txt` here, not `/dev/full`")
             finally:
                 os.close(fd)
+                os.close(Opened.other_fd)
 
-            self.assertEqual("/dev/full", P._stream_destination(Opened()),
-                             "a stream that already names itself must not be second-guessed")
             self.assertEqual("<stdout>", P._stream_destination(NoDescriptor()),
                              "a stream with no descriptor is back to what its object can say")
 
@@ -7410,12 +7450,14 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
           is what `_emit` holds when the destination is genuinely unknown.
 
         So the fixture is deliberately *not* given a `fileno`. Measured under exactly that
-        mutation (`if real and real != name:` -> `if real:`) this pin goes red, together with
-        `test_a_shell_redirected_broken_pipe_stays_unnamed` — but that one fails on its
-        `could not write the report to <stdout>: BrokenPipeError` prefix assertion, which is
-        collateral on the operator's wording rather than a claim about the guard. This is the
-        pin that asserts the suppression decision itself, in-process, with the descriptor
-        path deliberately unavailable so nothing else can be responsible for the answer.
+        mutation (`if real and real != name:` -> `if real:`) this pin goes red first: since
+        PRO-373 F2 the `<stdout> (<stdout>)` guard runs ahead of the wording prefix, so the
+        message an engineer reads is the one that explains the rule. The end-to-end pipe pin
+        goes red under the same mutation as well, but on its prefix assertion — a suppressed
+        parenthetical leaks no inode number, so its `pipe:[` guard has nothing to see. That
+        asymmetry is why the suppression decision is pinned here, in-process, with the
+        descriptor path deliberately unavailable so nothing else can be responsible for the
+        answer.
         """
         import sys
         import preflight_worlddb as P
@@ -7462,13 +7504,16 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         self.assertEqual(1, len(fallback.lines),
                          f"`_emit` owes exactly one fallback line, got {fallback.lines}")
         note = fallback.lines[0]
-        self.assertIn("could not write the report to <stdout>: ", note,
-                      f"the suppression half regressed, or the notice lost the channel it "
-                      f"was aimed at: {note!r}")
+        # PRO-373 F2: ordering is load-bearing here. The prefix assertion below also breaks
+        # when a parenthetical turns up, so leading with it swallowed the regression and the
+        # message that explains the suppression rule never reached the engineer.
         self.assertNotIn("<stdout> (<stdout>)", note,
                          "the parenthetical repeated the label, which is the noise "
                          "PRO-341 review N2's 'say it only when it adds something' rule "
                          "and the `real != name` half of the guard exist to prevent")
+        self.assertIn("could not write the report to <stdout>: ", note,
+                      f"the suppression half regressed, or the notice lost the channel it "
+                      f"was aimed at: {note!r}")
         self.assertIn("OSError", note)
         self.assertIn("No space left on device", note,
                       "suppressing the destination must not cost the errno")
