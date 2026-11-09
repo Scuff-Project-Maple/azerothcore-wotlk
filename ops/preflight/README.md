@@ -818,6 +818,90 @@ What a green check does **not** say: it is not a boot rehearsal. None of these s
 mount — those belong to the boot gate (see "Dry run (check 5)"). Green here means the write-policy
 engine agrees with itself over the corpus in this checkout, and that the corpus was attributable.
 
+### The ref the sweep attributes against, and the clone that has never held it (PRO-430)
+
+`corpus_sweep.py` answers the upstream question the way the boot gate does: it resolves the ref the
+policy names with **one** `git ls-tree -z -r <ref>` for the whole run (cached, so the tree is walked
+once), then compares each upstream-tagged file against the blob that ref holds with
+`git hash-object -- <path>` and reads its author with `git log -1 -- <path>`.
+`ci_provenance_guard.py` runs no git at all — it imports `argparse`, `json`, `re`, `sys` and
+`pathlib`, reads the JSON tally the sweep wrote with `--out`, and checks that tally's shape and
+arithmetic. The ref is consulted by the sweep alone, which is exactly why the `provenance` column has
+to be read before the guard's exit code is trusted: a checkout the sweep could not attribute leaves
+the guard nothing to fail on except the sweep's own numbers.
+
+```
+upstreamProvenance.verifiedRef    = refs/remotes/origin/Playerbot
+upstreamProvenance.refreshCommand = git fetch --prune origin Playerbot
+```
+
+The ref the sweep needs is that canonical `refs/remotes/...` name — not `Playerbot`, not `HEAD`,
+not a local branch of that name — and it has to be a **remote-tracking ref in this clone**, because
+both the upstream exemption and the `company` column the check gates on are read out of it.
+
+What a `git clone --single-branch` of some other branch does to that depends on one more thing about
+the clone — whether it holds a fetch fingerprint (see "`missing`, `indeterminate`, `unchecked`"
+above) — and only one of the two states is the dangerous one:
+
+- **No fetch fingerprint.** A pristine single-branch clone nobody has run `git fetch` or `git pull`
+  in yet. `git clone` writes neither a `FETCH_HEAD` nor a reflog for a remote-tracking ref, so the
+  answer is `unchecked`, the exemption stands, and the sweep reports the baseline block above (there
+  at `head=6582d07fe`, `commits=20276`; the same figures here at `head=34099b85e61a`, where the
+  history line reads `commits=20372`).
+- **Any completed fetch.** One `git pull`, one `git fetch --prune origin <other-branch>`, or the
+  `git fetch --depth <n> origin <branch>` an `actions/checkout` limited-`fetch-depth` job runs
+  (measured to write `FETCH_HEAD`, where `git clone --depth 1 --single-branch` writes none — a
+  *fetch* is the fingerprint, a partial clone is not). `FETCH_HEAD` now names a fetched ref, so the
+  gate can no longer tell "the remote never carried the branch" from "someone deleted it", fails
+  closed (`indeterminate` / `ref-deleted`), and every file in an upstream-tagged directory loses the
+  exemption in one step.
+
+Measured on a `git clone --local --single-branch --branch <a branch that is not Playerbot>` of this
+repo plus one `git fetch --prune origin <that branch>`, then the workflow's own two command lines.
+What the guard prints for that run is a single line; the `guard: ` prefix below is literal and the
+line is reflowed here for width:
+
+```
+guard: head=34099b85e61a files=3060 under-policy=3060 statements=131625 findings=447779
+provenance[company=3060 upstream=0 unknown=0] companyFindings=447779 rowsListed=2000+
+history[commits=20372 shallow=False authors=8]
+```
+
+Read the `history` line before the verdict: 20 372 commits, 8 authors, not shallow, so every
+shallow/grafted refusal the guard has passes — and it still exits 2, on the one clause that fits,
+printed on stderr as `GUARD FAIL:` followed by "no scanned file was attributed to `upstream` even
+though the included directories are mostly upstream archive and updates: every file was given the
+same origin, which is what a checkout with no real history looks like. The `company` column in that
+tally is not a policy verdict." The sweep steps out of the way first with exit 1 on its non-zero
+`company` column, and that `447779` is the number a reader takes for a policy verdict. The same head
+with the ref present measures
+`findings=444726 provenance[company=7 upstream=3053 unknown=0] companyFindings=0` (with
+`refs/remotes/origin/Playerbot` itself at `34099b85e61a` — a pin the prose has to carry, since the
+tally JSON records no ref oid) and the guard exits 0, so the difference is exactly one
+`upstream-ref-deleted` finding per upstream-tagged file — 3 053 of them, the only rule `byRule` gains
+on this path and a rule that never appears on a clone holding the ref. A `company` column that large
+is a checkout defect, not 447 779 boot refusals, and refusing to read it as a verdict is the guard's
+whole job (PRO-295 review B1, PRO-422 review N4).
+
+Fix the clone. The ref has to be a remote-tracking ref, not merely objects in the object store:
+
+```
+git remote set-branches origin Playerbot && git fetch --prune origin      # '*' for every branch
+git fetch --prune origin +refs/heads/Playerbot:refs/remotes/origin/Playerbot   # one-off refspec
+```
+
+Either one lands `refs/remotes/origin/Playerbot` in the clone above, and both forms were measured
+there: each returns `provenance[company=7 upstream=3053 unknown=0] companyFindings=0 rowsListed=0`
+at the same head and the same ref tip, the sweep exits 0 and the guard exits 0 with its "the tally is attributable"
+line. Note what does not: the policy's own `refreshCommand`, run verbatim in that single-branch clone, fetches the
+commits and writes `FETCH_HEAD`, but `remote.origin.fetch` maps only the branch the clone tracks, so
+`refs/remotes/origin/Playerbot` is still absent afterwards — and the `FETCH_HEAD` it just wrote is the fingerprint that
+keeps the sweep on the fail-closed path. It is the right hint for a clone that tracks every branch and lost the ref, and
+not enough for one that never tracked it; the two forms above work for both. `--allow-missing-upstream-ref` is not an
+answer here either: it is the boot gate's typed opt-in back to the pre-PRO-248 exemption, and `corpus_sweep.py` never
+sets it — its hand-rolled `Args` has no such attribute, so `allow_missing_upstream_ref()` is `False` on every sweep run
+— which leaves the fetch as the only way a sweep can speak for the corpus at all.
+
 ## Dry run (check 5)
 
 The pending files are replayed, in `std::set`-ordered basename, into
