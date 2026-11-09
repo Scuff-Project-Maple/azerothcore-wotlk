@@ -6875,11 +6875,12 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
     # route is reached by naming a path that is not there — the operator's typo, which is
     # how it happens in the field. The driver still builds `policy.json` and the tree;
     # `main()` returns before either is reached, which is the point: the shape under test
-    # is the earliest `_emit`-backed exit `main()` has, and the one whose report goes to
-    # `sys.stderr`. `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4691` is
-    # earlier still and writes its usage error to `sys.stderr` directly — never through
-    # `_emit`, so nothing retires it — which is a separate gap (PRO-389 review N-a) and not
-    # what these pins drive.
+    # is the earliest `_emit`-backed exit `main()` has, and one of the two whose report goes
+    # to `sys.stderr` — the other is the operational-error return at
+    # `preflight_worlddb.py:4716-4717`, which this family does not drive.
+    # `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4691` is earlier still
+    # and writes its usage error to `sys.stderr` directly — never through `_emit`, so nothing
+    # retires it — which is a separate gap (PRO-389 review N-a) and not what these pins drive.
     _MAIN_ARGV = ('["--compose-root", str(td / "tree"), "--policy", str(td / "policy.json"), '
                   '"--json", str(td / "verdict.json")]')
     _MAIN_ARGV_MISSING_POLICY = ('["--compose-root", str(td / "tree"), "--policy", '
@@ -7134,7 +7135,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` still costs the gate its rc: "
-                             f"rc={proc.returncode} stderr={proc.stderr}")
+                             f"rc={proc.returncode} "
+                             f"(stderr is empty by construction under 2>&1)")
             payload = Path(td) / "verdict.json"
             self.assertTrue(payload.is_file(),
                             "the evidence has to survive both descriptors being full")
@@ -7161,7 +7163,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=120 story in the pair test proves nothing ({proc.stderr})")
+                             f"the rc=120 story in the pair test proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertTrue((Path(td) / "verdict.json").is_file(),
                             "even the pre-fix build wrote the payload before presenting")
 
@@ -7179,7 +7182,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         different stream, so none of them reaches that identity — which is why this route
         could sit unpinned while looking covered. (The three in-process `EXIT_ERROR` rc
         pins in the blank/whitespace `--json` family — `test_a_blank_json_target_refuses_the_boot`
-        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 360
+        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 450
         lines and a class boundary above this one — are not end-to-end: they run `main()`
         under `_drive_main`, which swaps the streams inside the child and so cannot see the
         interpreter's teardown flush that costs 120.)
@@ -7211,7 +7214,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_ERROR, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
-                             f"the error route too: rc={proc.returncode} stderr={proc.stderr}")
+                             f"the error route too: rc={proc.returncode} "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the missing-policy return happens before the evidence write, so "
                              "the rc is the only thing this route can report")
@@ -7233,7 +7237,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the pre-fix build returned before the payload too; if this flips "
                              "the two tests are no longer driving the same route")
@@ -7283,7 +7288,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self.assertEqual(P.EXIT_ERROR, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
                              f"the evidence-write route too: rc={proc.returncode} "
-                             f"stderr={proc.stderr}")
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "a blank `--json` target must never touch the filesystem, so the "
                              "rc is the only thing this route can report")
@@ -7318,7 +7323,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the suppressed-retirement build never wrote the payload either; "
                              "if this flips the two tests are no longer driving the same route")
