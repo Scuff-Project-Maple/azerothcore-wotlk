@@ -6070,10 +6070,32 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
                       f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
                       "the claim about what it quotes")
+        # The bound above is the FIRST bare `fi`, which is only the right bound while the
+        # block holds no conditional of its own. If it grows one, that nested `fi` becomes
+        # the bound and every line below it silently leaves the scan — including a new
+        # exempted quote, which is exactly the widening this block exists to refuse
+        # (PRO-346: no third exempted line). Measured on PRO-388 NB2: the block extended
+        # with a nested `if`/`fi` and a fourth quoted fragment passes the whole suite
+        # green, while the same fragment added flat fails two tests. So refuse a block
+        # this helper cannot bound rather than bound it wrongly and call the part we
+        # scanned the whole of it.
+        nested = [ln for ln in lines[start:end] if re.search(r"\bif\b.*\bthen\b\s*$", ln)]
+        if nested:
+            self.fail(f"the refusal block at {self.REFUSAL_BLOCK_ANCHOR!r} contains a nested "
+                      f"conditional {nested[0]!r}; the first `fi` no longer bounds the block, "
+                      "so the no-widening guard scans part of the sentence and calls it all "
+                      "of it. Flatten the block or bound it structurally — do not let the "
+                      "scan shrink (PRO-388 NB2).")
         return "\n".join(lines[start:end])
 
     def _wrapper_quoted_fragments(self) -> list:
-        """Every single-quoted fragment inside the refusal block, in first-seen order."""
+        """Every distinct single-quoted fragment inside the refusal block, sorted.
+
+        Sorted, not first-seen (PRO-388 NB4): both callers compare this against
+        `sorted(...)` of the pinned tuple, so order carries no information here — a
+        first-seen list would fail those comparisons on any rewording that reorders the
+        sentence without adding or removing a fragment.
+        """
         return sorted(set(re.findall(r"'([^']*)'", self._wrapper_refusal_block())))
 
     def _line_the_operator_matches(self, err: str, *, quoted: str, prefix: str) -> str:
@@ -6147,15 +6169,17 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                          "an untyped write failure leaves the operator unable to tell a "
                          "missing directory from a full disk")
 
-    def test_the_wrapper_still_quotes_both_gate_lines_the_gate_emits(self):
+    def test_the_wrapper_still_quotes_the_three_fragments_the_refusal_block_carries(self):
         """The pairing is two-sided, so the other half is pinned too (PRO-359).
 
         This suite does not own the wrapper's wording — `worldserver-up.sh` is frozen as
-        merged and its exemption is prose — but it does own the claim that these are the
-        two fragments an operator locked out is handed. Read it as the seam: whenever the
-        wrapper is reworded, its exemption and the two emitter lines move together, or a
-        one-sided rename routes an environment failure to Scuff (SQL) and a real finding
-        to nobody.
+        merged and its exemption is prose — but it does own the claim about what the
+        operator locked out of a boot is handed: three quoted fragments, the two exempted
+        gate lines plus the `'!!'` finding marker (PRO-388 NB5 — this test used to be
+        named for two, while it loops `WRAPPER_QUOTED_FRAGMENTS` and compares all three).
+        Read it as the seam: whenever the wrapper is reworded, its exemption and the
+        emitter lines move together, or a one-sided rename routes an environment failure
+        to Scuff (SQL) and a real finding to nobody.
         """
         block = self._wrapper_refusal_block()
         for frag in self.WRAPPER_QUOTED_FRAGMENTS:
@@ -6177,11 +6201,19 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                          "gate lines plus the finding marker; it is three quoted fragments "
                          "and PRO-346 rejected adding a fourth")
 
-    # Every shape `main()` can leave the operator in, so the wrapper-read test below has
-    # the complete set of lines the gate really writes to compare against: the printed
-    # verdict, the degraded verdict, the operational error, and the refused payload.
-    # `render_raises` and `op_error` are the two failure paths; `missing-dir` is the
-    # evidence-write path; the plain drive is a normal refused boot with findings.
+    # Every shape this suite needs a witness from, so the wrapper-read test below has the
+    # lines the gate really writes to compare against: the printed verdict, the degraded
+    # verdict, the operational error, and the refused payload. `render_raises` and
+    # `op_error` are the two failure paths; `missing-dir` is the evidence-write path; the
+    # plain drive is a normal refused boot with findings.
+    # This is not a claim that it is every shape `main()` can leave the operator in
+    # (PRO-388 NB3). Three more exist and none of them is quoted by the refusal block, so
+    # none needs a witness here: the policy-file-not-found early return (one
+    # `preflight: policy file not found: <path>` line on stderr, then `EXIT_ERROR`), the
+    # blank `--json ""` case (`main()` reports `BLANK_JSON_TARGET_NOTE`, added by PRO-352
+    # after this list was first written), and `--json-only`, which writes nothing to
+    # stdout at all. Each row of `WRAPPER_QUOTED_EVIDENCE` names its own shape, so a row
+    # that names a shape not driven here fails on the lookup rather than passing quietly.
     OPERATOR_FACING_SHAPES = (
         ("verdict", {}),
         ("degraded verdict", {"render_raises": True}),
@@ -6189,15 +6221,24 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                                            "No such file or directory"}),
         ("refused payload", {"json_target": "missing-dir"}),
     )
-    # Each fragment the refusal block quotes, and the one shape that has to show it.
-    # Naming the shape is not decoration: pooled into one corpus, `'!!'` is satisfied by
-    # the render-failure apology alone and the findings listing could stop marking
-    # findings without anyone noticing, which is the half of the wrapper's sentence that
-    # tells the operator what still counts as their problem.
+    # Each fragment the refusal block quotes, the one shape that has to show it, and the
+    # prefix the gate must put on that line. Naming the shape is not decoration: pooled
+    # into one corpus, `'!!'` is satisfied by the render-failure apology alone and the
+    # findings listing could stop marking findings without anyone noticing, which is the
+    # half of the wrapper's sentence that tells the operator what still counts as their
+    # problem. Naming the prefix is not decoration either: a shape name alone is a lever,
+    # because `'!!'` also turns up in the `render()`-failure apology, so repointing this
+    # row at `"degraded verdict"` keeps the test green with the findings listing unmarked.
+    # That is `WRAPPER_EXEMPTED_GATE_LINES`'s pairing rule arriving in this table — the
+    # two exempted lines already cross-check fragment against prefix before either half
+    # is trusted (PRO-359 review B1), and the finding marker had no such check (PRO-388
+    # NB1, the same self-consistency defect PRO-369 NB1 was about).
     WRAPPER_QUOTED_EVIDENCE = (
-        ("preflight: operational error:", "operational error"),
-        ("could not write the --json payload", "refused payload"),
-        ("!!", "verdict"),
+        ("preflight: operational error:", "operational error",
+         "preflight: operational error: "),
+        ("could not write the --json payload", "refused payload",
+         "preflight: could not write the --json payload to "),
+        ("!!", "verdict", "    !! "),
     )
 
     def _lines_the_gate_really_emits(self) -> dict:
@@ -6237,22 +6278,28 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS), quoted,
                          "the refusal block and this suite's view of it have drifted; "
                          "fix the wrapper and the pins together, in one change")
-        self.assertEqual({f for f, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
+        self.assertEqual({f for f, _, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
                          "a quoted fragment has no witness shape, so nothing checks that "
                          "the gate still emits it")
         emitted = self._lines_the_gate_really_emits()
         for name, lines in emitted.items():
             self.assertTrue(lines, f"the gate produced nothing at all in the {name!r} "
                                    "shape; an empty corpus passes any substring test")
-        for frag, shape in self.WRAPPER_QUOTED_EVIDENCE:
+        for frag, shape, line_prefix in self.WRAPPER_QUOTED_EVIDENCE:
+            self.assertIn(frag, line_prefix,
+                          f"the fixture drifted: {frag} is not a fragment of "
+                          f"{line_prefix!r}, so this row no longer describes gate and "
+                          "wrapper (compare the pairing rule in "
+                          "`_line_the_operator_matches`)")
             lines = emitted[shape]
             self.assertTrue(
-                any(frag in ln for ln in lines),
+                any(ln.startswith(line_prefix) for ln in lines),
                 f"{self.WRAPPER.name} quotes '{frag}' at the operator as though the gate "
-                f"wrote it, but no line the gate produced in the {shape!r} shape contains "
-                "it. The refusal routing turns on that string: an operator locked out is "
-                "told to escalate to Scuff (SQL) unless the gate said something like it, "
-                "and the gate no longer says it. Lines seen were:\n"
+                f"wrote it, but no line the gate produced in the {shape!r} shape starts "
+                f"with {line_prefix!r}. The refusal routing turns on that string: an "
+                "operator locked out is told to escalate to Scuff (SQL) unless the gate "
+                "said something like it, and the gate no longer says it. Lines seen "
+                "were:\n"
                 + "\n".join(sorted({ln for ln in lines if ln.strip()})))
 
     def test_a_render_failure_still_names_the_failing_check(self):
@@ -6276,8 +6323,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # inside the presentation half at all (PRO-335 §2, PRO-341 review N1/B1). The four
     # tests in `test_the_degraded_verdict_*` below pin its three shapes plus the blank
     # `--json ""` case; the `_payload_fortune()` helper that branch carried was dropped
-    # in the PRO-331 merge rather than kept as a second, competing source of the same
-    # claim.
+    # in the PRO-331 merge (`c6eca76f3`) rather than kept as a second, competing source of
+    # the same claim. Check that instead of trusting it:
+    # `git diff 1f11c9273 c6eca76f3 -- ops/preflight/preflight_worlddb.py`, where
+    # `1f11c9273` is the `pro-331-preflight-nb-fixes` tip that still held the helper. The
+    # obvious `git log -S"_payload_fortune" -- ops/preflight/` misses the drop, because
+    # pickaxe does not diff merge commits unless asked (PRO-388 NB6).
 
     def test_checks_that_pass_still_refuse_the_boot_when_the_payload_cannot_be_written(self):
         """PRO-324 NB3: the case that actually changes what boots.
