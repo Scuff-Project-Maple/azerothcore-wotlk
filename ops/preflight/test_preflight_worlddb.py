@@ -6659,12 +6659,13 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         PRO-325 NB2's shape (an absent thing asserted as present) on the line an operator
         reads while the boot is being refused.
 
-        PRO-352 (Core's PRO-355 contract A) closes the other half: the write gate and the
-        evidence-missing refusal now read one predicate, so a blank target counts as
-        requested, the refusal fires, and the rc is `EXIT_ERROR` — no longer a value this
-        pin declines to name. Blank is *not* "not requested", so the degraded line must say
-        the target is blank, never borrow `NO_JSON_PAYLOAD_NOTE`, and never claim the
-        payload is on disk.
+        PRO-352 (Core's PRO-355 contract A) closes the other half: the refusal is chained
+        behind the write gate rather than sharing its read — it tests `payload_error`, which
+        the blank-target arm sets without any write being attempted — so a blank target
+        counts as requested, the refusal fires, and the rc is `EXIT_ERROR` — no longer a
+        value this pin declines to name. Blank is *not* "not requested", so the degraded
+        line must say the target is blank, never borrow `NO_JSON_PAYLOAD_NOTE`, and never
+        claim the payload is on disk.
         """
         import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
@@ -6696,11 +6697,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     def test_a_blank_json_target_refuses_the_boot(self):
         """PRO-352: `--json ""` is "evidence asked for, none produced" — refuse at EXIT_ERROR.
 
-        This is the half the PRO-335 pin above deliberately left unpinned. The single
-        predicate in `main()` makes a blank target reach the same evidence-missing refusal
-        an unwritable path already took, so the boot cannot slip out on the checks' rc. The
-        operator's stderr names `--json` rather than an empty path or the cwd (`.`), and no
-        filesystem write is attempted for the blank family.
+        This is the half the PRO-335 pin above deliberately left unpinned. The blank-target
+        arm of the payload block sets `payload_error` without touching the filesystem, so a
+        blank target reaches the same evidence-missing refusal an unwritable path already
+        took and the boot cannot slip out on the checks' rc. The operator's stderr names
+        `--json` rather than an empty path or the cwd (`.`), and no filesystem write is
+        attempted for the blank family.
         """
         import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),

@@ -168,17 +168,19 @@ which says "no --json payload requested" rather than claiming a payload nobody a
 That degraded line draws from **four** wordings, three of which say the evidence is not there.
 They are chosen by three names in `main()`, not one: `payload_requested` splits never-requested
 from asked-for, `blank_json_target` splits the blank family out of that, and `payload_error` —
-which only the payload build/write can set — splits NOT-written from on-disk (PRO-352, Core's
-PRO-355 contract A): never requested → `NO_JSON_PAYLOAD_NOTE`; requested but blank →
+which only the payload block in `main()` can set — splits NOT-written from on-disk (PRO-352,
+Core's PRO-355 contract A): never requested → `NO_JSON_PAYLOAD_NOTE`; requested but blank →
 `BLANK_JSON_TARGET_NOTE`; requested but unwritable → "the --json payload at X was NOT written";
 written → "the --json payload at X is on disk". The fourth is not hypothetical — it is what that
 line says when `render()` raises *after* the payload landed, which is the shape
-`test_the_degraded_verdict_still_points_at_the_payload_it_wrote` holds. The write attempt is gated
-on `payload_requested = args.json_out is not None`; the evidence-missing refusal at the bottom of
-`main()` is gated on `payload_error`, which that write and only that write can set. They still
-cannot disagree about whether evidence was asked for — no path reaches a non-`None`
-`payload_error` with `payload_requested` false — but they are not the same test, and the
-NOT-written / on-disk half of the note follows what the write did, not the flag. Blankness is
+`test_the_degraded_verdict_still_points_at_the_payload_it_wrote` holds. The write attempt is
+gated on `payload_requested = args.json_out is not None`; the evidence-missing refusal at the
+bottom of `main()` is gated on `payload_error`, which is set in exactly two places, both inside
+that same block and both on branches that already required `payload_requested` — the failed
+write, and the blank-target arm beside it. They still cannot disagree about whether evidence was
+asked for — no path reaches a non-`None` `payload_error` with `payload_requested` false — but
+they are not the same test, and the NOT-written / on-disk half of the note follows what the
+write did, not the flag. Blankness is
 `args.json_out.strip()` — not truthiness, and not `== ""` — so `--json ""` and `--json "   "`,
 what an operator's `--json "$TARGET"` becomes when `$TARGET` is blank because
 the wrapper forwards unrecognised arguments verbatim, are *requested* payloads that touch no

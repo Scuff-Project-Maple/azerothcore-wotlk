@@ -4185,9 +4185,10 @@ NO_JSON_PAYLOAD_NOTE = "no --json payload requested"
 
 # The one wording for "a `--json` target was passed but holds no path" (PRO-352, Core's
 # PRO-355 contract A). It is the blank family's answer to the same question
-# `NO_JSON_PAYLOAD_NOTE` answers for an absent flag, so both live here and `main()` reads
-# them off one predicate — the pairing that stops stdout saying "no payload requested"
-# two lines before stderr says "the requested evidence payload is missing". Prefix
+# `NO_JSON_PAYLOAD_NOTE` answers for an absent flag, so both live here and `main()` chooses
+# between them in one fork (`payload_requested`, then `blank_json_target`) — the pairing that
+# stops stdout saying "no payload requested" two lines before stderr says "the requested
+# evidence payload is missing". Prefix
 # `preflight: ` at the standalone stderr emit; the bare sentence is shared with the
 # degraded stdout note. Blank by `strip()`, not `== ""`: a whitespace-only target is the
 # same family and the worse bug, because a real write with it would succeed. `strip()` is
@@ -4730,12 +4731,11 @@ def main(argv=None) -> int:
     # refusal at the bottom of `main()` must not be able to disagree about that, and the
     # way they cannot is a chain rather than a shared read: the refusal is gated on
     # `payload_error`, which is only ever set from inside a branch that already required
-    # `payload_requested`. `payload_requested` itself is true whenever the flag was passed
-    # at all — even with a blank argument. `worldserver-up.sh` forwards unrecognised
-    # operator arguments
-    # verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with an empty or whitespace
-    # `$TARGET` reaches here; the old truthiness gate skipped both the write and the
-    # refusal for it, so the boot went out on the checks' own rc with no evidence at all.
+    # `payload_requested`. `payload_requested` itself is true whenever the flag was passed at
+    # all — even with a blank argument. `worldserver-up.sh` forwards unrecognised operator
+    # arguments verbatim (`GATE_ARGS+=("$arg")`), so `--json "$TARGET"` with an empty or
+    # whitespace `$TARGET` reaches here; the old truthiness gate skipped both the write and
+    # the refusal for it, so the boot went out on the checks' own rc with no evidence at all.
     payload_requested = args.json_out is not None
     # `strip()`, not `== ""`: a whitespace-only target is the same family and the worse
     # bug. `Path("   ").write_text` *succeeds*, dropping a file literally named `   ` in
@@ -4777,7 +4777,8 @@ def main(argv=None) -> int:
     if not args.json_only:
         # The note is a claim about the payload, so it reads off the same three names the
         # write and the refusal sit behind — `payload_requested`, `blank_json_target`, and
-        # `payload_error` (only the build/write above can set it) — and not off one flag:
+        # `payload_error` (set above by the failed write, or by the blank-target arm beside
+        # it) — and not off one flag:
         # never-requested, requested-but-blank, requested-but-unwritable, and
         # written each get their own wording. A blank target must not borrow
         # `NO_JSON_PAYLOAD_NOTE` — that would tell the operator no payload was requested
