@@ -7128,7 +7128,11 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
 
         `_retire_broken_stream` is patched back to retiring only the refusing stream,
         which is precisely what `_emit` did before PRO-372: the notice line to
-        `sys.__stderr__` strands its bytes for the shutdown flush and 120 is back. If this
+        `sys.__stderr__` strands its bytes for the shutdown flush and 120 is back. That
+        equation holds here because this route presents once — one `_emit`, so one pair of
+        retirement calls and no later call that could retire the fallback by itself. On the
+        two-`_emit` payload-error route further down the same predicate is *not* the pre-372
+        build, and its control says so; do not copy this sentence across. If this
         pin ever exits 1, the fixture has stopped reaching the interpreter's final flush
         and the rc assertion above proves nothing.
         """
@@ -7156,9 +7160,11 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         second stream to retire. Every end-to-end subprocess rc pin above drives the
         `EXIT_FAIL` route, where the primary is `sys.stdout` and the fallback is a
         different stream, so none of them reaches that identity — which is why this route
-        could sit unpinned while looking covered. (Three in-process `EXIT_ERROR` rc pins sit
-        immediately above, in the blank/whitespace `--json` family; they run `main()` under
-        `_drive_main`, which swaps the streams inside the child and so cannot see the
+        could sit unpinned while looking covered. (The three in-process `EXIT_ERROR` rc
+        pins in the blank/whitespace `--json` family — `test_a_blank_json_target_refuses_the_boot`
+        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 360
+        lines and a class boundary above this one — are not end-to-end: they run `main()`
+        under `_drive_main`, which swaps the streams inside the child and so cannot see the
         interpreter's teardown flush that costs 120.)
 
         Measured on 3.12.3 at `d97932345` this exits **2**, not 120. On this return the two
@@ -7168,8 +7174,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         neither. The controls carry the asymmetry instead: on the `EXIT_FAIL` route either
         call removed on its own costs 120, while on the other `EXIT_ERROR` return — the
         payload write failure / blank `--json` at `preflight_worlddb.py:4791-4803`, whose
-        report goes to `sys.stdout` — retiring only the refusing stream is no longer enough,
-        which is what that route's own control below pins. "Passes today" is not a pin
+        report goes to `sys.stdout` — leaving only the `sys.stdout` retirement is no longer
+        enough, which is what that route's own control below pins. "Passes today" is not a pin
         either way, and the failure class is the one `flush_std_files()` owns: bytes a device
         already refused, retried at teardown, and answered by `Py_Exit()` with 120. The
         companion below removes both retirements and lands on 120, so the assertion here is
@@ -7224,17 +7230,28 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         the other way round: the report goes to `sys.stdout` (`:4789`) and the two notice
         lines to `sys.stderr` (`:4799-4800`). Primary and fallback are two different
         objects there, so the one-object identity that lets the missing-policy return above
-        survive either retirement call alone does not exist, and the two halves of the fix
-        stop being interchangeable. Measured on 3.12.3 under `> /dev/full 2>&1`: unpatched it
-        exits **2**; the pre-PRO-372 build — `_retire_broken_stream` back to retiring only
-        the refusing stream, which is what the control below runs — costs it **120**, and so
-        does blocking only the *first* call. What does not cost it 120 is blocking only the
-        second: the `_emit(sys.stderr, ...)` pair that follows carries its own primary
-        retirement, and on this route that retires the same object the fallback call would
-        have. So the claim this shape earns is "an `EXIT_ERROR` route whose report goes to
-        `sys.stdout` needs the fallback retirement to exist", not "the second call is
-        individually load-bearing" — a distinction worth having written down, because the
-        second reading is what the missing-policy return above would suggest.
+        survive either retirement call alone does not exist. Measured on 3.12.3 under
+        `> /dev/full 2>&1`: unpatched it exits **2**. The control below patches
+        `_retire_broken_stream` to suppress every retirement except the one on the refusing
+        `sys.stdout`, and that exits **120** — and so does removing every retirement, so on
+        this route those two patches are indistinguishable (both measured, 3.12.3). What
+        does *not* cost it 120 is blocking only the second call, nor the genuine pre-PRO-372
+        `_emit` with nothing but the `if fallback_refused:` retirement deleted: both exit
+        **2**, because this route runs more than one `_emit` and the pair at
+        `preflight_worlddb.py:4799-4800` carries its own *primary* retirement, which in the
+        pre-372 build lands on the same `sys.__stderr__` the skipped fallback call would have
+        covered. That is also why the control's predicate is strictly stronger than pre-372
+        rather than equal to it — it drops that second primary call too.
+
+        So the claim this shape earns is narrow: an `EXIT_ERROR` route whose report goes to
+        `sys.stdout` needs the refused `sys.__stderr__` retired by *something* before
+        teardown, and if the only surviving retirement is the stdout one, `Py_Exit()` answers
+        120. It says nothing about which half of the fix owns the route, and it is not the
+        "either call alone suffices" reading the missing-policy return above would suggest —
+        blocking the first call here costs 120, where the same patch there leaves 2. Where
+        the PRO-372 fallback call is genuinely load-bearing is the single-`_emit` report
+        route, and `test_the_devfull_pair_costs_120_without_the_fallback_retirement` is the
+        pin that says so.
 
         No stderr assertion, for the PRO-389 N1 reason stated on the `EXIT_FAIL` pin: under
         `2>&1` fd 2 cannot deliver anything to the parent. This route never writes the
@@ -7254,17 +7271,26 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                              "a blank `--json` target must never touch the filesystem, so the "
                              "rc is the only thing this route can report")
 
-    def test_the_payload_error_route_costs_120_without_the_fallback_retirement(self):
-        """Negative control for the pin above — the half of the fix that route rests on.
+    def test_the_payload_error_route_costs_120_when_the_refused_stderr_is_never_retired(self):
+        """Negative control for the pin above — proof its rc=2 is able to fail.
 
-        `_retire_broken_stream` is patched back to retiring only the refusing stream, which
-        is what `_emit` did before PRO-372. Here the refusing stream is `sys.stdout`, so the
-        refused fallback — `sys.__stderr__`, still holding the notice line and the two
-        payload-error lines — is left in place for `flush_std_files()`, and `Py_Exit()`
-        answers with 120 on a route that should exit 2. That is the measurement behind the
-        claim in the pin above that PRO-372's fallback call is load-bearing whenever the
-        report and the fallback are different objects; if this ever exits 2 the claim is
-        false and the docstring has to change, not the test.
+        `_retire_broken_stream` is patched to suppress every retirement except the one on
+        the refusing `sys.stdout`. The refused fallback — `sys.__stderr__`, still holding
+        the notice line and the two payload-error lines — is therefore never retired, stays
+        buffered for `flush_std_files()`, and `Py_Exit()` answers 120 on a route that should
+        exit 2.
+
+        Do not read this patch as the pre-PRO-372 build. Measured on 3.12.3, deleting only
+        the `if fallback_refused:` retirement from `_emit` — what `_emit` really looked like
+        before PRO-372 — leaves this route at **2**, because this route runs two `_emit`s and
+        the second one retires `sys.stderr` as its own *primary*, which is the object holding
+        the stranded bytes. The predicate here additionally drops that call, so it is
+        strictly stronger than pre-372; and the full removal measures 120 here as well, so
+        the two are indistinguishable. What this control can carry is "the refused
+        `sys.__stderr__` has to be retired by something before teardown", and nothing about
+        which half of the fix owns the route — which is why the pin above does not say. If
+        this ever exits 2, the fixture has stopped reaching the interpreter's final flush and
+        the rc=2 above proves nothing.
         """
         driver = self._driver(
             "_orig = P._retire_broken_stream; "
@@ -7275,10 +7301,45 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the fallback-retirement claim above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing ({proc.stderr})")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
-                             "the pre-fix build never wrote the payload either; if this flips "
-                             "the two tests are no longer driving the same route")
+                             "the suppressed-retirement build never wrote the payload either; "
+                             "if this flips the two tests are no longer driving the same route")
+
+    def test_the_payload_error_route_names_its_notices_when_only_stdout_is_full(self):
+        """PRO-389 review NB-2: the same route with fd 2 live, so the notices are the proof.
+
+        The two pins above can only claim their rc — under `2>&1` fd 2 delivers nothing to
+        the parent, and an `argparse` usage error exits 2 as well
+        (`preflight_worlddb.py:4691`, the gap PRO-389 review N-a routed to PRO-406), so rc
+        alone does not say which `EXIT_ERROR` return ran. Here only fd 1 sits on the refusing
+        device, so fd 2 is live and the route can name itself: the `_emit` notice about the
+        report, the PRO-352 blank-target line and the evidence-write refusal all have to
+        arrive verbatim. That is the stderr coverage the `EXIT_FAIL` side of this family has
+        had since PRO-341 and this route has never had.
+        """
+        import preflight_worlddb as P
+        driver = self._driver(
+            "pass   # fd 1 is on the full device; fd 2 is still the operator's terminal",
+            argv=self._MAIN_ARGV_BLANK_JSON)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full")
+            self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                             f"the evidence-write refusal changed code the moment fd 2 stayed "
+                             f"live: rc={proc.returncode} stderr={proc.stderr}")
+            self.assertIn("preflight: the --json target is blank; pass a path or omit the flag",
+                          proc.stderr,
+                          "without the blank-target line a 2 is not distinguishable from an "
+                          "argparse usage error, which is the ambiguity this pin exists to kill")
+            self.assertIn("preflight: the requested evidence payload is missing, so the boot is "
+                          "refused", proc.stderr,
+                          "the sentence an operator reads has to name an evidence-write failure, "
+                          "not a finding about their SQL")
+            self.assertIn("could not write the report to <stdout> (/dev/full)", proc.stderr,
+                          "the device that refused the report has to be named here too, the way "
+                          "the `EXIT_FAIL` pins have always required")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "a blank `--json` target must never touch the filesystem")
 
     def test_a_shell_redirected_broken_pipe_stays_unnamed(self):
         """PRO-341 review N2 has to survive the descriptor path: an inode is not a destination.
