@@ -6060,15 +6060,206 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # `REFUSING BOOT` lines from the lease checks, and the guard below has to cover one
     # sentence, not a 300-line shell script (PRO-359 review B1).
     REFUSAL_BLOCK_ANCHOR = "REFUSING BOOT — pre-flight failed"
+    # The last statement the block runs before it closes, and therefore the statement that
+    # has to be sitting under the `fi` the walk lands on. The right bound is derived two
+    # ways in `_refusal_block_end` and this is the third: every way the walk can be fooled
+    # into stopping early moves the tail out from under the `fi`, so a scan that silently
+    # shrank — the PRO-403 B1 failure mode, arriving from the opposite direction now that
+    # the block is nested — fails here instead of reporting half a sentence as all of it.
+    REFUSAL_BLOCK_TAIL = 'exit "$rc"'
     # Shell block tokens, matched on word boundaries and *position-free*. Position is what
     # PRO-403 B1 walked through: a line-leading match cannot see `  true; if :; then`, so
     # the nested block it opened hid a fourth exempted quote and the suite stayed green. The
     # lookbehind and lookahead are what keep operator-facing prose honest — `pre-flight`,
     # `finding` and `file(s)` are not block tokens — and they are verified by the control run
     # over the pristine block, not by an allowlist of the current wording.
+    #
+    # Run against the OPENER LINE only. Over the body this pattern is a flatness policy
+    # wearing a regex, and PRO-422 B1 is what that costs: PRO-381 nested the refusal arms on
+    # purpose, so the sweep fired on the real wrapper at `if [[ -n "$GATE_DIR" ]]; then` and
+    # called a correct script a defect. The body is walked command-by-command instead, by
+    # `_refusal_block_end`, which is where the price of nesting (a closer that has to be
+    # counted rather than assumed) is actually paid.
     _SHELL_BLOCK_KEYWORD = re.compile(
         r"(?<![\w./-])(?:if|elif|else|fi|then|do|done|case|esac"
         r"|for|while|until|select)(?![\w-])")
+
+    @staticmethod
+    def _shell_line_without_comment(line: str):
+        """`line` with its trailing shell comment removed, and whether its quotes balanced.
+
+        The comment has to go before anything is counted, and it has to go *quote-aware*:
+        `#` inside a quoted string is data, and `;` inside a quoted string is not a command
+        separator. Two measured reasons, both from the PRO-413/PRO-414 line of work on this
+        same bound:
+
+        - counting over raw lines books a phantom opener on trunk's
+          `# rc 1 IS a verdict even if the capture came back empty`, which closes the block
+          one `fi` early and hides the tail of the sentence;
+        - a stripper that guesses through an unbalanced quote is itself the bypass PRO-422 N1
+          warns about, so parity is *returned* rather than assumed. The caller fails on False;
+          nothing here continues with a guessed answer, which is what keeps a stripped
+          comment from becoming a way to hide a block token in plain sight.
+        """
+        kept, quote, i = [], "", 0
+        while i < len(line):
+            ch = line[i]
+            if quote == "'":
+                kept.append(ch)
+                if ch == "'":
+                    quote = ""
+                i += 1
+            elif quote == '"':
+                if ch == "\\" and i + 1 < len(line):
+                    kept.append(line[i:i + 2])
+                    i += 2
+                    continue
+                kept.append(ch)
+                if ch == '"':
+                    quote = ""
+                i += 1
+            elif ch in ("'", '"'):
+                quote = ch
+                kept.append(ch)
+                i += 1
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                break
+            elif ch == "\\" and i + 1 < len(line):
+                kept.append(line[i:i + 2])
+                i += 2
+            else:
+                kept.append(ch)
+                i += 1
+        return "".join(kept), not quote
+
+    @staticmethod
+    def _shell_command_first_words(line: str) -> tuple:
+        """The first word of every command `line` runs, in order.
+
+        A reserved word is only reserved at the start of a command, so this is what turns
+        `  true; if :; then` into the two commands PRO-403 B1 needs it to be — a line-leading
+        keyword match sees `true` there and the nested block vanishes from the count. The
+        separators are `;`, newline (only ever present in a logical line the walker joined
+        from a backslash continuation) and the list/pipeline operators `&&`, `||`, `|`, with
+        braces and parens included because a reserved word is also reserved after one of
+        those.
+
+        Splitting is done outside quotes, for the reason above: a `;` inside a quoted
+        sentence is prose the operator reads, not a command boundary. Over-splitting is the
+        tolerated direction — a phantom command whose first word happens to read `if` extends
+        the scan, and the column-0 cross-check then disagrees, which is loud. Under-counting
+        is the one that shrinks the scan, so anything that could hide a keyword from position
+        zero is named in `_refusal_block_end` rather than left uncounted.
+        """
+        commands, buf, quote, i = [], [], "", 0
+        while i < len(line):
+            ch = line[i]
+            if quote:
+                buf.append(ch)
+                if ch == quote:
+                    quote = ""
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                buf.append(ch)
+                i += 1
+                continue
+            pair = line[i:i + 2]
+            if pair in ("&&", "||") or ch in ";&|\n(){}":
+                commands.append("".join(buf))
+                buf = []
+                i += 2 if pair in ("&&", "||") else 1
+                continue
+            buf.append(ch)
+            i += 1
+        commands.append("".join(buf))
+        return tuple(cmd.split()[0] for cmd in (c.strip() for c in commands) if cmd)
+
+    @staticmethod
+    def _shell_continues(stripped_line: str) -> bool:
+        """Whether a comment-free line ends in a backslash continuation."""
+        stripped = stripped_line.rstrip()
+        return (len(stripped) - len(stripped.rstrip("\\"))) % 2 == 1
+
+    def _refusal_block_end(self, lines, start: int, where: str) -> int:
+        """Index of the `fi` closing the block whose opener is `lines[start]`.
+
+        Derived twice from the same text and required to agree, because the two fail in
+        opposite directions:
+
+        - a depth walk over command-position `if`/`fi` (`_shell_command_first_words`), which
+          is the only bound that survives a nested body and therefore the answer the scan is
+          cut at;
+        - the first `fi` written in column 0, which is how this helper bounded itself while
+          the block was flat and which no nested closer can imitate.
+
+        Requiring agreement is what PRO-413's cross-check buys: a walk that stops early at a
+        nested `fi` reports a line the column-0 scan does not, and a column-0 scan that runs
+        past a mis-counted opener reports a line the walk does not. Either disagreement is a
+        failure naming both answers.
+
+        What this still cannot see, stated rather than assumed (PRO-422 N1 asked for the
+        false-positive class to be named; these are the false-*negative* twins of it, and the
+        tail pin above is why they are survivable):
+
+        - a keyword split by a line continuation (`i\\` / `f true; the\\` / `n`). PRO-422 AC6
+          reached the same verdict for the flatness sweep this replaced — no token-level
+          bound over physical lines sees it, and closing that class needs a real shell lexer;
+        - a `fi` inside a here-doc body, or a command actually named `if`/`fi`, both of which
+          the walk counts as block structure (PRO-414's two counterexamples to a walk alone);
+        - a keyword that is not the first word of its command (`then if :; then`). `bash -n`
+          rejects that spelling, and the wrapper is executed by this suite, so it is not a
+          live shape — unlike `  true; if :; then`, which is legal and is counted.
+
+        Quote parity is a precondition rather than a hope: an unterminated quote in the
+        region fails here, because every rule above is a rule about *unquoted* text.
+        """
+        depth = 0
+        walked = None
+        i = start
+        while i < len(lines):
+            body, balanced = self._shell_line_without_comment(lines[i])
+            if not balanced:
+                self.fail(f"{where}:{i + 1} leaves a quote open, so neither the block walk "
+                          "nor the comment strip below it can tell block keywords from "
+                          "operator-facing prose. Bound the region some other structural way "
+                          "rather than letting the scan run over text it cannot parse "
+                          "(PRO-422 N1).")
+            while self._shell_continues(body) and i + 1 < len(lines):
+                i += 1
+                more, balanced = self._shell_line_without_comment(lines[i])
+                if not balanced:
+                    self.fail(f"{where}:{i + 1} leaves a quote open mid-continuation, so the "
+                              "logical line it belongs to cannot be counted (PRO-422 N1).")
+                body += "\n" + more
+            for word in self._shell_command_first_words(body):
+                if word == "if":
+                    depth += 1
+                elif word == "fi":
+                    depth -= 1
+                    if depth == 0:
+                        walked = i
+                        break
+            if walked is not None:
+                break
+            i += 1
+        if walked is None:
+            self.fail(f"no `fi` closes the refusal block opened at {lines[start]!r} in {where}; "
+                      "the block cannot be bounded, so neither can the claim about what it "
+                      "quotes")
+        col0 = next((j for j in range(start, len(lines)) if lines[j] == "fi"), None)
+        if col0 is None:
+            self.fail(f"nothing closes the refusal block in {where} with a `fi` in column 0; "
+                      "the block's own closer has to be reachable from the outside, or this "
+                      "scan has no bound it can defend")
+        if col0 != walked:
+            self.fail(f"the refusal block cannot be bounded two ways and agrees with itself "
+                      f"on neither: the block walk closes it at line {walked + 1} "
+                      f"({lines[walked]!r}) but the first column-0 `fi` is line {col0 + 1}. "
+                      "One of the two is lying about the nesting, and the scan would be cut "
+                      "at whichever it trusts (PRO-413 cross-check).")
+        return walked
 
     def _wrapper_refusal_block(self) -> str:
         """The lines the wrapper prints when the gate exits non-zero — that block only.
@@ -6078,14 +6269,13 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         let PRO-359's guard miss a fragment for reasons unrelated to the exemption
         (PRO-359 review B1).
 
-        The bound is a `fi` in COLUMN 0, not any line that strips to `fi`. PRO-381 gave
-        the refusal arms a capture-reading block of nested `if`s, and an
-        indentation-blind bound cut the region at the first arm — which hid every quote
-        below it from the guard and made the two-sided seam fire on a block that had
-        already ended. That is the PRO-359 review B1 failure mode arriving from the other
-        direction: a guard that cannot see the sentence it protects. The frozen wording
-        this guard was written against closes in column 0 too, so the stricter bound
-        costs nothing it used to cover.
+        The left bound is the `if` that opens the block, not the anchor line, and the right
+        bound is the `fi` that closes *that* `if` — derived twice and cross-checked by
+        `_refusal_block_end`. PRO-422 B1 is the record of what the old right bound cost: it
+        assumed a flat body, PRO-381 nested the refusal arms on purpose, and a bound that
+        cannot describe the script it is scanning is not a bound, it is a false failure that
+        reads as a defect report. The `if`/`fi` walk pays for that nesting; the tail pin
+        below is what keeps a walk that is fooled from quietly shrinking the scan.
         """
         lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
         anchor = next((i for i, ln in enumerate(lines)
@@ -6094,12 +6284,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
             self.fail(f"{self.WRAPPER.name} no longer prints {self.REFUSAL_BLOCK_ANCHOR!r}. "
                       "The gate's exit-code contract and this suite's view of the refusal "
                       "wording both key on that line, so a rename here is not cosmetic.")
-        # The right bound is the first bare `fi`; the left bound has to be the `if` that
-        # opens the block, not the anchor line. Bounding at the anchor is what PRO-388's
-        # re-review (PRO-403 P11) walked through: a fourth exempted quote inserted between
-        # the opener and the anchor sits outside the scan, and the whole suite stays green
-        # without any nested conditional at all. So require the anchor to be the first thing
-        # the `if` does, which leaves no room above it for a line the guard cannot see.
+        # The left bound has to be the `if` that opens the block, not the anchor line.
+        # Bounding at the anchor is what PRO-388's re-review (PRO-403 P11) walked through: a
+        # fourth exempted quote inserted between the opener and the anchor sits outside the
+        # scan, and the whole suite stays green without any nested conditional at all. So
+        # require the anchor to be the first thing the `if` does, which leaves no room above
+        # it for a line the guard cannot see.
         #
         # Kept alongside the token checks below, which otherwise imply it for any opener
         # that survives `bash -n`: the one spelling only this regex catches is an opener
@@ -6117,51 +6307,35 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                       "refusal sentence. Put the anchor first after the `if`, or bound this "
                       "helper structurally — do not let the scan shrink (PRO-403 P11).")
         start = anchor - 1
-        end = next((i for i in range(start, len(lines))
-                    if lines[i] == "fi"), None)
-        if end is None:
-            self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
-                      f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
-                      "the claim about what it quotes")
-        # The bound above is the FIRST bare `fi`, which is the right bound only while that
-        # `fi` is the one closing the `if` on the opener line. PRO-403 B1 measured two
-        # spellings where it is not, and both keep `Ran 368 tests` / OK: a nested block whose
-        # opener follows another command on the same line (`  true; if :; then`) is invisible
-        # to a line-leading keyword match, and a second `if` opened *on the opener line* is
-        # invisible to a sweep that starts below it. Either way the first bare `fi` is a
-        # nested close, so every line under it — a fourth exempted quote included, which is
-        # the PRO-346 widening this block exists to refuse — silently leaves the scan.
-        #
-        # So pin the two properties that make the bound exact instead of re-deriving the
-        # bound a second way and comparing the answers: the opener line is exactly one `if`
-        # and its `then`, and the body carries no shell block token at all. Given those, the
-        # nesting depth between the opener and the first bare `fi` can only run 1 then 0, so
-        # that `fi` *is* the closer — a depth walk over the same text could not report
-        # anything the two checks below did not, which is the standard PRO-403 applied to P7
-        # and to the window-emptiness guard. Each check is exercised by its own probe: the
-        # opener by `if (( rc != 0 )); then if :; then`, the sweep by `true; if :; then` and
-        # by a balanced `if …; then …; fi` written on one line, which leaves the depth bound
-        # intact and adds no quote, so nothing else in the suite can see it.
+        # The opener is pinned position-free, which the body deliberately is not: a second
+        # block token on this one line moves the walk's first depth-zero `fi` inside it, so
+        # the scan stops at a nested close and calls part of the sentence all of it — the
+        # PRO-403 B1 bypass, and the reason `if (( rc != 0 )); then if :; then` is a probe.
+        # There is no prose to misread on an opener line, so the sweep costs nothing here that
+        # it costs the body (PRO-422 N1), and it is the only check that can fire on the two
+        # spellings PRO-422 AC4 found where the walk stays correct: a second `if` on this line
+        # and `if (( rc != 0 )) && then=1 ; then`, whose extra `then` is real structure the
+        # command counter is right to ignore.
         opener_keywords = self._SHELL_BLOCK_KEYWORD.findall(opener)
         if opener_keywords != ["if", "then"]:
             self.fail(
                 f"the refusal block does not open on a single `if`: the line before "
                 f"{self.REFUSAL_BLOCK_ANCHOR!r} is {opener!r}, which carries the shell block "
                 f"tokens {opener_keywords} and must carry exactly ['if', 'then']. A second "
-                "block token on that line moves the first bare `fi` inside it, so the "
-                "no-widening guard scans part of the sentence and calls it all of it — "
-                "flatten the block or move the wording out of it, but do not let the scan "
+                "block token on that line moves the walk's first depth-zero `fi` inside it, "
+                "so the no-widening guard scans part of the sentence and calls it all of it — "
+                "open the block with one `if … ; then` and nest below it, or bound it "
+                "structurally some other way that cannot be moved, but do not let the scan "
                 "shrink (PRO-388 NB2, PRO-403 P2/B1).")
-        nested = [ln for ln in lines[start + 1:end]
-                  if self._SHELL_BLOCK_KEYWORD.search(ln)]
-        if nested:
-            self.fail(f"the refusal block at {self.REFUSAL_BLOCK_ANCHOR!r} carries the shell "
-                      f"block token "
-                      f"{self._SHELL_BLOCK_KEYWORD.search(nested[0]).group(0)!r} on "
-                      f"{nested[0]!r}; the first `fi` no longer bounds the block, so the "
-                      "no-widening guard scans part of the sentence and calls it all of it. "
-                      "Flatten the block, or move the wording that reads like shell out of "
-                      "it — do not let the scan shrink (PRO-388 NB2, PRO-403 P2/B1).")
+        end = self._refusal_block_end(lines, start, self.WRAPPER.name)
+        if lines[end - 1].strip() != self.REFUSAL_BLOCK_TAIL:
+            self.fail(f"the refusal block in {self.WRAPPER.name} does not end where this "
+                      f"guard believes it ends: the bound lands on the `fi` at line "
+                      f"{end + 1}, but the statement above it is {lines[end - 1]!r} rather "
+                      f"than {self.REFUSAL_BLOCK_TAIL!r}. Either the block grew a tail the "
+                      "scan was never shown or the bound stopped short of the real close, and "
+                      "the no-widening guard reads exactly one of those as the whole sentence "
+                      "(PRO-403 B1, PRO-422 B1).")
         return "\n".join(lines[start:end])
 
     def _wrapper_quoted_fragments(self) -> list:
