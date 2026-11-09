@@ -87,6 +87,32 @@ die() {
   exit 2
 }
 
+# Did the gate print a verdict about the SQL, as opposed to a notice about its own
+# plumbing? `render()` prints every FAIL as four spaces then `!! `, and the degraded
+# listing keeps that indent (`    !! [check] ...`); the one `!!` the operator must NOT be
+# sent to Scuff (SQL) for is `!! render() raised ...`, which is the gate describing its
+# own presentation failure rather than a finding about the SQL. Leading whitespace is
+# tolerated so a reindent inside the gate cannot quietly switch the escalation off; the
+# pin that renders a real verdict through the real `main()` is what catches drift in the
+# marker itself.
+gate_printed_a_finding() {
+  awk '
+    /^[[:space:]]*!![[:space:]]+render\(\)[[:space:]]+raised / { next }
+    /^[[:space:]]*!![[:space:]]/                                { found = 1 }
+    END                                                         { exit !found }
+  ' "$@"
+}
+
+# The gate's own two stderr prefixes for "something about my environment went wrong".
+# Matched as fixed strings because the gate emits them verbatim, not formatted:
+# `preflight: operational error: {exc}` and `preflight: could not write the --json
+# payload to {path}: ...`.
+gate_printed() {
+  local needle="$1"
+  shift
+  grep -qF -- "$needle" "$@" 2>/dev/null
+}
+
 if [[ ! -f "$GATE" ]]; then
   die "pre-flight gate not found at $GATE"
 fi
@@ -340,18 +366,94 @@ fi
 fi
 
 say "pre-flight gate (compose root $COMPOSE_ROOT)"
+
+# The advice under a refusal has to answer the one question the operator is actually
+# asking — is this my SQL? — and the only honest source for that answer is what the gate
+# printed, not the number it exited with. rc 2 covers both "the evidence payload could not
+# be written" and "the environment is broken"; rc 1 is a verdict. PRO-338/PRO-331 printed
+# one unconditional block for every non-zero rc, so a `--json` aimed at an unwritable
+# directory — a run whose own last line says it is not a finding about anyone's SQL — was
+# answered two lines later with "escalate to Scuff (SQL)" about the payload (PRO-370 F1).
+# So capture both streams, read them, then replay each to the fd it came from. Deferring
+# the bytes costs nothing live: the gate assembles its whole verdict before it prints any
+# of it, and every child process it runs has its pipes captured.
+GATE_DIR="$(mktemp -d)" || die "could not make a scratch dir to capture the gate's output"
+GATE_OUT="$GATE_DIR/stdout"
+GATE_ERR="$GATE_DIR/stderr"
+trap 'rm -rf "$GATE_DIR"' EXIT INT TERM
+
 rc=0
-"$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} || rc=$?
+# `if` rather than `|| rc=$?` so errexit stays out of the way without a `set +e` window.
+if "$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} \
+     >"$GATE_OUT" 2>"$GATE_ERR"; then
+  rc=0
+else
+  rc=$?
+fi
+# The operator still sees everything the gate said, on the stream it said it on. The guard
+# is the PRO-353 one reused: `>&2` dups fd 1 from what fd 2 is at that moment, then
+# `2>/dev/null` moves fd 2, so it is `cat`'s own "write error" complaint that gets
+# silenced and the gate's bytes that still reach the terminal. `|| true` for the same
+# reason — a terminal that refuses the replay must not replace the gate's rc with the
+# status of `cat`; the PRO-325/PRO-353 contract is that presentation may fail, the verdict
+# may not.
+cat "$GATE_OUT" 2>/dev/null || true
+cat "$GATE_ERR" >&2 2>/dev/null || true
+
 if (( rc != 0 )); then
   tell "REFUSING BOOT — pre-flight failed (exit $rc)."
-  tell "ac-worldserver was not started. Fix the named file(s) or"
-  tell "                  escalate to Scuff (SQL); a 'preflight: operational error:' or"
-  tell "                  'could not write the --json payload' line from the gate alone is an"
-  tell "                  environment or evidence-write failure, not a finding about your SQL."
-  tell "                  Any '!!' line from the gate is still a finding about your SQL."
+  has_finding=0
+  has_payload_failure=0
+  has_operational_error=0
+  if gate_printed_a_finding "$GATE_OUT" "$GATE_ERR"; then
+    has_finding=1
+  fi
+  if gate_printed "could not write the --json payload" "$GATE_OUT" "$GATE_ERR"; then
+    has_payload_failure=1
+  fi
+  if gate_printed "preflight: operational error:" "$GATE_OUT" "$GATE_ERR"; then
+    has_operational_error=1
+  fi
+
+  # rc 1 IS a verdict even if the capture came back empty — a terminal may have refused the
+  # bytes on the way here — so the SQL routing keys on rc as well as on the marker. The
+  # marker is what adds: a run that carried real findings AND lost its payload exits 2, and
+  # still has to reach Scuff (SQL).
+  if (( has_finding == 1 || rc == 1 )); then
+    tell "ac-worldserver was not started. Fix the named file(s) or"
+    tell "                  escalate to Scuff (SQL)."
+  fi
+  if (( has_payload_failure == 1 )); then
+    # Deliberately never names the SQL lane as the place to take this: the shape this arm
+    # exists for is the one where the gate has already said, accurately, that nobody's SQL
+    # is in question (PRO-370 F1).
+    tell "the run asked for a --json evidence payload and the gate could not write it."
+    tell "                  Its own line above names the path; the directory has to exist" >&2
+    tell "                  and be writable by this user. Fix the path and re-run. This is"
+    tell "                  an evidence-write failure, not a finding about your SQL, so the"
+    tell "                  SQL lane is not where it belongs."
+  fi
+  if (( has_operational_error == 1 )); then
+    tell "a 'preflight: operational error:' line is the gate failing to reach or set up"
+    tell "                  its environment — usually ac-database. Nothing was started,"
+    tell "                  and this is not a finding about your SQL."
+  fi
+  if (( has_finding == 0 && has_payload_failure == 0 && has_operational_error == 0 \
+        && rc != 1 )); then
+    # Worded so it cannot misroute in either direction: the wrapper saw no finding line, but
+    # it also cannot prove there was one it failed to capture.
+    tell "ac-worldserver was not started, and the gate printed neither a finding line nor"
+    tell "                  one of its own failure notices, so the wrapper cannot say"
+    tell "                  whether this is about your SQL. A '!!' line in the gate's output"
+    tell "                  above is a finding about your SQL; a line about the gate's own"
+    tell "                  environment is not."
+  fi
   tell "                  Do not bypass this gate."
   exit "$rc"
 fi
+
+rm -rf "$GATE_DIR"
+trap - EXIT INT TERM
 
 if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
   say "gate passed; PREFLIGHT_CHECK_ONLY=1 so the stack was not touched."

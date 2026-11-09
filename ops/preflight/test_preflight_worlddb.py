@@ -7181,5 +7181,288 @@ class TestTheGateCompilesQuietly(unittest.TestCase):
         self.assertNotIn("\udcff", doc, "a prose docstring is not a place for a surrogate")
 
 
+class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
+    """PRO-370 F1: an evidence-write failure may not be answered with the SQL escalation.
+
+    `ops/deploy/worldserver-up.sh` printed one advice block for every non-zero gate rc.
+    PRO-370 proved it on the deploy host: the `--json`-into-a-0555-directory case (rc 2)
+    and a real SQL FAIL (rc 1) differed only in the trailing `(exit 2)` vs `(exit 1)`, so
+    a gate that had just said — accurately — *"this is an evidence-write failure, not a
+    finding about your SQL"* was answered two lines later with *"Fix the named file(s) or
+    escalate to Scuff (SQL)"*. The gate's honesty was undone one layer up.
+
+    Every fixture here is produced by the **real** `main()` and replayed to the wrapper by
+    a stub `PYTHON`, carrying the gate's real bytes and the real rc. That indirection is
+    the point: PRO-338's earlier clause keyed on a hand-written guess about what the gate
+    prints ("did it name a file?") and turned out false in both directions, because nobody
+    had tied the guess to the emitter. Here the marker the wrapper matches and the rc the
+    wrapper reads come out of the same process run as the bytes themselves, so a change to
+    `render()` or to the payload notice that would strand an operator shows up as a red
+    test rather than as a wrong sentence on a refused boot.
+    """
+
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+
+    # Byte-for-byte what PRO-370 says a real SQL FAIL must still produce. Two echoes,
+    # wrapped for a terminal; both the raw pair and the folded sentence are pinned.
+    ESCALATION_RAW = ("worldserver-up: ac-worldserver was not started. Fix the named "
+                      "file(s) or\nworldserver-up:                   escalate to Scuff "
+                      "(SQL).")
+    ESCALATION = "ac-worldserver was not started. Fix the named file(s) or escalate to " \
+                 "Scuff (SQL)."
+
+    # The one real `main()`, with only the check bodies stubbed (the shape
+    # `TestTheGateHoldsItsOwnRc` already uses): no MySQL, no compose, no docker.
+    _GATE_DRIVER = '''
+        import pathlib
+        import sys
+
+        sys.path.insert(0, sys.argv[1])
+        import preflight_worlddb as P
+
+
+        class StubPreflight:
+            def __init__(self, args, policy, report):
+                self.args, self.policy, self.report = args, policy, report
+                self.sql_root = pathlib.Path(args.compose_root) / "data" / "sql"
+                self.git_root = pathlib.Path(args.compose_root)
+
+            def run(self):
+                if {operational}:
+                    raise P.OperationalError("cannot reach the database (db-access=docker, "
+                                             "service=ac-database). Is ac-database up?")
+                if {refuse}:
+                    self.report.fail("3", "UPDATE `creature_template` has no key predicate",
+                                     file="creature_template.sql", rule="unbounded-write")
+                    return P.EXIT_FAIL
+                return P.EXIT_OK
+
+
+        P.Preflight = StubPreflight
+        {break_render}
+        td = pathlib.Path(sys.argv[2])
+        (td / "tree" / "data" / "sql").mkdir(parents=True)
+        (td / "policy.json").write_text("{{}}")
+        sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
+                         str(td / "policy.json"), "--json", sys.argv[3]]))
+    '''
+
+    def _real_gate(self, *, refuse=False, operational=False, break_render=False, json_target):
+        """Run the real `main()`; return (rc, stdout, stderr) exactly as the operator saw them."""
+        import subprocess
+        import sys
+        import textwrap
+        broken = ("P.render = lambda report, args: (_ for _ in ())."
+                  "throw(RuntimeError('fixture: render broke'))") if break_render else "pass"
+        with tempfile.TemporaryDirectory() as td:
+            driver = Path(td) / "gate.py"
+            driver.write_text(textwrap.dedent(self._GATE_DRIVER).format(
+                refuse="True" if refuse else "False",
+                operational="True" if operational else "False",
+                break_render=broken))
+            proc = subprocess.run([sys.executable, str(driver), str(HERE), td, str(json_target)],
+                                  capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _writable_target(self):
+        """A --json path the gate really can write, so the payload arm stays silent."""
+        import os
+        fd, name = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        target = Path(name)
+        self.addCleanup(lambda: target.unlink(missing_ok=True))
+        return target
+
+    def _unwritable_dir(self):
+        """A 0555 directory: the PRO-370 host case, not a missing-directory stand-in."""
+        import shutil
+        root = Path(tempfile.mkdtemp())
+        locked = root / "evidence"
+        locked.mkdir()
+        locked.chmod(0o555)
+
+        def restore():
+            locked.chmod(0o755)
+            shutil.rmtree(str(root), ignore_errors=True)
+
+        self.addCleanup(restore)
+        return locked
+
+    def _replay_through_wrapper(self, gate_rc, gate_out, gate_err, json_target):
+        """Run the real wrapper with `PYTHON` pointed at a shim that replays `gate_*`."""
+        import os
+        import shutil
+        import subprocess
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(td), True)
+        (td / "stack").mkdir()
+        (td / "out").write_text(gate_out, encoding="utf-8")
+        (td / "err").write_text(gate_err, encoding="utf-8")
+        shim = td / "replay-gate"
+        # argv is the gate path and the forwarded flags; the replay is the whole point, so
+        # it reads its script from the environment and ignores them.
+        shim.write_text("#!/usr/bin/env bash\n"
+                        'cat "$REPLAY_OUT"\n'
+                        'cat "$REPLAY_ERR" >&2\n'
+                        'exit "$GATE_RC"\n', encoding="utf-8")
+        shim.chmod(0o755)
+        env = dict(os.environ, PYTHON=str(shim), REPLAY_OUT=str(td / "out"),
+                   REPLAY_ERR=str(td / "err"), GATE_RC=str(gate_rc),
+                   COMPOSE_ROOT=str(td / "stack"), LEASE_FILE=str(td / "lease"),
+                   PREFLIGHT_CHECK_ONLY="1")
+        proc = subprocess.run(["bash", str(self.WRAPPER), "--json", str(json_target)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              env=env, timeout=60)
+        return proc
+
+    @staticmethod
+    def _folded(text):
+        """The block with its line breaks folded, so a sentence is pinned whole.
+
+        The `worldserver-up: ` tag is dropped rather than kept: it is printed once per
+        physical line, so where a sentence happens to straddle two of them the tag would
+        otherwise land in the middle of the phrase under test. Exact rendering of the
+        escalation is pinned separately against `ESCALATION_RAW`.
+        """
+        without_tag = re.sub(r"worldserver-up: *", "", text)
+        return re.sub(r"\s+", " ", without_tag).strip()
+
+    # -- the case PRO-370 raised ------------------------------------------------------ #
+
+    def test_an_evidence_write_failure_is_not_answered_with_the_sql_escalation(self):
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc,
+                         f"fixture: a 0555 --json target must still be an evidence-write "
+                         f"failure the gate refuses on its own code (rc={rc})")
+        self.assertIn("could not write the --json payload to", err)
+        self.assertIn("not a finding about your SQL", err,
+                      "fixture: the gate has to still be the honest layer here")
+        self.assertNotIn("!!", out, "fixture: this run earned no finding")
+
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                         "the wrapper stopped failing closed on an evidence-write failure")
+        self.assertNotIn("Scuff (SQL)", proc.stderr,
+                         "the payload failure is routed to the SQL lane again — the exact "
+                         "sentence PRO-370 caught the wrapper printing")
+        self.assertIn("evidence-write failure", proc.stderr)
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+        self.assertIn(str(target), proc.stderr,
+                      "the advice has to point at the payload path, as the gate's own line does")
+
+    def test_the_gate_own_lines_still_reach_the_operator_unchanged(self):
+        """Routing may read the gate's output, but it may not swallow or relocate it."""
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(json_target=target)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        for line in (out + err).splitlines():
+            if line.strip():
+                self.assertIn(line, proc.stdout + proc.stderr,
+                              f"a line the gate printed never reached the operator: {line!r}")
+
+    def test_the_capture_keeps_each_stream_on_the_descriptor_it_came_from(self):
+        """The gate's verdict is stdout and its notices are stderr; the replay keeps that.
+
+        Capture-then-replay is only acceptable if the wrapper's `2>/dev/null` still hides
+        what `2>/dev/null` used to hide.
+        """
+        import preflight_worlddb as P
+        target = self._writable_target()
+        rc, out, err = self._real_gate(refuse=True, json_target=target)
+        self.assertEqual(P.EXIT_FAIL, rc)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertIn("RESULT: FAIL — boot refused", proc.stdout)
+        self.assertNotIn("RESULT: FAIL — boot refused", proc.stderr,
+                         "the gate's verdict was moved onto stderr by the capture")
+        self.assertIn("REFUSING BOOT", proc.stderr)
+        self.assertNotIn("REFUSING BOOT", proc.stdout)
+
+    # -- the case that must not regress ----------------------------------------------- #
+
+    def test_a_real_sql_fail_still_gets_the_escalation_sentence_verbatim(self):
+        import preflight_worlddb as P
+        target = self._writable_target()
+        rc, out, err = self._real_gate(refuse=True, json_target=target)
+        self.assertEqual(P.EXIT_FAIL, rc)
+        self.assertIn("    !! unbounded-write: UPDATE `creature_template` has no key predicate",
+                      out, "fixture: the finding line the wrapper keys on is not on disk")
+
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_FAIL, proc.returncode)
+        self.assertIn(self.ESCALATION_RAW, proc.stderr,
+                      "the escalation block changed shape on the path that must be untouched")
+        self.assertIn(self.ESCALATION, self._folded(proc.stderr))
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+        self.assertNotIn("evidence-write", proc.stderr,
+                         "a run that wrote its payload is being told about payloads")
+
+    def test_a_run_that_carried_findings_and_lost_its_payload_routes_to_both(self):
+        """rc 2 is not "not my SQL": findings and a lost payload can share a run."""
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(refuse=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("    !! unbounded-write:", out)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_ERROR, proc.returncode)
+        self.assertIn(self.ESCALATION, self._folded(proc.stderr),
+                      "a real finding was demoted because the rc belonged to the payload")
+        self.assertIn("evidence-write failure", proc.stderr)
+
+    def test_a_degraded_render_still_routes_the_findings_it_listed(self):
+        """The marker, not the exit code, is what decides — rc 2 with a listed FAIL routes to SQL."""
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(refuse=True, break_render=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("!! render() raised RuntimeError", out)
+        self.assertIn("    !! [3] FAIL", out,
+                      "fixture: the degraded listing stopped listing what it refused on")
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertIn(self.ESCALATION, self._folded(proc.stderr))
+
+    def test_a_render_failure_alone_is_not_read_as_a_finding(self):
+        """`!! render() raised ...` is the gate describing itself, not the SQL."""
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(break_render=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("!! render() raised RuntimeError", out)
+        self.assertNotIn("    !!", out, "fixture: no finding was listed, so this tests "
+                                       "the exclusion and nothing else")
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertNotIn("Scuff (SQL)", proc.stderr,
+                         "a presentation failure sent the operator to the SQL lane")
+
+    def test_an_operational_error_is_not_answered_with_the_sql_escalation(self):
+        """The PRO-338 counterexample, now pinned: ac-database was down; nobody's SQL was."""
+        import preflight_worlddb as P
+        target = self._writable_target()
+        rc, out, err = self._real_gate(operational=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("preflight: operational error:", err)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_ERROR, proc.returncode)
+        self.assertNotIn("Scuff (SQL)", proc.stderr)
+        self.assertIn("operational error", proc.stderr)
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+
+    def test_an_unrecognised_failure_fails_closed_without_naming_the_sql_lane(self):
+        """No finding line, no known notice, an undocumented rc: say nothing that misroutes."""
+        proc = self._replay_through_wrapper(3, "", "something the gate has never printed\n",
+                                            Path("/nonexistent/preflight.json"))
+        self.assertEqual(3, proc.returncode, "an undocumented rc stopped failing closed")
+        self.assertNotIn("Scuff (SQL)", proc.stderr)
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+        self.assertIn("cannot say whether this is about your SQL", self._folded(proc.stderr))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
