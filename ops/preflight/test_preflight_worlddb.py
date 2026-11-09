@@ -6644,6 +6644,58 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                             "the evidence still has to survive a terminal that will not take it")
             self.assertEqual("fail", json.loads(payload.read_bytes().decode("ascii"))["result"])
 
+    def test_the_real_main_holds_its_rc_when_fd_2_dups_the_refusing_device(self):
+        """PRO-372 F1: the operator's `> /dev/full 2>&1` — both descriptors, one full device.
+
+        PRO-325 made the gate hold its own rc against a refusing stdout while fd 2 stayed
+        live, and PRO-360's rewritten `_retire_broken_stream` docstring then made a prose
+        claim about the shape where fd 2 *is* fd 1. Measured at `5942df102`, `cc9d8bfda`
+        and `c93866486`, that shape still exited 120: `_emit` retired only the stream that
+        refused it, the notice line it then wrote to `sys.__stderr__` was refused too
+        (at startup `sys.stderr is sys.__stderr__`), those bytes stayed buffered, and
+        `flush_std_files()` at teardown tripped on the same full descriptor from the other
+        side — `Py_Exit()` turned the failed final flush into 120. The wrapper still fails
+        closed, but `REFUSING BOOT — pre-flight failed (exit 120)` is the PRO-325 `extraD`
+        symptom from the operator's most natural redirect, and no pin had ever put fd 2 on
+        the refusing descriptor. The refusing device keeps the notice in this shape; rc is
+        the one number that still reaches the operator, and the payload is the evidence.
+        """
+        import preflight_worlddb as P
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup="pass   # the shell put fd 2 on the same full description as fd 1")
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(P.EXIT_FAIL, proc.returncode,
+                             f"the operator's `> /dev/full 2>&1` still costs the gate its rc: "
+                             f"rc={proc.returncode} stderr={proc.stderr}")
+            self.assertNotIn("Exception ignored", proc.stderr,
+                             "the interpreter is still holding bytes for a device that refused them")
+            payload = Path(td) / "verdict.json"
+            self.assertTrue(payload.is_file(),
+                            "the evidence has to survive both descriptors being full")
+            self.assertEqual("fail", json.loads(payload.read_bytes().decode("ascii"))["result"])
+
+    def test_the_devfull_pair_costs_120_without_the_fallback_retirement(self):
+        """Negative control for the pin above — the pre-PRO-372 build, reproduced not restated.
+
+        `_retire_broken_stream` is patched back to retiring only the refusing stream,
+        which is precisely what `_emit` did before PRO-372: the notice line to
+        `sys.__stderr__` strands its bytes for the shutdown flush and 120 is back. If this
+        pin ever exits 1, the fixture has stopped reaching the interpreter's final flush
+        and the rc assertion above proves nothing.
+        """
+        driver = self._MAIN_DRIVER.format(
+            stdout_setup="_orig = P._retire_broken_stream; "
+                         "P._retire_broken_stream = "
+                         "(lambda s, l: _orig(s, l) if s is sys.stdout else None)")
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(120, proc.returncode,
+                             f"the fixture no longer reaches the interpreter's final flush, so "
+                             f"the rc=120 story in the pair test proves nothing ({proc.stderr})")
+            self.assertTrue((Path(td) / "verdict.json").is_file(),
+                            "even the pre-fix build wrote the payload before presenting")
+
     def test_a_shell_redirected_broken_pipe_stays_unnamed(self):
         """PRO-341 review N2 has to survive the descriptor path: an inode is not a destination.
 
@@ -6759,6 +6811,110 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             sys.stdout.flush()
         finally:
             sys.stdout = original
+
+    def test_a_fallback_that_refuses_too_is_retired_from_teardown(self):
+        """PRO-372 F1 mechanism: after a refused notice, nothing may stay buffered in it.
+
+        The end-to-end pair can only show the rc; in-process it can show the guarantee the
+        rc rests on. Both descriptors point at one refusing device (the `2>&1` shape), so
+        the primary write and the fallback notice both fail. After `_emit` returns, the
+        stream the interpreter will flush at shutdown must be the inert stand-in, and the
+        object that held the stranded bytes must report itself closed — the one shape
+        `flush_std_files()` skips outright.
+        """
+        import sys
+        import preflight_worlddb as P
+
+        class Full:
+            name = "<stderr>"
+            encoding = "utf-8"
+
+            def __init__(self):
+                self.closed = False
+                self.buffered = []
+
+            def write(self, s):
+                self.buffered.append(s)
+                return len(s)
+
+            def flush(self):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                self.closed = True
+
+        primary, fallback = Full(), Full()
+        orig_out, orig_err, orig_stderr = sys.stdout, sys.stderr, sys.__stderr__
+        try:
+            sys.stdout, sys.stderr, sys.__stderr__ = primary, fallback, fallback
+            P._emit(primary, "verdict text", label="<stdout>")
+            self.assertIsInstance(sys.stderr, P._RetiredStream,
+                                  "the notice's own bytes stayed buffered in a stream the "
+                                  "shutdown flush still reaches — the PRO-372 shape")
+            self.assertTrue(fallback.closed,
+                            "a refusing fallback must report itself closed; that is what "
+                            "takes it out of flush_std_files()")
+            self.assertTrue(primary.closed and isinstance(sys.stdout, P._RetiredStream),
+                            "the original retirement may not regress with the new one")
+        finally:
+            sys.stdout, sys.stderr, sys.__stderr__ = orig_out, orig_err, orig_stderr
+
+    def test_a_fallback_that_took_the_notice_is_left_in_the_interpreters_hands(self):
+        """The other half of PRO-372: a live fd 2 delivers the notice and is never retired.
+
+        `> /dev/full` alone — stdout full, stderr live — is the shape whose operator-facing
+        sentence PRO-341 review N2 and PRO-354 spent two rounds polishing. Retiring a
+        fallback that took the line would silently silence it, and every rc pin would still
+        pass. The fallback is retired when and only when it refused.
+        """
+        import sys
+        import preflight_worlddb as P
+
+        class Full:
+            name = "<stdout>"
+            encoding = "utf-8"
+
+            def __init__(self):
+                self.closed = False
+
+            def write(self, s):
+                return len(s)
+
+            def flush(self):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                self.closed = True
+
+        class Live:
+            name = "<stderr>"
+            encoding = "utf-8"
+            closed = False
+
+            def __init__(self):
+                self.lines = []
+
+            def write(self, s):
+                self.lines.append(s)
+                return len(s)
+
+            def flush(self):
+                return None
+
+        primary, fallback = Full(), Live()
+        orig_out, orig_err, orig_stderr = sys.stdout, sys.stderr, sys.__stderr__
+        try:
+            sys.stdout, sys.stderr, sys.__stderr__ = primary, fallback, fallback
+            P._emit(primary, "verdict text", label="<stdout>")
+            self.assertIs(sys.stderr, fallback,
+                          "a fallback that delivered the notice must not be retired")
+            self.assertFalse(fallback.closed)
+            self.assertTrue(any("could not write the report to <stdout>" in line
+                                for line in fallback.lines),
+                            "the notice has to reach the live fallback stream — that is "
+                            "the sentence PRO-354 exists to get right")
+        finally:
+            sys.stdout, sys.stderr, sys.__stderr__ = orig_out, orig_err, orig_stderr
 
     def test_the_label_names_the_destination_and_never_says_none(self):
         """`_stream_label` is the whole of PRO-325 NB2, so pin its three shapes."""
