@@ -87,6 +87,55 @@ die() {
   exit 2
 }
 
+# Did the gate print a verdict about the SQL, as opposed to a notice about its own
+# plumbing? `render()` prints every FAIL as four spaces then `!! `, and the degraded
+# listing keeps that indent (`    !! [check] ...`); the one `!!` the operator must NOT be
+# sent to Scuff (SQL) for is `!! render() raised ...`, which is the gate describing its
+# own presentation failure rather than a finding about the SQL. Leading whitespace is
+# tolerated so a reindent inside the gate cannot quietly switch the escalation off; the
+# pin that renders a real verdict through the real `main()` is what catches drift in the
+# marker itself.
+gate_printed_a_finding() {
+  # Each file is probed on its own and only when it is non-empty, so a capture that is
+  # simply gone — the tmpfiles-daemon-reclaimed-it-underneath-a-long-run shape, or the
+  # dir removed under the arms — reads as "no finding here" instead of printing a raw
+  # `awk: cannot open ...` in the middle of the refusal (PRO-381 B3; the PRO-308/PRO-313
+  # "keep the tool's own diagnostics out of the operator's refusal" rule).
+  local f
+  for f in "$@"; do
+    [[ -s "$f" ]] || continue
+    if awk '
+      /^[[:space:]]*!![[:space:]]+render\(\)[[:space:]]+raised / { next }
+      /^[[:space:]]*!![[:space:]]/                                { found = 1 }
+      END                                                         { exit !found }
+    ' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The gate's own two stderr prefixes for "something about my environment went wrong".
+# Matched as fixed strings because the gate emits them verbatim, not formatted:
+# `preflight: operational error: {exc}` and `preflight: could not write the --json
+# payload to {path}: ...`.
+gate_printed() {
+  local needle="$1"
+  shift
+  grep -qF -- "$needle" "$@" 2>/dev/null
+}
+
+# The third environmental notice, and the one the refusal sentence does NOT quote:
+# `preflight: policy file not found: {path}` (preflight_worlddb.py) means the checkout it
+# was called from is missing its policy JSON, which is as unambiguously a deployment
+# problem as a missing docker. It is matched here rather than inline so the refusal block
+# keeps quoting exactly the three fragments PRO-346 fixed and PRO-382 pinned — the two
+# exempted gate lines plus `'!!'` — and a fourth exempted line stays a deliberate edit to
+# that pin instead of a side effect of adding an arm.
+gate_printed_a_policy_notice() {
+  gate_printed 'preflight: policy file not found:' "$@"
+}
+
 if [[ ! -f "$GATE" ]]; then
   die "pre-flight gate not found at $GATE"
 fi
@@ -340,18 +389,163 @@ fi
 fi
 
 say "pre-flight gate (compose root $COMPOSE_ROOT)"
+
+# The advice under a refusal has to answer the one question the operator is actually
+# asking — is this my SQL? — and the only honest source for that answer is what the gate
+# printed, not the number it exited with. rc 2 covers both "the evidence payload could not
+# be written" and "the environment is broken"; rc 1 is a verdict. PRO-338/PRO-331 printed
+# one unconditional block for every non-zero rc, so a `--json` aimed at an unwritable
+# directory — a run whose own last line says it is not a finding about anyone's SQL — was
+# answered two lines later with "escalate to Scuff (SQL)" about the payload (PRO-370 F1).
+# So capture both streams, read them, then replay each to the fd it came from. Deferring
+# the bytes costs nothing live: the gate assembles its whole verdict before it prints any
+# of it, and every child process it runs has its pipes captured.
+# Capture is presentation, not the verdict (the PRO-325/PRO-353 rule): the gate run *is*
+# the verdict, so a scratch dir we cannot make must not cost the operator a run that would
+# have passed. `mktemp -d` is exactly the call that dies on `No space left on device` — the
+# PRO-351 host shape — so it is best-effort: on success we read the bytes and route on them;
+# on failure the gate speaks straight to the operator's own descriptors and we route on rc
+# alone, rather than dying before the gate ever ran (PRO-381 B2: an unwritable/full TMPDIR
+# used to answer a run that should have printed RESULT: PASS with rc 2 and no payload).
+if GATE_DIR="$(mktemp -d 2>/dev/null)"; then
+  GATE_OUT="$GATE_DIR/stdout"
+  GATE_ERR="$GATE_DIR/stderr"
+  # EXIT owns the removal, and it runs *after* the advice arms have read the capture.
+  # INT/TERM only leave — they must not clean up and then fall through, or a signal that
+  # used to abort the boot starts letting it happen: the trap-replaced handler returns,
+  # the gate child (never signalled) finishes rc 0, and the script walks straight into
+  # `docker compose up -d ac-worldserver`. That is the fail-open PRO-381 B1 caught under
+  # `docker stop` / `systemd stop` / a plain `kill -TERM`, all of which signal only this
+  # script. Forwarding the signal to the gate's pid is a bonus, not required for that.
+  trap 'rm -rf "$GATE_DIR"' EXIT
+else
+  GATE_DIR=""
+  GATE_OUT=/dev/null
+  GATE_ERR=/dev/null
+fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 rc=0
-"$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} || rc=$?
+# `if` rather than `|| rc=$?` so errexit stays out of the way without a `set +e` window.
+if [[ -n "$GATE_DIR" ]]; then
+  if "$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"} \
+       >"$GATE_OUT" 2>"$GATE_ERR"; then
+    rc=0
+  else
+    rc=$?
+  fi
+else
+  # No capture: the gate writes to our own stdout/stderr, exactly as it did before the
+  # capture existed, so the operator still gets RESULT:, the `!!` lines, and any notice.
+  if "$PYTHON" "$GATE" --compose-root "$COMPOSE_ROOT" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}; then
+    rc=0
+  else
+    rc=$?
+  fi
+fi
+# The operator still sees everything the gate said, on the stream it said it on — but only
+# when we actually captured it. With no capture the gate already wrote straight to those
+# descriptors, and replaying /dev/null would only add noise. The guard on the replay is the
+# PRO-353 one reused: `>&2` dups fd 1 from what fd 2 is at that moment, then
+# `2>/dev/null` moves fd 2, so it is `cat`'s own "write error" complaint that gets
+# silenced and the gate's bytes that still reach the terminal. `|| true` for the same
+# reason — a terminal that refuses the replay must not replace the gate's rc with the
+# status of `cat`; the PRO-325/PRO-353 contract is that presentation may fail, the verdict
+# may not.
+if [[ -n "$GATE_DIR" ]]; then
+  cat "$GATE_OUT" 2>/dev/null || true
+  cat "$GATE_ERR" >&2 2>/dev/null || true
+fi
+
 if (( rc != 0 )); then
   tell "REFUSING BOOT — pre-flight failed (exit $rc)."
-  tell "ac-worldserver was not started. Fix the named file(s) or"
-  tell "                  escalate to Scuff (SQL); a 'preflight: operational error:' or"
-  tell "                  'could not write the --json payload' line from the gate alone is an"
-  tell "                  environment or evidence-write failure, not a finding about your SQL."
-  tell "                  Any '!!' line from the gate is still a finding about your SQL."
+  has_finding=0
+  has_payload_failure=0
+  has_operational_error=0
+  has_policy_missing=0
+  # The markers can only be read when there is a capture to read. With no capture every
+  # flag stays 0 and routing falls to the rc-only rules below — which is the honest
+  # degradation: the wrapper can still tell a verdict (rc 1) from an environment failure,
+  # it just cannot name which environment failure it saw.
+  if [[ -n "$GATE_DIR" ]]; then
+    if gate_printed_a_finding "$GATE_OUT" "$GATE_ERR"; then
+      has_finding=1
+    fi
+    # Single-quoted, and load-bearing as quotes: the refusal block is pinned to quote
+    # these two fragments verbatim because the operator-facing sentence below quotes them
+    # too (PRO-382 §1), so the matcher and the promise have to be the same string.
+    if gate_printed 'could not write the --json payload' "$GATE_OUT" "$GATE_ERR"; then
+      has_payload_failure=1
+    fi
+    if gate_printed 'preflight: operational error:' "$GATE_OUT" "$GATE_ERR"; then
+      has_operational_error=1
+    fi
+    if gate_printed_a_policy_notice "$GATE_OUT" "$GATE_ERR"; then
+      has_policy_missing=1
+    fi
+  fi
+
+  # rc 1 IS a verdict even if the capture came back empty — a terminal may have refused the
+  # bytes on the way here — so the SQL routing keys on rc as well as on the marker. The
+  # marker is what adds: a run that carried real findings AND lost its payload exits 2, and
+  # still has to reach Scuff (SQL).
+  if (( has_finding == 1 || rc == 1 )); then
+    tell "ac-worldserver was not started. Fix the named file(s) or"
+    tell "                  escalate to Scuff (SQL)."
+  fi
+  if (( has_payload_failure == 1 )); then
+    # The first half is always safe: it names the payload problem and points at the path,
+    # which is true whether or not the run also carried SQL findings.
+    tell "the run asked for a --json evidence payload and the gate could not write it."
+    tell "                  Its own line above names the path; the directory has to exist" >&2
+    tell "                  and be writable by this user. Fix the path and re-run."
+    if (( has_finding == 0 )); then
+      # The closing disclaimer — "not a finding about your SQL, the SQL lane is not where
+      # it belongs" — is only honest when nothing on screen contradicts it. When a `!!`
+      # finding is also present the escalation above just sent the operator to Scuff (SQL);
+      # printing "the SQL lane is not where it belongs" two lines later is the PRO-370
+      # contradiction one level up, so this arm ends at `Fix the path and re-run.` instead
+      # (PRO-381 review NB).
+      tell "                  This is an evidence-write failure, not a finding about your"
+      tell "                  SQL, so the SQL lane is not where it belongs."
+    fi
+  fi
+  if (( has_operational_error == 1 )); then
+    tell "a 'preflight: operational error:' line is the gate failing to reach or set up"
+    tell "                  its environment — usually ac-database. Nothing was started,"
+    tell "                  and this is not a finding about your SQL."
+  fi
+  if (( has_policy_missing == 1 )); then
+    # Routed like the other environment arms and never to the SQL lane (PRO-381 review
+    # NB); the notice it matches lives with `gate_printed_a_policy_notice`.
+    tell "the gate could not find its policy file, so the checkout it was called from is"
+    tell "                  incomplete or mis-deployed. Nothing was started, and this is"
+    tell "                  not a finding about your SQL."
+  fi
+  if (( has_finding == 0 && has_payload_failure == 0 && has_operational_error == 0 \
+        && has_policy_missing == 0 && rc != 1 )); then
+    # Worded so it cannot misroute in either direction: the wrapper saw no finding line, but
+    # it also cannot prove there was one it failed to capture.
+    tell "ac-worldserver was not started, and the gate printed neither a finding line nor"
+    tell "                  one of its own failure notices, so the wrapper cannot say"
+    tell "                  whether this is about your SQL. A '!!' line in the output above"
+    tell "                  is a finding about your SQL; a line about the environment of"
+    tell "                  the gate itself is not."
+  fi
   tell "                  Do not bypass this gate."
   exit "$rc"
 fi
+
+# Reached only on a pass. Remove the capture now rather than at EXIT so a long boot's
+# scratch dir is not held for the life of the script, then stand the traps down so the
+# compose path runs with default signal behaviour (a `docker stop` after this point should
+# hit compose, not be swallowed here).
+if [[ -n "$GATE_DIR" ]]; then
+  rm -rf "$GATE_DIR"
+  trap - EXIT
+fi
+trap - INT TERM
 
 if [[ "${PREFLIGHT_CHECK_ONLY:-0}" == "1" ]]; then
   say "gate passed; PREFLIGHT_CHECK_ONLY=1 so the stack was not touched."
