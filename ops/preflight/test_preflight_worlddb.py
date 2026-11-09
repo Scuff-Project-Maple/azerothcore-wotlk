@@ -7977,6 +7977,16 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
         self.assertNotIn("Scuff (SQL)", proc.stderr)
         self.assertIn("Do not bypass this gate.", proc.stderr)
         self.assertIn("cannot say whether this is about your SQL", self._folded(proc.stderr))
+        # The other half of the unclassified arm: with no marker to route on, the only
+        # thing left to hand the operator is the rule for reading the capture themselves.
+        # Pinned as a sentence because PRO-382's seam proves the wrapper may not quote
+        # `'!!'` anywhere in the refusal block without the gate really emitting it, and
+        # this arm is the only place that quote lives — reword it into silence and the
+        # seam stays green while the operator loses the rule.
+        self.assertIn("A '!!' line in the output above is a finding about your SQL",
+                      self._folded(proc.stderr))
+        self.assertIn("a line about the environment of the gate itself is not",
+                      self._folded(proc.stderr))
 
     # -- the capture-block regressions PRO-390 caught -------------------------------- #
     #
