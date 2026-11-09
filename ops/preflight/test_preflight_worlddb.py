@@ -6061,11 +6061,25 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # `REFUSING BOOT` lines from the lease checks, and the guard below has to cover one
     # sentence, not a 300-line shell script (PRO-359 review B1).
     REFUSAL_BLOCK_ANCHOR = "REFUSING BOOT — pre-flight failed"
+    # The statement that opens the refusal block, in column 0. PRO-413 re-review B1: the
+    # guard locates the block by the anchor, so this is the one line the anchor-based
+    # search cannot see for itself, and it is the line the block's whole body sits inside.
+    REFUSAL_BLOCK_OPENER = "if (( rc != 0 )); then"
 
     # PRO-413 review B1: the safety net is this constant, not the rule that finds the
-    # block. The region below is lines 462-538 of `worldserver-up.sh` as merged — the
-    # anchor line through the `fi` that closes `if (( rc != 0 ))` — and the guard refuses
-    # any wrapper whose scanned region is not byte-identical to it.
+    # block. The region below is lines 461-538 of `worldserver-up.sh` as merged — the
+    # `if (( rc != 0 )); then` that opens the refusal block through the `fi` that closes
+    # it — and the guard refuses any wrapper whose scanned region is not byte-identical
+    # to it.
+    #
+    # PRO-413 re-review B1 is why the golden starts on the opener and not on the anchor.
+    # `_refusal_block_from_lines()` finds the block by its anchor, and the anchor is the
+    # block's *second* line: pinning from the anchor down leaves the one line between the
+    # opener and the anchor inside the block bash runs but outside the region compared to
+    # the golden, which is a gap a fourth single-quoted notice can be dropped into. The
+    # opener is therefore part of the golden, and `REFUSAL_BLOCK_OPENER` — asserted to be
+    # the line directly above the anchor before anything is scanned — is what makes that
+    # top edge a checked fact rather than an assumption.
     #
     # Bounding the region by a rule was the design PRO-407 found fail-open, and PRO-413's
     # nesting bound narrowed but did not close it: both bounds key on "a line whose
@@ -6081,7 +6095,8 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # really_emits` already requires of the wrapper's wording. The fragment equality below
     # stays, because the constant alone would also pass a wrapper that had stopped quoting
     # the gate's lines at all.
-    WRAPPER_REFUSAL_BLOCK_FROZEN = r"""  tell "REFUSING BOOT — pre-flight failed (exit $rc)."
+    WRAPPER_REFUSAL_BLOCK_FROZEN = r"""if (( rc != 0 )); then
+  tell "REFUSING BOOT — pre-flight failed (exit $rc)."
   has_finding=0
   has_payload_failure=0
   has_operational_error=0
@@ -6242,9 +6257,14 @@ fi
 
         The check that carries the property is the last one: the region has to be
         byte-identical to `WRAPPER_REFUSAL_BLOCK_FROZEN`, so it cannot be narrowed,
-        widened, re-indented or reworded without this suite saying so. The history is why
-        it is a frozen region and not a rule: PRO-407 found "the first `fi` in column 0"
-        fail-open, PRO-413 replaced that with a nesting balance plus the column-0 `fi` as a
+        widened, re-indented or reworded without this suite saying so. The region is the
+        whole executed block — the column-0 `if (( rc != 0 )); then` through the `fi` that
+        closes it — and the top edge is pinned too: `start` is found from the anchor, so the
+        line above the anchor is asserted to BE that opener before anything is scanned,
+        which is what stops the golden from describing a block that starts one line below
+        the one bash runs (PRO-413 re-review B1). The history is why it is a frozen region
+        and not a rule: PRO-407 found "the first `fi` in column 0" fail-open, PRO-413
+        replaced that with a nesting balance plus the column-0 `fi` as a
         cross-check, and review B1 produced two `bash -n`-clean wrappers that move BOTH
         bounds onto the same wrong line — a `fi` sitting in a heredoc body, and a
         `: ; if true; then` opener the line-local counter cannot see. A frozen region is
@@ -6269,6 +6289,20 @@ fi
                       "nothing and the three-fragment claim would cover part of what the "
                       "operator is actually told (PRO-413 review N3).")
         start = anchors[0]
+        # The top edge, checked before anything downstream of it. The anchor is how the
+        # block is *found*; it is not evidence that the block starts there. Without this,
+        # everything above the anchor is inside the block bash runs and outside the region
+        # compared to the golden, and PRO-413 re-review B1 is exactly that gap: a fourth
+        # single-quoted `tell` dropped between the opener and the anchor reaches the
+        # operator on every refused boot while the scan reads the frozen three.
+        if start == 0 or lines[start - 1] != self.REFUSAL_BLOCK_OPENER:
+            self.fail(
+                f"the refusal block in {name} is not the block this suite pins: the line "
+                f"above {self.REFUSAL_BLOCK_ANCHOR!r} is {None if start == 0 else lines[start - 1]!r}, "
+                f"not the column-0 opener {self.REFUSAL_BLOCK_OPENER!r}. The golden region "
+                "starts on that opener, so whatever sits between it and the anchor is part "
+                "of what the operator is handed on a refused boot and has to be reviewed "
+                "with the block (PRO-413 re-review B1).")
         anchor_opens, anchor_closes = self._shell_if_fi(lines[start])
         if anchor_opens or anchor_closes:
             self.fail(f"the {name} line holding {self.REFUSAL_BLOCK_ANCHOR!r} is itself a "
@@ -6298,17 +6332,18 @@ fi
                       "scanning a block that has already ended (PRO-413). Either re-indent "
                       "the arm that closes in column 0, or fix the nesting — do not relax "
                       "this check.")
-        # Pinned inclusive of the closing `fi`, so "the block ends here" is
-        # a frozen fact too and not something a rule has to keep finding correctly.
-        block = lines[start:end + 1]
+        # Pinned on BOTH edges: inclusive of the opener one line above the anchor and of the
+        # closing `fi`, so "the block starts here and ends here" is a frozen fact too and not
+        # something a rule — or the anchor search — has to keep finding correctly.
+        block = lines[start - 1:end + 1]
         if block != self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES:
             diff = "\n".join(difflib.unified_diff(
                 self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES, block,
                 fromfile="the pinned refusal block",
-                tofile=f"{name} lines {start + 1}-{end + 1}", lineterm="", n=1))
+                tofile=f"{name} lines {start}-{end + 1}", lineterm="", n=1))
             self.fail("the refusal block this suite scans is not the block it pins. The "
                       f"scan reads {len(block)} line(s) of {name} "
-                      f"({start + 1}-{end + 1}); the pinned block has "
+                      f"({start}-{end + 1}); the pinned block has "
                       f"{len(self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES)}:\n{diff}\n\n"
                       "The pinned region is what the claim that the refusal block quotes "
                       "exactly the two exempted gate lines plus the finding marker rests on "
@@ -6549,6 +6584,10 @@ fi
         This is deliberately a second, weaker implementation of the same scan. It exists so
         the negative control below can show its own teeth: if the old rule already caught a
         mutant, asserting the new rule fails on it would prove nothing.
+
+        The scan reads the raw lines where the live one comment-strips (PRO-413 review N2).
+        That asymmetry is the point — this has to reproduce the weaker behaviour the suite
+        actually shipped, not be "helpfully" unified with the current scan.
         """
         end = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
         return sorted(set(re.findall(
@@ -6765,24 +6804,157 @@ fi
                          self._quoted_fragments_from_region("\n".join(
                              self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES)))
 
+    def _refusal_region_as_pinned_before_PRO_413_rereview(self, lines: list) -> list:
+        """The golden as PRO-413 shipped it: anchored on the anchor, not on the opener.
+
+        A second, weaker copy of the pin on purpose (the same role
+        `_region_and_fragments_as_before_PRO_413()` plays for the bound). Re-review B1 was
+        possible because this region starts one line BELOW the block bash runs, so it cannot
+        see what sits between the opener and the anchor. It comment-strips like the live
+        scan does, so the comparison below is about the top edge and nothing else.
+        """
+        start = next(i for i, ln in enumerate(lines) if self.REFUSAL_BLOCK_ANCHOR in ln)
+        end = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
+        if end is None:
+            raise AssertionError("no column-0 `fi` closes the region, so the old pin had "
+                                 "nothing to compare either")
+        return lines[start:end + 1]
+
+    # PRO-413 re-review B1. The gap the anchor-down golden could not see is one line wide in
+    # the wrapper as merged, but it is a gap and not a constant, so these mutants fill it.
+    # The two-line shape is the one that matters, not the one-line shape: `gate_printed` is
+    # how the block already matches a gate line, so a fourth single-quoted fragment introduced
+    # that way — and echoed to the operator by the `tell` under it — keeps the scan's fragment
+    # SET exactly equal to the three the two seam tests compare. A count or set assertion is
+    # therefore blind to it; only a pin that covers the top of the block can see it.
+    WRAPPER_MUTANT_TOP_EDGE = (
+        "  gate_printed 'could not write the --json payload' \"$GATE_OUT\" \"$GATE_ERR\"",
+        "  tell \"a fourth notice: 'could not write the --json payload' reaches the "
+        "operator\"",
+    )
+
+    def test_a_quoted_notice_above_the_anchor_fails_the_frozen_block(self):
+        """PRO-413 re-review B1: the top of the pinned region has to be pinned too.
+
+        `_refusal_block_from_lines()` locates the block by its anchor, so before this commit
+        the golden covered anchor → closing `fi` while the executed block opened one line
+        higher. Re-review reproduced the hole exactly: a fourth single-quoted `tell` inserted
+        between `if (( rc != 0 )); then` and the anchor is valid bash, is printed on every
+        refused boot, and leaves the scanned region byte-identical to the golden — so the pin
+        PRO-413 added as the safety net never looks at it.
+
+        The assertions are in the order that makes the mutant mean something: `bash -n` is
+        happy, the notice is live code inside the executed block above the arms that print
+        the other notices, the fragment set an anchor-down scan reports is STILL exactly the
+        three the seam tests compare (which is why a count-based check was never going to
+        cover this edge), and the opener-down golden refuses it.
+        """
+        import subprocess
+
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        start = next((i for i, ln in enumerate(lines)
+                      if self.REFUSAL_BLOCK_ANCHOR in ln), None)
+        self.assertIsNotNone(start, "the mutants have nothing to mutate without the anchor")
+        # The head is what this commit asserts of every wrapper, so it is checked before
+        # anything is claimed about a mutant of it.
+        self.assertEqual(self.REFUSAL_BLOCK_OPENER, lines[start - 1])
+
+        top = self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES
+        self.assertEqual(self.REFUSAL_BLOCK_OPENER, top[0],
+                         "the golden no longer starts on the block's opener, which is the "
+                         "one property that closes the top edge PRO-413 re-review B1 found "
+                         "unguarded")
+        self.assertIn(self.REFUSAL_BLOCK_ANCHOR, top[1],
+                      "the golden no longer opens opener-then-anchor, so the guard's view "
+                      "of the block and the pinned region have drifted apart")
+
+        mutant = list(lines)
+        mutant[start:start] = list(self.WRAPPER_MUTANT_TOP_EDGE)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "mutant.sh"
+            path.write_text("\n".join(mutant) + "\n", encoding="utf-8")
+            res = subprocess.run(["bash", "-n", str(path)],
+                                 capture_output=True, text=True)
+            self.assertEqual(0, res.returncode,
+                             "the mutant is not valid bash, so this is a broken script and "
+                             f"not the fail-open under test. bash said: {res.stderr}")
+
+        # Live code, not a comment: the two lines sit between the opener and the anchor, so
+        # they run before any refusal arm and before `exit "$rc"`, and the notice is one of
+        # the block's own `tell` calls.
+        self.assertEqual(list(self.WRAPPER_MUTANT_TOP_EDGE), mutant[start:start + 2])
+        self.assertEqual(self.REFUSAL_BLOCK_OPENER, mutant[start - 1])
+        self.assertTrue(any("a fourth notice" in ln for ln in mutant
+                            if ln.strip().startswith("tell ")),
+                        "the fourth notice is no longer a `tell`, so the mutant would not be "
+                        "handing the operator a fragment at all")
+        notice_pos = next(i for i, ln in enumerate(mutant) if "a fourth notice" in ln)
+        bypass_pos = next(i for i, ln in enumerate(mutant) if "Do not bypass this gate." in ln)
+        self.assertLess(notice_pos, bypass_pos,
+                        "the fourth notice is no longer above the closing notices, so it is "
+                        "no longer something every refused boot prints")
+
+        # The negative control, and the load-bearing one: the golden as PRO-413 shipped it —
+        # anchored on the anchor — cannot see the inserted lines, and the fragments it does
+        # see are still EXACTLY the three the seam tests compare. So neither
+        # `test_the_wrapper_still_quotes_both_gate_lines_the_gate_emits`'s set equality nor
+        # `test_every_fragment_the_wrapper_quotes_is_a_line_the_gate_really_emits`'s would
+        # have said a word, while the operator was handed a fourth single-quoted notice.
+        blind = self._refusal_region_as_pinned_before_PRO_413_rereview(mutant)
+        for inserted in self.WRAPPER_MUTANT_TOP_EDGE:
+            self.assertNotIn(inserted, blind,
+                             "the region mutated is no longer above the anchor, so this "
+                             "mutant no longer exercises the top edge")
+        self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS),
+                         self._quoted_fragments_from_region("\n".join(blind)),
+                         "the anchor-down region no longer reports exactly the three frozen "
+                         "fragments for a mutant that hands the operator a fourth notice; the "
+                         "seam tests would catch this mutant on their own and it stops "
+                         "showing that the pin's top edge is the net")
+
+        # The pin, now that the top edge is part of it. The failure has to come from the
+        # top-edge check and name the line that moved, not from a downstream bound.
+        with self.assertRaises(AssertionError) as cm:
+            self._refusal_block_from_lines(
+                mutant, name=f"{self.WRAPPER.name} (fourth notice above the anchor)")
+        msg = str(cm.exception)
+        self.assertIn(self.REFUSAL_BLOCK_OPENER, msg,
+                      "the guard did not refuse the wrapper on its top edge: " + msg)
+        self.assertIn("the line above", msg,
+                      "the refusal did not come from the opener check, so it is not the "
+                      "check that closes re-review B1: " + msg)
+        self.assertIn("a fourth notice", msg,
+                      "the failure does not name the notice the operator is handed above "
+                      "the anchor: " + msg)
+
     def test_the_frozen_refusal_block_is_a_balanced_block_and_not_a_hollow_copy(self):
         """A golden can be quietly gutted, so the golden is checked against itself.
 
         The pinned region is now the safety net for the three-fragment claim, which makes
         the constant itself an attack surface: an emptied or truncated copy would keep
         every other test green while guarding nothing. These are the properties that make
-        it the block and not a placeholder — it opens on the anchor, it is exactly one
-        balanced `if` body closed by the `fi` that is not part of it, and it still quotes
-        the three gate lines.
+        it the block and not a placeholder — it opens on the block's own column-0 `if` with
+        the anchor directly below it, it is exactly one balanced `if` body closed by the
+        `fi` that is part of it, and it still quotes the three gate lines. The first two
+        are the top edge PRO-413 re-review B1 found unpinned; a golden that opened on the
+        anchor would keep every assertion below passing while leaving the line above the
+        anchor free.
         """
         frozen = self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES
         self.assertTrue(frozen, "the pinned refusal block is empty")
-        self.assertIn(self.REFUSAL_BLOCK_ANCHOR, frozen[0],
-                      "the pinned region no longer starts on the anchor line, so the scan "
-                      "and the pin would be describing different blocks")
+        self.assertEqual(self.REFUSAL_BLOCK_OPENER, frozen[0],
+                         "the pinned region no longer starts on the statement that opens "
+                         "the refusal block, so the line above the anchor is outside the "
+                         "pin again")
+        self.assertEqual((1, 0), self._shell_if_fi(frozen[0]),
+                         "the pinned region does not open on a structural `if`")
+        self.assertIn(self.REFUSAL_BLOCK_ANCHOR, frozen[1],
+                      "the pinned region no longer has the anchor directly under its "
+                      "opener, so the scan and the pin would be describing different blocks")
         self.assertEqual((0, 1), self._shell_if_fi(frozen[-1]),
-                         "the pinned region does not end just before a structural `fi`")
-        depth = 1
+                         "the pinned region does not end on its closing `fi`")
+        depth = 0
         for ln in frozen[:-1]:
             opens, closes = self._shell_if_fi(ln)
             depth += opens - closes
