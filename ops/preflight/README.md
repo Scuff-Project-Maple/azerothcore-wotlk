@@ -132,7 +132,7 @@ degrades to listing the findings if `render()` itself blows up, and that degrade
 itself a guard, so it is held to the rule it exists to enforce: no line of it may raise back into
 `main()`. A report that raises while it is being read still prints the two-line
 `PRO-179 … / RESULT: …` header instead of losing the verdict (PRO-324 NB1). The same line names the
-payload's actual outcome — on disk, not requested, or not written — because `main()` hands the
+payload's actual outcome — on disk, not requested, blank, or not written — because `main()` hands the
 renderer the claim it actually proved, as the required keyword-only `payload_note`; the renderer
 derives nothing about the payload it did not write (PRO-324 NB2, closed on the integration line by
 PRO-335 §2 and PRO-341 review N1). The dictionary behind that payload is built *inside* the same
@@ -165,13 +165,24 @@ interpreter teardown is not observable from inside a fixture. The same class pin
 observation: with fd 1 closed, `sys.stdout` is `None` and the old label printed the word `None` where
 a destination belongs; an absent thing is now named as absent, including on the degraded render line,
 which says "no --json payload requested" rather than claiming a payload nobody asked for.
-That degraded line draws from **three** wordings, and all three are decided by one predicate in
-`main()` (PRO-352, Core's PRO-355 contract A): never requested → `NO_JSON_PAYLOAD_NOTE`;
-requested but blank → `BLANK_JSON_TARGET_NOTE`; requested but unwritable → "the --json payload at
-X was NOT written". The write attempt and the evidence-missing refusal read the same
-`payload_requested = args.json_out is not None`, so they cannot disagree about whether evidence was
-asked for. Blankness is `args.json_out.strip()` — not truthiness, and not `== ""` — so `--json ""`
-and `--json "   "`, what an operator's `--json "$TARGET"` becomes when `$TARGET` is blank because
+That degraded line draws from **four** wordings, three of which say the evidence is not there.
+They are chosen by three names in `main()`, not one: `payload_requested` splits never-requested
+from asked-for, `blank_json_target` splits the blank family out of that, and `payload_error` —
+which only the payload block in `main()` can set — splits NOT-written from on-disk (PRO-352,
+Core's PRO-355 contract A): never requested → `NO_JSON_PAYLOAD_NOTE`; requested but blank →
+`BLANK_JSON_TARGET_NOTE`; requested but unwritable → "the --json payload at X was NOT written";
+written → "the --json payload at X is on disk". The fourth is not hypothetical — it is what that
+line says when `render()` raises *after* the payload landed, which is the shape
+`test_the_degraded_verdict_still_points_at_the_payload_it_wrote` holds. The write attempt is
+gated on `payload_requested = args.json_out is not None`; the evidence-missing refusal at the
+bottom of `main()` is gated on `payload_error`, which is set in exactly two places, both inside
+that same block and both on branches that already required `payload_requested` — the failed
+write, and the blank-target arm beside it. They still cannot disagree about whether evidence was
+asked for — no path reaches a non-`None` `payload_error` with `payload_requested` false — but
+they are not the same test, and the NOT-written / on-disk half of the note follows what the
+write did, not the flag. Blankness is
+`args.json_out.strip()` — not truthiness, and not `== ""` — so `--json ""` and `--json "   "`,
+what an operator's `--json "$TARGET"` becomes when `$TARGET` is blank because
 the wrapper forwards unrecognised arguments verbatim, are *requested* payloads that touch no
 filesystem at all and take the evidence-missing refusal at `EXIT_ERROR`. A gate that tested the flag
 for truth instead would accept the whitespace target, since `Path("   ").write_text` succeeds, and
@@ -188,8 +199,11 @@ and the device name never appeared. `_stream_destination()` therefore falls back
 `os.readlink("/proc/self/fd/N")` when the object's answer is one of the interpreter's own channel
 names. An anonymous descriptor (`pipe:[…]`, `socket:[…]`) is not a place anyone can go and fix, so it
 stays unnamed and an early-closed pipe still reads plain `<stdout>`; a host without `/proc` gets the
-old wording rather than a guess. Both destination shapes are pinned through a real shell redirect, not
-an `open()` stand-in, so the two paths cannot drift apart again.
+old wording rather than a guess. Three destination shapes are pinned from outside the child: a shell
+`1>&-`, a shell `> /dev/full`, and an early-closed pipe the parent hands over with `Popen(stdout=…)`.
+Each pins the same property — fd 1 is set before the interpreter is built, never by an `open()`
+rebinding inside it — and only the two shell shapes go through the one helper, because no shell
+redirect can hand a child a descriptor whose reader is already gone.
 
 ### The third tag: the tracked upstream ref (PRO-248)
 

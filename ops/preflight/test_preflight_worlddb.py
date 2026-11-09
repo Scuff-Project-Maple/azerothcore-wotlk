@@ -691,8 +691,10 @@ class TestDirtyWorktree(unittest.TestCase):
 
     def _file(self, pf, sql):
         # git_root is the temp dir so is_dirty() sees a real repo-relative path
+        import shutil
         import tempfile
         d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         p = d / "upstream.sql"
         p.write_text(sql, encoding="utf-8")
         pf.git_root = d
@@ -5865,6 +5867,16 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                     # fixed by construction.
                     out_path = None
                     json_arg = "   "
+                elif json_target == "relative":
+                    # A *legitimately* relative `--json` target. The drive chdirs into the
+                    # empty scratch cwd below, so `verdict.json` names a file inside it and
+                    # the payload really is written there. That makes this the one case whose
+                    # `leftovers` listing is supposed to come back non-empty — the positive
+                    # control for the witness every other pin uses only to assert emptiness
+                    # (PRO-378 NB-C). A `leftovers` that had quietly degraded to always
+                    # returning `[]` would pass all of those and fail here.
+                    out_path = Path(td) / "cwd" / "verdict.json"
+                    json_arg = "verdict.json"
                 else:
                     out_path = None
                     json_arg = None
@@ -6065,6 +6077,15 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         wrapper-read test both need exactly that scope. Scanning the whole file is what
         let PRO-359's guard miss a fragment for reasons unrelated to the exemption
         (PRO-359 review B1).
+
+        The bound is a `fi` in COLUMN 0, not any line that strips to `fi`. PRO-381 gave
+        the refusal arms a capture-reading block of nested `if`s, and an
+        indentation-blind bound cut the region at the first arm — which hid every quote
+        below it from the guard and made the two-sided seam fire on a block that had
+        already ended. That is the PRO-359 review B1 failure mode arriving from the other
+        direction: a guard that cannot see the sentence it protects. The frozen wording
+        this guard was written against closes in column 0 too, so the stricter bound
+        costs nothing it used to cover.
         """
         lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
         anchor = next((i for i, ln in enumerate(lines)
@@ -6097,7 +6118,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
                       "helper structurally — do not let the scan shrink (PRO-403 P11).")
         start = anchor - 1
         end = next((i for i in range(start, len(lines))
-                    if lines[i].strip() == "fi"), None)
+                    if lines[i] == "fi"), None)
         if end is None:
             self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
                       f"in {self.WRAPPER.name}; the block cannot be bounded, so neither can "
@@ -6760,9 +6781,19 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         path, including the one where nobody asked for a payload — a claim about a file
         that does not exist and was never requested. The operator reading a failed boot
         is the audience; `NO_JSON_PAYLOAD_NOTE` is the gate's single wording for the
-        absent case, and the assertion below quotes what that wording says rather than
-        the constant, because an assertion written against the same constant the emitter
-        reads is self-consistent under a reword (PRO-369 review N1).
+        never-requested case — "absent" is only the umbrella, and *not written* and
+        *blank* are the other two arms with their own wordings — and the assertion below
+        quotes what that wording says rather than the constant, because an assertion
+        written against the same constant the emitter reads is self-consistent under a
+        reword (PRO-369 review N1; the enumeration is the one the README carries after
+        PRO-392 NB-A).
+
+        The `leftovers` assertion is the same claim measured off the filesystem instead of
+        off the string. `res.payload` is `None` by construction here — there is no path
+        handed to the drive to look at — so on its own this pin would not notice a
+        regression that wrote a payload with no `--json` flag at all. The drive runs in an
+        empty scratch cwd, so the listing is what actually witnesses "no file, wherever it
+        would land" (PRO-378 NB-B).
         """
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                render_raises=True, json_target="none")
@@ -6772,6 +6803,7 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertNotIn("unaffected", text,
                          "the degraded line still promises a payload nobody asked for")
         self.assertNotIn("None", text, "the absent payload is rendered as a word, not None")
+        self.assertEqual([], res.leftovers, "no --json means no file, wherever it would land")
 
     def test_the_degraded_verdict_does_not_call_an_unwritten_payload_unaffected(self):
         """The same sentence on the path that asked for a payload and did not get one."""
@@ -6802,12 +6834,13 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         PRO-325 NB2's shape (an absent thing asserted as present) on the line an operator
         reads while the boot is being refused.
 
-        PRO-352 (Core's PRO-355 contract A) closes the other half: the write gate and the
-        evidence-missing refusal now read one predicate, so a blank target counts as
-        requested, the refusal fires, and the rc is `EXIT_ERROR` — no longer a value this
-        pin declines to name. Blank is *not* "not requested", so the degraded line must say
-        the target is blank, never borrow `NO_JSON_PAYLOAD_NOTE`, and never claim the
-        payload is on disk.
+        PRO-352 (Core's PRO-355 contract A) closes the other half: the refusal is chained
+        behind the write gate rather than sharing its read — it tests `payload_error`, which
+        the blank-target arm sets without any write being attempted — so a blank target
+        counts as requested, the refusal fires, and the rc is `EXIT_ERROR` — no longer a
+        value this pin declines to name. Blank is *not* "not requested", so the degraded
+        line must say the target is blank, never borrow `NO_JSON_PAYLOAD_NOTE`, and never
+        claim the payload is on disk.
         """
         import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
@@ -6839,11 +6872,12 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     def test_a_blank_json_target_refuses_the_boot(self):
         """PRO-352: `--json ""` is "evidence asked for, none produced" — refuse at EXIT_ERROR.
 
-        This is the half the PRO-335 pin above deliberately left unpinned. The single
-        predicate in `main()` makes a blank target reach the same evidence-missing refusal
-        an unwritable path already took, so the boot cannot slip out on the checks' rc. The
-        operator's stderr names `--json` rather than an empty path or the cwd (`.`), and no
-        filesystem write is attempted for the blank family.
+        This is the half the PRO-335 pin above deliberately left unpinned. The blank-target
+        arm of the payload block sets `payload_error` without touching the filesystem, so a
+        blank target reaches the same evidence-missing refusal an unwritable path already
+        took and the boot cannot slip out on the checks' rc. The operator's stderr names
+        `--json` rather than an empty path or the cwd (`.`), and no filesystem write is
+        attempted for the blank family.
         """
         import preflight_worlddb as P
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
@@ -6882,6 +6916,48 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         self.assertIn("boot is refused", err)
         self.assertNotIn("could not write the --json payload to", err)
         self.assertEqual(P.EXIT_ERROR, res.rc)
+
+    def test_the_scratch_cwd_witness_can_report_a_file_it_found(self):
+        """PRO-378 NB-C: the `leftovers` witness needs a positive control.
+
+        Every other pin on `leftovers` asserts `[]`, including the two that hold the
+        "a blank/whitespace `--json` must touch no filesystem" claims and the one that holds
+        "no `--json`, no file". A witness that had silently degraded to always returning
+        `[]` — a listing pointed at the wrong directory, an early `break`, a refactor of the
+        scratch cwd the drive chdirs into — keeps every one of them green, and with them the
+        PRO-361 NB1 "no junk file" claim it exists to hold. That is the same
+        witness-that-cannot-fail shape as PRO-378 NB1, one layer down.
+
+        So drive the one run that legitimately writes *into* the scratch cwd: `--json
+        verdict.json` while chdir-ed into it. The payload must land there, the listing must
+        name it, and the bytes the listing names must be the evidence — otherwise the
+        positive control would pass on an unrelated file.
+
+        The `rc` pin (PRO-404 N3) closes the other way this control can go soft: it holds
+        that the very run which produced its own evidence still refused the boot. A drive
+        that drifted to a passing rc while the payload kept landing would leave every
+        listing/bytes assertion above green while the thing under test stopped being a
+        refusal, which is the whole job of the gate.
+        """
+        import preflight_worlddb as P
+        res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
+                               json_target="relative")
+        self.assertEqual(
+            ["verdict.json"], res.leftovers,
+            "a relative --json target wrote into the scratch cwd and the witness did not "
+            "see it; a bare [] here means every emptiness pin in this class has stopped "
+            "witnessing anything")
+        self.assertIsNotNone(res.payload,
+                             "the listing named a file the drive could not read back")
+        back = json.loads(res.payload.decode("ascii"))
+        self.assertEqual("fail", back["result"],
+                         "the positive control must point at the run's own evidence")
+        self.assertEqual(self.RAW, back["findings"][0]["file"])
+        self.assertEqual(
+            P.EXIT_FAIL, res.rc,
+            "the positive-control run wrote its own evidence and still refused the boot; an "
+            "rc of 0 here means the witness is pointing at a run that booted, and a gate "
+            "that boots is not the gate this class pins")
 
 
 class TestTheGateHoldsItsOwnRc(unittest.TestCase):
@@ -6931,8 +7007,9 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         return subprocess.run([sys.executable, "-c", code, str(HERE)], env=self._env(),
                               capture_output=True, text=True, **kwargs)
 
-    # The real `main()` under a terminal that will not have it. `{stdout_setup}` is the
-    # one thing the two end-to-end pins differ on, so the stub exists once.
+    # The real `main()` under a terminal that will not have it. `{stdout_setup}` and
+    # `{argv}` are the only two things the end-to-end pins differ on, so the stub exists
+    # once and the shapes cannot drift apart the way PRO-354's two fixtures did.
     _MAIN_DRIVER = '''
         import pathlib
         import sys
@@ -6957,9 +7034,38 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         (td / "tree" / "data" / "sql").mkdir(parents=True)
         (td / "policy.json").write_text("{{}}")
         {stdout_setup}
-        sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
-                         str(td / "policy.json"), "--json", str(td / "verdict.json")]))
+        sys.exit(P.main({argv}))
     '''
+
+    # `--policy` defaults to the file that ships next to the gate, so the `EXIT_ERROR`
+    # route is reached by naming a path that is not there — the operator's typo, which is
+    # how it happens in the field. The driver still builds `policy.json` and the tree;
+    # `main()` returns before either is reached, which is the point: the shape under test
+    # is the earliest `_emit`-backed exit `main()` has, and the one whose report goes to
+    # `sys.stderr`. `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4691` is
+    # earlier still and writes its usage error to `sys.stderr` directly — never through
+    # `_emit`, so nothing retires it — which is a separate gap (PRO-389 review N-a) and not
+    # what these pins drive.
+    _MAIN_ARGV = ('["--compose-root", str(td / "tree"), "--policy", str(td / "policy.json"), '
+                  '"--json", str(td / "verdict.json")]')
+    _MAIN_ARGV_MISSING_POLICY = ('["--compose-root", str(td / "tree"), "--policy", '
+                                 'str(td / "absent.json"), "--json", str(td / "verdict.json")]')
+    # The third route, for the `EXIT_ERROR` return whose report does *not* go to
+    # `sys.stderr`: `--json ""` is "evidence asked for, produced none" (PRO-352), so the
+    # report is emitted on `sys.stdout` (`preflight_worlddb.py:4789`) and the two notice
+    # lines on `sys.stderr` (`:4799-4800`). There primary and fallback are two objects,
+    # which is the pairing the missing-policy return cannot show.
+    _MAIN_ARGV_BLANK_JSON = ('["--compose-root", str(td / "tree"), "--policy", '
+                             'str(td / "policy.json"), "--json", ""]')
+
+    def _driver(self, stdout_setup, *, argv=None):
+        """One driver template, the argv shapes `main()` can be driven through.
+
+        Everything the pins share lives in `_MAIN_DRIVER`; a pin that needed its own copy
+        of the stub would be a second fixture to keep honest, which is the PRO-354 bug.
+        """
+        return self._MAIN_DRIVER.format(
+            stdout_setup=stdout_setup, argv=self._MAIN_ARGV if argv is None else argv)
 
     def _drive_real_main(self, driver, td):
         import subprocess
@@ -6971,15 +7077,25 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                               env=self._env(), capture_output=True, text=True)
 
     def _drive_real_main_through_shell(self, driver, td, redirect):
-        """Run the real `main()` with fd 1 set up by the shell, not by the child.
+        """Run the real `main()` with fd 1 set up outside the child, not by the child.
 
         PRO-354 is the reason this exists rather than another `sys.stdout = open(...)`
         fixture. Rebinding inside the child hands `main()` an object whose `name` really is
         `/dev/full`, so it exercises the object-naming half of `_emit` and nothing else; an
         operator reaches the state by redirecting descriptor 1 before the interpreter is
         built, which leaves `sys.stdout.name` as the literal `<stdout>`. Two fixtures, two
-        code paths, and only the one that never happens in the field was ever pinned. Both
-        destination shapes pinned below go through here so they cannot drift apart again.
+        code paths, and only the one that never happens in the field was ever pinned.
+
+        Three destination shapes are pinned that way (PRO-373 F2, naming them rather than
+        saying "both"): a shell `1>&-` in
+        `test_the_real_main_names_the_closed_fd_1_it_has_to_report_through`, a shell
+        `> /dev/full` in `test_a_shell_redirected_full_device_is_named_from_the_descriptor`,
+        and an early-closed pipe in `test_a_shell_redirected_broken_pipe_stays_unnamed`. Only
+        the two shell shapes come through here. The pipe cannot, because there is no shell
+        redirect that hands a child a descriptor whose reader is already gone; that test sets
+        fd 1 from the parent with `Popen(stdout=write_end)` instead. What all three pin is the
+        substantive half the shell was only ever a means to: the descriptor is set outside the
+        child, never by an `open()` rebinding in it.
         """
         import shlex
         import subprocess
@@ -7071,8 +7187,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         The notice has to name the device that refused, which is `/dev/full` here.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup='sys.stdout = open("/dev/full", "w")   # terminal refuses us')
+        driver = self._driver('sys.stdout = open("/dev/full", "w")   # terminal refuses us')
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main(driver, td)
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
@@ -7096,8 +7211,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         sentence has to carry both: what was aimed at, and that nothing is attached.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # fd 1 was closed by the shell before the interpreter ran")
+        driver = self._driver(
+            "pass   # fd 1 was closed by the shell before the interpreter ran")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "1>&-")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
@@ -7130,9 +7245,9 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         the full device. Ask the descriptor when the object cannot help.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # fd 1 was redirected by the shell, so the object cannot "
-                         "help and the descriptor has to answer")
+        driver = self._driver(
+            "pass   # fd 1 was redirected by the shell, so the object cannot "
+            "help and the descriptor has to answer")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
@@ -7164,17 +7279,28 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         symptom from the operator's most natural redirect, and no pin had ever put fd 2 on
         the refusing descriptor. The refusing device keeps the notice in this shape; rc is
         the one number that still reaches the operator, and the payload is the evidence.
+
+        There is deliberately no stderr assertion here (PRO-389 N1). Under `2>&1` fd 2 is a
+        dup of the same full file description as fd 1, so nothing the interpreter writes to
+        fd 2 can reach the parent: an `assertNotIn("Exception ignored", proc.stderr)` on this
+        shape was unsatisfiable by construction, passed whether or not the regression it
+        appeared to guard against had come back, and read like coverage while pinning
+        nothing. The load-bearing claims are the rc and the on-disk payload below. The
+        sibling pins that *do* assert on stderr all leave fd 2 live (`> /dev/full`, `1>&-`,
+        the early-closed pipe) — that is the precondition that makes those able to fail, and
+        it does not hold here. What shows the two claims that remain can still move is
+        `test_the_devfull_pair_costs_120_without_the_fallback_retirement`, and the same
+        argument for the error route is
+        `test_the_error_route_costs_120_when_nothing_is_retired`.
         """
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # the shell put fd 2 on the same full description as fd 1")
+        driver = self._driver(
+            "pass   # the shell put fd 2 on the same full description as fd 1")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` still costs the gate its rc: "
                              f"rc={proc.returncode} stderr={proc.stderr}")
-            self.assertNotIn("Exception ignored", proc.stderr,
-                             "the interpreter is still holding bytes for a device that refused them")
             payload = Path(td) / "verdict.json"
             self.assertTrue(payload.is_file(),
                             "the evidence has to survive both descriptors being full")
@@ -7185,14 +7311,18 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
 
         `_retire_broken_stream` is patched back to retiring only the refusing stream,
         which is precisely what `_emit` did before PRO-372: the notice line to
-        `sys.__stderr__` strands its bytes for the shutdown flush and 120 is back. If this
+        `sys.__stderr__` strands its bytes for the shutdown flush and 120 is back. That
+        equation holds here because this route presents once — one `_emit`, so one pair of
+        retirement calls and no later call that could retire the fallback by itself. On the
+        two-`_emit` payload-error route further down the same predicate is *not* the pre-372
+        build, and its control says so; do not copy this sentence across. If this
         pin ever exits 1, the fixture has stopped reaching the interpreter's final flush
         and the rc assertion above proves nothing.
         """
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="_orig = P._retire_broken_stream; "
-                         "P._retire_broken_stream = "
-                         "(lambda s, l: _orig(s, l) if s is sys.stdout else None)")
+        driver = self._driver(
+            "_orig = P._retire_broken_stream; "
+            "P._retire_broken_stream = "
+            "(lambda s, l: _orig(s, l) if s is sys.stdout else None)")
         with tempfile.TemporaryDirectory() as td:
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
@@ -7200,6 +7330,199 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                              f"the rc=120 story in the pair test proves nothing ({proc.stderr})")
             self.assertTrue((Path(td) / "verdict.json").is_file(),
                             "even the pre-fix build wrote the payload before presenting")
+
+    def test_the_real_main_holds_its_rc_on_the_error_route_when_fd_2_is_the_refusing_device(
+            self):
+        """PRO-389 N2: the `EXIT_ERROR` route under `> /dev/full 2>&1` — the unpinned half.
+
+        `_emit` has a second primary. `main()` returns `EXIT_ERROR` from three places, and
+        the one this pin drives — the missing `--policy` at `preflight_worlddb.py:4696-4697`
+        — aims the report at `sys.stderr`; at startup `sys.stderr is sys.__stderr__`, so
+        inside `_emit` the primary and the fallback are the *same object*. The report line
+        and the notice line land in one buffer on one refusing descriptor, and there is no
+        second stream to retire. Every end-to-end subprocess rc pin above drives the
+        `EXIT_FAIL` route, where the primary is `sys.stdout` and the fallback is a
+        different stream, so none of them reaches that identity — which is why this route
+        could sit unpinned while looking covered. (The three in-process `EXIT_ERROR` rc
+        pins in the blank/whitespace `--json` family — `test_a_blank_json_target_refuses_the_boot`
+        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 360
+        lines and a class boundary above this one — are not end-to-end: they run `main()`
+        under `_drive_main`, which swaps the streams inside the child and so cannot see the
+        interpreter's teardown flush that costs 120.)
+
+        Measured on 3.12.3 at `d97932345` this exits **2**, not 120. On this return the two
+        `_retire_broken_stream` calls in `_emit` act on one object, so either one alone
+        suffices and only removing both costs 120 — a block-the-second-call measurement does
+        not by itself show which half of the fix saves the route, and this pin credits
+        neither. The controls carry the asymmetry instead: on the `EXIT_FAIL` route either
+        call removed on its own costs 120, while on the other `EXIT_ERROR` return — the
+        payload write failure / blank `--json` at `preflight_worlddb.py:4791-4803`, whose
+        report goes to `sys.stdout` — leaving only the `sys.stdout` retirement is no longer
+        enough, which is what that route's own control below pins. "Passes today" is not a pin
+        either way, and the failure class is the one `flush_std_files()` owns: bytes a device
+        already refused, retried at teardown, and answered by `Py_Exit()` with 120. The
+        companion below removes both retirements and lands on 120, so the assertion here is
+        able to fail.
+
+        No stderr assertion, for the PRO-389 N1 reason stated on the `EXIT_FAIL` pin above:
+        under `2>&1` fd 2 cannot deliver anything to the parent. This route also returns
+        before the payload write, so the assertion below says so rather than leaving it
+        implied — on this shape the rc is the whole claim the gate gets to make.
+        """
+        import preflight_worlddb as P
+        driver = self._driver(
+            "pass   # the shell put fd 2 on the same full description as fd 1",
+            argv=self._MAIN_ARGV_MISSING_POLICY)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                             f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
+                             f"the error route too: rc={proc.returncode} stderr={proc.stderr}")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "the missing-policy return happens before the evidence write, so "
+                             "the rc is the only thing this route can report")
+
+    def test_the_error_route_costs_120_when_nothing_is_retired(self):
+        """Negative control for the `EXIT_ERROR` pin — proof it is not another vacuous pass.
+
+        `_retire_broken_stream` is patched out entirely, which is the pre-PRO-325 build: the
+        report line and the notice line both strand their bytes in the one wrapper CPython
+        built on the full descriptor, `flush_std_files()` retries them at teardown and
+        `Py_Exit()` returns 120. PRO-389 N1 is about pins that cannot fail; this is the
+        version of the error-route pin that can. If it ever exits 2, the fixture has stopped
+        reaching the interpreter's final flush and the rc=2 above proves nothing.
+        """
+        driver = self._driver(
+            "P._retire_broken_stream = lambda stream, label: None   # pre-PRO-325 build",
+            argv=self._MAIN_ARGV_MISSING_POLICY)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(120, proc.returncode,
+                             f"the fixture no longer reaches the interpreter's final flush, so "
+                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "the pre-fix build returned before the payload too; if this flips "
+                             "the two tests are no longer driving the same route")
+
+    def test_the_real_main_holds_its_rc_on_the_payload_error_route_when_fd_2_is_refused(
+            self):
+        """PRO-389 review B1/N-b: the `EXIT_ERROR` return whose primary is *not* `sys.stderr`.
+
+        `main()`'s third `EXIT_ERROR` return (`preflight_worlddb.py:4791-4803`) is reached
+        with `--json ""` — evidence asked for and none produced (PRO-352) — and it presents
+        the other way round: the report goes to `sys.stdout` (`:4789`) and the two notice
+        lines to `sys.stderr` (`:4799-4800`). Primary and fallback are two different
+        objects there, so the one-object identity that lets the missing-policy return above
+        survive either retirement call alone does not exist. Measured on 3.12.3 under
+        `> /dev/full 2>&1`: unpatched it exits **2**. The control below patches
+        `_retire_broken_stream` to suppress every retirement except the one on the refusing
+        `sys.stdout`, and that exits **120** — and so does removing every retirement, so on
+        this route those two patches are indistinguishable (both measured, 3.12.3). What
+        does *not* cost it 120 is blocking only the second call, nor the genuine pre-PRO-372
+        `_emit` with nothing but the `if fallback_refused:` retirement deleted: both exit
+        **2**, because this route runs more than one `_emit` and the pair at
+        `preflight_worlddb.py:4799-4800` carries its own *primary* retirement, which in the
+        pre-372 build lands on the same `sys.__stderr__` the skipped fallback call would have
+        covered. That is also why the control's predicate is strictly stronger than pre-372
+        rather than equal to it — it drops that second primary call too.
+
+        So the claim this shape earns is narrow: an `EXIT_ERROR` route whose report goes to
+        `sys.stdout` needs the refused `sys.__stderr__` retired by *something* before
+        teardown, and if the only surviving retirement is the stdout one, `Py_Exit()` answers
+        120. It says nothing about which half of the fix owns the route, and it is not the
+        "either call alone suffices" reading the missing-policy return above would suggest —
+        blocking the first call here costs 120, where the same patch there leaves 2. Where
+        the PRO-372 fallback call is genuinely load-bearing is the single-`_emit` report
+        route, and `test_the_devfull_pair_costs_120_without_the_fallback_retirement` is the
+        pin that says so.
+
+        No stderr assertion, for the PRO-389 N1 reason stated on the `EXIT_FAIL` pin: under
+        `2>&1` fd 2 cannot deliver anything to the parent. This route never writes the
+        payload either, so the rc is the whole claim the gate gets to make here.
+        """
+        import preflight_worlddb as P
+        driver = self._driver(
+            "pass   # the shell put fd 2 on the same full description as fd 1",
+            argv=self._MAIN_ARGV_BLANK_JSON)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                             f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
+                             f"the evidence-write route too: rc={proc.returncode} "
+                             f"stderr={proc.stderr}")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "a blank `--json` target must never touch the filesystem, so the "
+                             "rc is the only thing this route can report")
+
+    def test_the_payload_error_route_costs_120_when_the_refused_stderr_is_never_retired(self):
+        """Negative control for the pin above — proof its rc=2 is able to fail.
+
+        `_retire_broken_stream` is patched to suppress every retirement except the one on
+        the refusing `sys.stdout`. The refused fallback — `sys.__stderr__`, still holding
+        the notice line and the two payload-error lines — is therefore never retired, stays
+        buffered for `flush_std_files()`, and `Py_Exit()` answers 120 on a route that should
+        exit 2.
+
+        Do not read this patch as the pre-PRO-372 build. Measured on 3.12.3, deleting only
+        the `if fallback_refused:` retirement from `_emit` — what `_emit` really looked like
+        before PRO-372 — leaves this route at **2**, because this route runs two `_emit`s and
+        the second one retires `sys.stderr` as its own *primary*, which is the object holding
+        the stranded bytes. The predicate here additionally drops that call, so it is
+        strictly stronger than pre-372; and the full removal measures 120 here as well, so
+        the two are indistinguishable. What this control can carry is "the refused
+        `sys.__stderr__` has to be retired by something before teardown", and nothing about
+        which half of the fix owns the route — which is why the pin above does not say. If
+        this ever exits 2, the fixture has stopped reaching the interpreter's final flush and
+        the rc=2 above proves nothing.
+        """
+        driver = self._driver(
+            "_orig = P._retire_broken_stream; "
+            "P._retire_broken_stream = "
+            "(lambda s, l: _orig(s, l) if s is sys.stdout else None)",
+            argv=self._MAIN_ARGV_BLANK_JSON)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
+            self.assertEqual(120, proc.returncode,
+                             f"the fixture no longer reaches the interpreter's final flush, so "
+                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "the suppressed-retirement build never wrote the payload either; "
+                             "if this flips the two tests are no longer driving the same route")
+
+    def test_the_payload_error_route_names_its_notices_when_only_stdout_is_full(self):
+        """PRO-389 review NB-2: the same route with fd 2 live, so the notices are the proof.
+
+        The two pins above can only claim their rc — under `2>&1` fd 2 delivers nothing to
+        the parent, and an `argparse` usage error exits 2 as well
+        (`preflight_worlddb.py:4691`, the gap PRO-389 review N-a routed to PRO-406), so rc
+        alone does not say which `EXIT_ERROR` return ran. Here only fd 1 sits on the refusing
+        device, so fd 2 is live and the route can name itself: the `_emit` notice about the
+        report, the PRO-352 blank-target line and the evidence-write refusal all have to
+        arrive verbatim. That is the stderr coverage the `EXIT_FAIL` side of this family has
+        had since PRO-341 and this route has never had.
+        """
+        import preflight_worlddb as P
+        driver = self._driver(
+            "pass   # fd 1 is on the full device; fd 2 is still the operator's terminal",
+            argv=self._MAIN_ARGV_BLANK_JSON)
+        with tempfile.TemporaryDirectory() as td:
+            proc = self._drive_real_main_through_shell(driver, td, "> /dev/full")
+            self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                             f"the evidence-write refusal changed code the moment fd 2 stayed "
+                             f"live: rc={proc.returncode} stderr={proc.stderr}")
+            self.assertIn("preflight: the --json target is blank; pass a path or omit the flag",
+                          proc.stderr,
+                          "without the blank-target line a 2 is not distinguishable from an "
+                          "argparse usage error, which is the ambiguity this pin exists to kill")
+            self.assertIn("preflight: the requested evidence payload is missing, so the boot is "
+                          "refused", proc.stderr,
+                          "the sentence an operator reads has to name an evidence-write failure, "
+                          "not a finding about their SQL")
+            self.assertIn("could not write the report to <stdout> (/dev/full)", proc.stderr,
+                          "the device that refused the report has to be named here too, the way "
+                          "the `EXIT_FAIL` pins have always required")
+            self.assertFalse((Path(td) / "verdict.json").is_file(),
+                             "a blank `--json` target must never touch the filesystem")
 
     def test_a_shell_redirected_broken_pipe_stays_unnamed(self):
         """PRO-341 review N2 has to survive the descriptor path: an inode is not a destination.
@@ -7217,8 +7540,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         import sys
         import textwrap
         import preflight_worlddb as P
-        driver = self._MAIN_DRIVER.format(
-            stdout_setup="pass   # fd 1 is an inherited pipe whose reader went away")
+        driver = self._driver(
+            "pass   # fd 1 is an inherited pipe whose reader went away")
         with tempfile.TemporaryDirectory() as td:
             script = Path(td) / "driver.py"
             script.write_text(textwrap.dedent(driver))
@@ -7234,11 +7557,15 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"a pipe that closed early changed the verdict too: "
                              f"rc={proc.returncode} stderr={err}")
-            self.assertIn("could not write the report to <stdout>: BrokenPipeError", err,
-                          "the wrapper's wording for an early-closed pipe has to stay put")
+            # PRO-373 F2: this ordering is load-bearing. The prefix assertion below also
+            # breaks when an unwanted parenthetical turns up, so if it ran first it would
+            # swallow the regression and the engineer would read a complaint about the
+            # wrapper's wording instead of the one that explains the rule.
             self.assertNotIn("pipe:[", err,
                              "the descriptor path leaked an inode number into a sentence that "
                              "is supposed to name somewhere fixable")
+            self.assertIn("could not write the report to <stdout>: BrokenPipeError", err,
+                          "the wrapper's wording for an early-closed pipe has to stay put")
             self.assertNotIn("Exception ignored", err)
             self.assertTrue((Path(td) / "verdict.json").is_file())
 
@@ -7394,9 +7721,13 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         class Live:
             name = "<stderr>"
             encoding = "utf-8"
-            closed = False
 
             def __init__(self):
+                # `closed` is an instance attribute here for the same reason `Full` above
+                # declares it in `__init__`: a class attribute would be shadowed the moment
+                # anything sets it, and the fixture would invite a reader to trust the
+                # declaration instead of the instance.
+                self.closed = False
                 self.lines = []
 
             def write(self, s):
@@ -7447,12 +7778,23 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         wrong for a descriptor the shell redirected first. The pair of helpers is the fix, so
         the seam between them is what needs pinning — including the two shapes where the
         descriptor must *not* win, because a wrong destination is worse than a vague one.
+
+        The must-not-win shapes are the ones that need a witness. A fixture that has no
+        descriptor to offer passes whether or not the early return is there, because both
+        branches end in `return label`; PRO-373 F2 measured that deleting it left the whole
+        suite at baseline. So `Opened` carries a `fileno` pointing at a second regular file
+        that is deliberately not `/dev/full`: the object and the descriptor now give different
+        answers, and only the early return can keep the object's.
         """
         import os
         import preflight_worlddb as P
 
         class Opened:
             name = "/dev/full"          # what an in-process open() produces
+            other_fd = None             # wired to a different file below; see the pin
+
+            def fileno(self):
+                return self.other_fd
 
         class Inherited:
             name = "<stdout>"           # what CPython stamps on fd 1 whatever the shell did
@@ -7468,7 +7810,18 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             target = Path(td) / "report.txt"
             target.write_text("x")
             real = os.path.realpath(str(target))
+            # PRO-373 F2: `Opened` has to be handed a descriptor that *disagrees* with its own
+            # `name`, and it has to still be open when the pin runs. Left without one — the
+            # shape this pin shipped with — deleting the early return at the top of
+            # `_stream_destination` only moves the answer two lines down, from
+            # `return label` to the "`fileno` is not callable" `return label`: still
+            # `/dev/full`, still green, and the "asked *only* when" this test is named after
+            # ships unpinned. With a live descriptor on a different regular file, dropping the
+            # early return lets the descriptor answer and this assertion is what goes red.
+            elsewhere = os.path.realpath(str(Path(td) / "elsewhere.txt"))
+            Path(elsewhere).write_text("y")
             fd = os.open(real, os.O_RDONLY)
+            Opened.other_fd = os.open(elsewhere, os.O_RDONLY)
             try:
                 self.assertEqual(real, P._descriptor_destination(fd),
                                   "a redirected regular file is nameable only from the fd")
@@ -7476,11 +7829,15 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
                 named.fd = fd
                 self.assertEqual(real, P._stream_destination(named),
                                   "the operator's `> file` has to be named, not `<stdout>`")
+                self.assertEqual("/dev/full", P._stream_destination(Opened()),
+                                 "a stream that already names itself must not be "
+                                 "second-guessed — and the only way to know whether it is "
+                                 "being second-guessed is to hand it a descriptor worth "
+                                 "asking, which is `elsewhere.txt` here, not `/dev/full`")
             finally:
                 os.close(fd)
+                os.close(Opened.other_fd)
 
-            self.assertEqual("/dev/full", P._stream_destination(Opened()),
-                             "a stream that already names itself must not be second-guessed")
             self.assertEqual("<stdout>", P._stream_destination(NoDescriptor()),
                              "a stream with no descriptor is back to what its object can say")
 
@@ -7526,12 +7883,14 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
           is what `_emit` holds when the destination is genuinely unknown.
 
         So the fixture is deliberately *not* given a `fileno`. Measured under exactly that
-        mutation (`if real and real != name:` -> `if real:`) this pin goes red, together with
-        `test_a_shell_redirected_broken_pipe_stays_unnamed` — but that one fails on its
-        `could not write the report to <stdout>: BrokenPipeError` prefix assertion, which is
-        collateral on the operator's wording rather than a claim about the guard. This is the
-        pin that asserts the suppression decision itself, in-process, with the descriptor
-        path deliberately unavailable so nothing else can be responsible for the answer.
+        mutation (`if real and real != name:` -> `if real:`) this pin goes red first: since
+        PRO-373 F2 the `<stdout> (<stdout>)` guard runs ahead of the wording prefix, so the
+        message an engineer reads is the one that explains the rule. The end-to-end pipe pin
+        goes red under the same mutation as well, but on its prefix assertion — a suppressed
+        parenthetical leaks no inode number, so its `pipe:[` guard has nothing to see. That
+        asymmetry is why the suppression decision is pinned here, in-process, with the
+        descriptor path deliberately unavailable so nothing else can be responsible for the
+        answer.
         """
         import sys
         import preflight_worlddb as P
@@ -7578,13 +7937,16 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         self.assertEqual(1, len(fallback.lines),
                          f"`_emit` owes exactly one fallback line, got {fallback.lines}")
         note = fallback.lines[0]
-        self.assertIn("could not write the report to <stdout>: ", note,
-                      f"the suppression half regressed, or the notice lost the channel it "
-                      f"was aimed at: {note!r}")
+        # PRO-373 F2: ordering is load-bearing here. The prefix assertion below also breaks
+        # when a parenthetical turns up, so leading with it swallowed the regression and the
+        # message that explains the suppression rule never reached the engineer.
         self.assertNotIn("<stdout> (<stdout>)", note,
                          "the parenthetical repeated the label, which is the noise "
                          "PRO-341 review N2's 'say it only when it adds something' rule "
                          "and the `real != name` half of the guard exist to prevent")
+        self.assertIn("could not write the report to <stdout>: ", note,
+                      f"the suppression half regressed, or the notice lost the channel it "
+                      f"was aimed at: {note!r}")
         self.assertIn("OSError", note)
         self.assertIn("No space left on device", note,
                       "suppressing the destination must not cost the errno")
@@ -7840,6 +8202,512 @@ class TestTheGateCompilesQuietly(unittest.TestCase):
                       "the raw flag changed the C-quoted example the docstring is about")
         self.assertIn("`\\`", doc)
         self.assertNotIn("\udcff", doc, "a prose docstring is not a place for a surrogate")
+
+
+class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
+    """PRO-370 F1: an evidence-write failure may not be answered with the SQL escalation.
+
+    `ops/deploy/worldserver-up.sh` printed one advice block for every non-zero gate rc.
+    PRO-370 proved it on the deploy host: the `--json`-into-a-0555-directory case (rc 2)
+    and a real SQL FAIL (rc 1) differed only in the trailing `(exit 2)` vs `(exit 1)`, so
+    a gate that had just said — accurately — *"this is an evidence-write failure, not a
+    finding about your SQL"* was answered two lines later with *"Fix the named file(s) or
+    escalate to Scuff (SQL)"*. The gate's honesty was undone one layer up.
+
+    Every fixture here is produced by the **real** `main()` and replayed to the wrapper by
+    a stub `PYTHON`, carrying the gate's real bytes and the real rc. That indirection is
+    the point: PRO-338's earlier clause keyed on a hand-written guess about what the gate
+    prints ("did it name a file?") and turned out false in both directions, because nobody
+    had tied the guess to the emitter. Here the marker the wrapper matches and the rc the
+    wrapper reads come out of the same process run as the bytes themselves, so a change to
+    `render()` or to the payload notice that would strand an operator shows up as a red
+    test rather than as a wrong sentence on a refused boot.
+    """
+
+    WRAPPER = HERE.parent / "deploy" / "worldserver-up.sh"
+
+    # Byte-for-byte what PRO-370 says a real SQL FAIL must still produce. Two echoes,
+    # wrapped for a terminal; both the raw pair and the folded sentence are pinned.
+    ESCALATION_RAW = ("worldserver-up: ac-worldserver was not started. Fix the named "
+                      "file(s) or\nworldserver-up:                   escalate to Scuff "
+                      "(SQL).")
+    ESCALATION = "ac-worldserver was not started. Fix the named file(s) or escalate to " \
+                 "Scuff (SQL)."
+
+    # The one real `main()`, with only the check bodies stubbed (the shape
+    # `TestTheGateHoldsItsOwnRc` already uses): no MySQL, no compose, no docker.
+    _GATE_DRIVER = '''
+        import pathlib
+        import sys
+
+        sys.path.insert(0, sys.argv[1])
+        import preflight_worlddb as P
+
+
+        class StubPreflight:
+            def __init__(self, args, policy, report):
+                self.args, self.policy, self.report = args, policy, report
+                self.sql_root = pathlib.Path(args.compose_root) / "data" / "sql"
+                self.git_root = pathlib.Path(args.compose_root)
+
+            def run(self):
+                if {operational}:
+                    raise P.OperationalError("cannot reach the database (db-access=docker, "
+                                             "service=ac-database). Is ac-database up?")
+                if {refuse}:
+                    self.report.fail("3", "UPDATE `creature_template` has no key predicate",
+                                     file="creature_template.sql", rule="unbounded-write")
+                    return P.EXIT_FAIL
+                return P.EXIT_OK
+
+
+        P.Preflight = StubPreflight
+        {break_render}
+        td = pathlib.Path(sys.argv[2])
+        (td / "tree" / "data" / "sql").mkdir(parents=True)
+        (td / "policy.json").write_text("{{}}")
+        sys.exit(P.main(["--compose-root", str(td / "tree"), "--policy",
+                         str(td / "policy.json"), "--json", sys.argv[3]]))
+    '''
+
+    def _real_gate(self, *, refuse=False, operational=False, break_render=False, json_target):
+        """Run the real `main()`; return (rc, stdout, stderr) exactly as the operator saw them."""
+        import subprocess
+        import sys
+        import textwrap
+        broken = ("P.render = lambda report, args: (_ for _ in ())."
+                  "throw(RuntimeError('fixture: render broke'))") if break_render else "pass"
+        with tempfile.TemporaryDirectory() as td:
+            driver = Path(td) / "gate.py"
+            driver.write_text(textwrap.dedent(self._GATE_DRIVER).format(
+                refuse="True" if refuse else "False",
+                operational="True" if operational else "False",
+                break_render=broken))
+            proc = subprocess.run([sys.executable, str(driver), str(HERE), td, str(json_target)],
+                                  capture_output=True, text=True, timeout=120)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def _writable_target(self):
+        """A --json path the gate really can write, so the payload arm stays silent."""
+        import os
+        fd, name = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        target = Path(name)
+        self.addCleanup(lambda: target.unlink(missing_ok=True))
+        return target
+
+    def _unwritable_dir(self):
+        """A 0555 directory: the PRO-370 host case, not a missing-directory stand-in."""
+        import shutil
+        root = Path(tempfile.mkdtemp())
+        locked = root / "evidence"
+        locked.mkdir()
+        locked.chmod(0o555)
+
+        def restore():
+            locked.chmod(0o755)
+            shutil.rmtree(str(root), ignore_errors=True)
+
+        self.addCleanup(restore)
+        return locked
+
+    def _replay_through_wrapper(self, gate_rc, gate_out, gate_err, json_target):
+        """Run the real wrapper with `PYTHON` pointed at a shim that replays `gate_*`."""
+        import os
+        import shutil
+        import subprocess
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(td), True)
+        (td / "stack").mkdir()
+        (td / "out").write_text(gate_out, encoding="utf-8")
+        (td / "err").write_text(gate_err, encoding="utf-8")
+        shim = td / "replay-gate"
+        # argv is the gate path and the forwarded flags; the replay is the whole point, so
+        # it reads its script from the environment and ignores them.
+        shim.write_text("#!/usr/bin/env bash\n"
+                        'cat "$REPLAY_OUT"\n'
+                        'cat "$REPLAY_ERR" >&2\n'
+                        'exit "$GATE_RC"\n', encoding="utf-8")
+        shim.chmod(0o755)
+        env = dict(os.environ, PYTHON=str(shim), REPLAY_OUT=str(td / "out"),
+                   REPLAY_ERR=str(td / "err"), GATE_RC=str(gate_rc),
+                   COMPOSE_ROOT=str(td / "stack"), LEASE_FILE=str(td / "lease"),
+                   PREFLIGHT_CHECK_ONLY="1")
+        proc = subprocess.run(["bash", str(self.WRAPPER), "--json", str(json_target)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              env=env, timeout=60)
+        return proc
+
+    @staticmethod
+    def _folded(text):
+        """The block with its line breaks folded, so a sentence is pinned whole.
+
+        The `worldserver-up: ` tag is dropped rather than kept: it is printed once per
+        physical line, so where a sentence happens to straddle two of them the tag would
+        otherwise land in the middle of the phrase under test. Exact rendering of the
+        escalation is pinned separately against `ESCALATION_RAW`.
+        """
+        without_tag = re.sub(r"worldserver-up: *", "", text)
+        return re.sub(r"\s+", " ", without_tag).strip()
+
+    # -- the case PRO-370 raised ------------------------------------------------------ #
+
+    def test_an_evidence_write_failure_is_not_answered_with_the_sql_escalation(self):
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc,
+                         f"fixture: a 0555 --json target must still be an evidence-write "
+                         f"failure the gate refuses on its own code (rc={rc})")
+        self.assertIn("could not write the --json payload to", err)
+        self.assertIn("not a finding about your SQL", err,
+                      "fixture: the gate has to still be the honest layer here")
+        self.assertNotIn("!!", out, "fixture: this run earned no finding")
+
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_ERROR, proc.returncode,
+                         "the wrapper stopped failing closed on an evidence-write failure")
+        self.assertNotIn("Scuff (SQL)", proc.stderr,
+                         "the payload failure is routed to the SQL lane again — the exact "
+                         "sentence PRO-370 caught the wrapper printing")
+        self.assertIn("evidence-write failure", proc.stderr)
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+        self.assertIn(str(target), proc.stderr,
+                      "the advice has to point at the payload path, as the gate's own line does")
+
+    def test_the_gate_own_lines_still_reach_the_operator_unchanged(self):
+        """Routing may read the gate's output, but it may not swallow or relocate it."""
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(json_target=target)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        for line in (out + err).splitlines():
+            if line.strip():
+                self.assertIn(line, proc.stdout + proc.stderr,
+                              f"a line the gate printed never reached the operator: {line!r}")
+
+    def test_the_capture_keeps_each_stream_on_the_descriptor_it_came_from(self):
+        """The gate's verdict is stdout and its notices are stderr; the replay keeps that.
+
+        Capture-then-replay is only acceptable if the wrapper's `2>/dev/null` still hides
+        what `2>/dev/null` used to hide.
+        """
+        import preflight_worlddb as P
+        target = self._writable_target()
+        rc, out, err = self._real_gate(refuse=True, json_target=target)
+        self.assertEqual(P.EXIT_FAIL, rc)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertIn("RESULT: FAIL — boot refused", proc.stdout)
+        self.assertNotIn("RESULT: FAIL — boot refused", proc.stderr,
+                         "the gate's verdict was moved onto stderr by the capture")
+        self.assertIn("REFUSING BOOT", proc.stderr)
+        self.assertNotIn("REFUSING BOOT", proc.stdout)
+
+    # -- the case that must not regress ----------------------------------------------- #
+
+    def test_a_real_sql_fail_still_gets_the_escalation_sentence_verbatim(self):
+        import preflight_worlddb as P
+        target = self._writable_target()
+        rc, out, err = self._real_gate(refuse=True, json_target=target)
+        self.assertEqual(P.EXIT_FAIL, rc)
+        self.assertIn("    !! unbounded-write: UPDATE `creature_template` has no key predicate",
+                      out, "fixture: the finding line the wrapper keys on is not on disk")
+
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_FAIL, proc.returncode)
+        self.assertIn(self.ESCALATION_RAW, proc.stderr,
+                      "the escalation block changed shape on the path that must be untouched")
+        self.assertIn(self.ESCALATION, self._folded(proc.stderr))
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+        self.assertNotIn("evidence-write", proc.stderr,
+                         "a run that wrote its payload is being told about payloads")
+
+    def test_a_run_that_carried_findings_and_lost_its_payload_routes_to_both(self):
+        """rc 2 is not "not my SQL": findings and a lost payload can share a run."""
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(refuse=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("    !! unbounded-write:", out)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_ERROR, proc.returncode)
+        self.assertIn(self.ESCALATION, self._folded(proc.stderr),
+                      "a real finding was demoted because the rc belonged to the payload")
+        folded = self._folded(proc.stderr)
+        self.assertIn("Fix the path and re-run", folded,
+                      "the lost payload stopped being named just because a finding shared the run")
+        # PRO-390 non-blocking: with a `!!` on screen the escalation above just sent the
+        # operator to Scuff (SQL); the wrapper's own payload arm must not then contradict it
+        # by claiming the SQL lane is irrelevant. That wrapper sentence ("the SQL lane is not
+        # where it belongs") belongs only to a findings-free run. The gate's own replayed
+        # "not a finding about your SQL" notice about the payload is left verbatim — that is
+        # the gate speaking, not the wrapper misrouting.
+        self.assertNotIn("the SQL lane is not where it belongs", folded,
+                         "the wrapper told the operator to escalate to SQL and that the SQL "
+                         "lane was the wrong place in the same refusal")
+
+    def test_a_degraded_render_still_routes_the_findings_it_listed(self):
+        """The marker, not the exit code, is what decides — rc 2 with a listed FAIL routes to SQL."""
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(refuse=True, break_render=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("!! render() raised RuntimeError", out)
+        self.assertIn("    !! [3] FAIL", out,
+                      "fixture: the degraded listing stopped listing what it refused on")
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertIn(self.ESCALATION, self._folded(proc.stderr))
+
+    def test_a_render_failure_alone_is_not_read_as_a_finding(self):
+        """`!! render() raised ...` is the gate describing itself, not the SQL."""
+        import preflight_worlddb as P
+        locked = self._unwritable_dir()
+        target = locked / "preflight.json"
+        rc, out, err = self._real_gate(break_render=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("!! render() raised RuntimeError", out)
+        self.assertNotIn("    !!", out, "fixture: no finding was listed, so this tests "
+                                       "the exclusion and nothing else")
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertNotIn("Scuff (SQL)", proc.stderr,
+                         "a presentation failure sent the operator to the SQL lane")
+
+    def test_an_operational_error_is_not_answered_with_the_sql_escalation(self):
+        """The PRO-338 counterexample, now pinned: ac-database was down; nobody's SQL was."""
+        import preflight_worlddb as P
+        target = self._writable_target()
+        rc, out, err = self._real_gate(operational=True, json_target=target)
+        self.assertEqual(P.EXIT_ERROR, rc)
+        self.assertIn("preflight: operational error:", err)
+        proc = self._replay_through_wrapper(rc, out, err, target)
+        self.assertEqual(P.EXIT_ERROR, proc.returncode)
+        self.assertNotIn("Scuff (SQL)", proc.stderr)
+        self.assertIn("operational error", proc.stderr)
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+
+    def test_an_unrecognised_failure_fails_closed_without_naming_the_sql_lane(self):
+        """No finding line, no known notice, an undocumented rc: say nothing that misroutes."""
+        proc = self._replay_through_wrapper(3, "", "something the gate has never printed\n",
+                                            Path("/nonexistent/preflight.json"))
+        self.assertEqual(3, proc.returncode, "an undocumented rc stopped failing closed")
+        self.assertNotIn("Scuff (SQL)", proc.stderr)
+        self.assertIn("Do not bypass this gate.", proc.stderr)
+        self.assertIn("cannot say whether this is about your SQL", self._folded(proc.stderr))
+        # The other half of the unclassified arm: with no marker to route on, the only
+        # thing left to hand the operator is the rule for reading the capture themselves.
+        # Pinned as a sentence because PRO-382's seam proves the wrapper may not quote
+        # `'!!'` anywhere in the refusal block without the gate really emitting it, and
+        # this arm is the only place that quote lives — reword it into silence and the
+        # seam stays green while the operator loses the rule.
+        self.assertIn("A '!!' line in the output above is a finding about your SQL",
+                      self._folded(proc.stderr))
+        self.assertIn("a line about the environment of the gate itself is not",
+                      self._folded(proc.stderr))
+
+    # -- the capture-block regressions PRO-390 caught -------------------------------- #
+    #
+    # The three blocking findings all lived in the ~20 lines that capture the gate's
+    # output for the markers to read. They are reproduced here on the shape the reviewer
+    # used: the real wrapper, a stub `PYTHON` standing in for the gate, a stand-in `docker`
+    # whose only job is to prove a boot happened. Each is checked against the fixed
+    # wrapper; reverting the corresponding guard flips the assertion.
+
+    _HOSTILE_GATE_HEAD = (
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-" ]; then exec "$REALPY" - "$2"; fi\n'
+    )
+
+    def _run_hostile(self, gate_body, *, check_only=True, tmpdir=None):
+        """Run the real wrapper once against a stub gate, on PRO-390's shape.
+
+        `gate_body` is the shell the stub runs after the lease-check passthrough. The
+        stub records that the gate ran (``$GATE_MARKER``) and a fake ``docker`` on PATH
+        records that a boot happened (``$DOCKER_MARKER``), so "the gate ran" and "the
+        container started" are both observable rather than inferred.
+        """
+        import datetime
+        import os
+        import shutil
+        import subprocess
+        import sys
+
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(td), True)
+        root = td / "root"
+        (root / ".stack").mkdir(parents=True)
+        binp = td / "bin"
+        binp.mkdir()
+        docker_marker = td / "docker-ran"
+        gate_marker = td / "gate-ran"
+
+        fake = binp / "docker"
+        fake.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "compose %s\\n" "$*" > "$DOCKER_MARKER"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        gate = td / "gate"
+        gate.write_text(self._HOSTILE_GATE_HEAD + gate_body, encoding="utf-8")
+        gate.chmod(0o755)
+
+        if not check_only:
+            # The boot path refuses without a lease someone is holding, so hand it one.
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            (root / ".stack" / "lease").write_text(
+                json.dumps(
+                    {
+                        "agentId": "core",
+                        "issueId": "PRO-381",
+                        "action": "check",
+                        "acquiredAt": stamp,
+                        "expectedMinutes": 99999,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "PYTHON": str(gate),
+                "REALPY": sys.executable,
+                "COMPOSE_ROOT": str(root),
+                "LEASE_FILE": str(root / ".stack" / "lease"),
+                "DOCKER_MARKER": str(docker_marker),
+                "GATE_MARKER": str(gate_marker),
+                "PATH": f"{binp}{os.pathsep}{env['PATH']}",
+            }
+        )
+        if tmpdir is not None:
+            env["TMPDIR"] = str(tmpdir)
+        if check_only:
+            env["PREFLIGHT_CHECK_ONLY"] = "1"
+        else:
+            env.pop("PREFLIGHT_CHECK_ONLY", None)
+
+        err = td / "stderr.txt"
+        argv = ["bash", str(self.WRAPPER), "--json", str(td / "v.json")]
+        with open(err, "w", encoding="utf-8") as fh:
+            proc = subprocess.run(
+                argv, env=env, cwd=str(td), stdout=subprocess.DEVNULL, stderr=fh,
+                timeout=60,
+            )
+        return {
+            "rc": proc.returncode,
+            "docker_ran": docker_marker.is_file(),
+            "gate_ran": gate_marker.is_file(),
+            "stderr": err.read_text(encoding="utf-8", errors="replace"),
+        }
+
+    def test_a_signal_to_the_wrapper_during_the_gate_does_not_start_the_container(self):
+        # PRO-390 B1 (fail-open). `docker stop`, `systemd stop` and a plain `kill -TERM`
+        # signal this script and only this script — the gate child is never signalled. The
+        # capture trap used to be `rm -rf "$GATE_DIR"` on INT/TERM, which cleaned up and
+        # *returned*, so the unsigned gate finished rc 0 and the script walked straight into
+        # `docker compose up -d ac-worldserver`. The signal traps must leave, not continue.
+        got = self._run_hostile(
+            'echo started > "$GATE_MARKER"\n'
+            'kill -TERM "$PPID" 2>/dev/null\n'
+            "exit 0\n",
+            check_only=False,
+        )
+        self.assertTrue(got["gate_ran"], "the gate never ran, so the signal test proves nothing")
+        self.assertFalse(
+            got["docker_ran"],
+            "a SIGTERM during the gate let the script fall through and start ac-worldserver",
+        )
+        self.assertEqual(143, got["rc"], "a SIGTERM during the gate did not leave with 128+15")
+        self.assertNotIn("compose up", got["stderr"])
+
+    def test_an_unwritable_scratch_dir_still_lets_the_gate_reach_its_verdict(self):
+        # PRO-390 B2 (lost verdict). `GATE_DIR="$(mktemp -d)" || die` ran *before* the gate,
+        # and `mktemp -d` is exactly the call that dies on `No space left on device` — the
+        # PRO-351 host shape. A run that should have printed RESULT: PASS was answered with
+        # rc 2, no RESULT and no payload, because a scratch dir we cannot make is not a
+        # verdict. With no capture the gate speaks to the operator's own descriptors and the
+        # wrapper routes on rc alone.
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(self._restore_tmpdir, td)
+        td.chmod(0o555)
+        got = self._run_hostile(
+            'echo started > "$GATE_MARKER"\n'
+            'printf "RESULT: PASS\\n"\n'
+            "exit 0\n",
+            check_only=True,
+            tmpdir=td,
+        )
+        self.assertTrue(
+            got["gate_ran"],
+            "an unwritable scratch dir stopped the gate from running at all — the verdict "
+            "was lost before it could be reached",
+        )
+        self.assertEqual(0, got["rc"], "a passing run was turned into a failure by TMPDIR")
+        self.assertNotIn("REFUSING BOOT", got["stderr"])
+
+    def _restore_tmpdir(self, td):
+        td.chmod(0o755)
+        import shutil
+
+        shutil.rmtree(str(td), True)
+
+    def test_a_capture_removed_under_the_arms_leaks_no_tool_diagnostics(self):
+        # PRO-390 B3 (diagnostic leak). The cleanup trap used to delete the capture before
+        # the advice arms read it, and the finding probe ran `awk` over files that were
+        # already gone — so a raw `awk: cannot open ...` landed in the middle of the
+        # operator's refusal (the tmpfiles-daemon-reclaims-it-underneath-a-long-run shape
+        # bites the same way). The probe must treat a missing capture as "no finding here",
+        # and the rc-1 verdict must still route to the SQL lane even though the `!!` line is
+        # no longer readable.
+        import shutil
+
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(td), True)
+        got = self._run_hostile(
+            "printf '    !! unbounded-write: planted\\n'\n"
+            'rm -rf "$TMPDIR"/tmp.* 2>/dev/null\n'
+            "exit 1\n",
+            check_only=True,
+            tmpdir=td,
+        )
+        self.assertEqual(1, got["rc"])
+        self.assertNotIn(
+            "awk:", got["stderr"],
+            "the finding probe printed its own file-open error into the refusal",
+        )
+        self.assertNotIn(
+            "cat:", got["stderr"],
+            "the replay printed its own file-open error into the refusal",
+        )
+        self.assertIn(
+            "escalate to Scuff (SQL)", self._folded(got["stderr"]),
+            "losing the capture must not cost a real rc-1 verdict its SQL routing",
+        )
+
+    def test_a_missing_policy_file_is_not_answered_with_the_sql_escalation(self):
+        # PRO-390 non-blocking: `preflight: policy file not found: {path}` is as
+        # unambiguously environmental as an operational error — a mis-deployed checkout is
+        # missing its policy JSON — so it gets its own arm rather than the "cannot say
+        # whether this is about your SQL" catch-all, and never routes to the SQL lane.
+        proc = self._replay_through_wrapper(
+            2,
+            "",
+            "preflight: policy file not found: /opt/world/config/preflight.json\n",
+            self._writable_target(),
+        )
+        self.assertEqual(2, proc.returncode)
+        self.assertIn("policy file", self._folded(proc.stderr))
+        self.assertIn("not a finding about your SQL", self._folded(proc.stderr))
+        self.assertNotIn("escalate to Scuff (SQL)", self._folded(proc.stderr))
+        self.assertNotIn(
+            "cannot say whether this is about your SQL", self._folded(proc.stderr)
+        )
 
 
 if __name__ == "__main__":
