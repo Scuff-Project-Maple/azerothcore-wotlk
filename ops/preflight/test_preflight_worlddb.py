@@ -6245,9 +6245,10 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # same finding on a better design: `main()` states the payload outcome and hands it to
     # the renderer as the required keyword-only `payload_note`, so no wording is derived
     # inside the presentation half at all (PRO-335 §2, PRO-341 review N1/B1). The four
-    # tests in `test_the_degraded_verdict_*_` below pin its three shapes plus the blank
-    # `--json ""` case; this issue's `_payload_fortune()` helper was dropped in the merge
-    # rather than kept as a second, competing source of the same claim.
+    # tests in `test_the_degraded_verdict_*` below pin its three shapes plus the blank
+    # `--json ""` case; the `_payload_fortune()` helper that branch carried was dropped
+    # in the PRO-331 merge rather than kept as a second, competing source of the same
+    # claim.
 
     def test_checks_that_pass_still_refuse_the_boot_when_the_payload_cannot_be_written(self):
         """PRO-324 NB3: the case that actually changes what boots.
@@ -6563,13 +6564,16 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         The degraded line used to end `...and the --json payload is unaffected` on every
         path, including the one where nobody asked for a payload — a claim about a file
         that does not exist and was never requested. The operator reading a failed boot
-        is the audience; `NO_JSON_PAYLOAD_NOTE` is the single wording for the absent case.
+        is the audience; `NO_JSON_PAYLOAD_NOTE` is the gate's single wording for the
+        absent case, and the assertion below quotes what that wording says rather than
+        the constant, because an assertion written against the same constant the emitter
+        reads is self-consistent under a reword (PRO-369 review N1).
         """
         res = self._drive_main(self._ReportingStream(), self._ReportingStream(),
                                render_raises=True, json_target="none")
         text = res.out.decode("ascii")
         self.assertIn("render() raised RuntimeError", text)
-        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        self.assertIn("no --json payload requested", text)
         self.assertNotIn("unaffected", text,
                          "the degraded line still promises a payload nobody asked for")
         self.assertNotIn("None", text, "the absent payload is rendered as a word, not None")
@@ -6614,7 +6618,11 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
         text = res.out.decode("ascii")
         self.assertIn("render() raised RuntimeError", text,
                       "the fixture stopped exercising the degraded line")
-        self.assertIn(NO_JSON_PAYLOAD_NOTE, text)
+        # Literal for the same reason as the pin above (PRO-369 review N1): this is the
+        # sibling shape of the same operator-facing claim, and a reword that survives one
+        # of the two would leave a blank `--json` asserting evidence that was never
+        # written while the suite stayed green.
+        self.assertIn("no --json payload requested", text)
         self.assertNotIn("on disk", text,
                          "the line still asserts evidence that was never written")
         self.assertNotIn("unaffected", text)
