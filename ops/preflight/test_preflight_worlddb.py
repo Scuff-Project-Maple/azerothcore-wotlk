@@ -9559,14 +9559,27 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
     #
     # The third carries NO single-quoted fragment at all, which is what makes it a different
     # mutant and not a third spelling of the same one: `_quoted_fragments_emitted` reads
-    # `'([^']*)'` off what the terminal received, so with nothing quoted the emission pin is
-    # structurally blind to it and can never be the thing that refuses it. It is here to pin
-    # that the predecessor edge is the GENERAL bound PRO-434 NB-1 asked for — indifferent to
-    # what the insertion does, which stream it writes, and how its guard is spelled — rather
-    # than a second net for quoted notices that the emission pin already catches.
+    # `'([^']*)'` off what the terminal received, so with nothing quoted the FRAGMENT SCAN the
+    # emission pin runs is blind to it — on every route the set it reads is that route's
+    # pristine `route_frags`, which is what the blind-branch `assertEqual` below pins. Say that
+    # and not "the emission pin can never refuse it" (PRO-438 NB-1): the same pin also asserts
+    # the gate ran, docker did not, the exit code, and that "REFUSING BOOT" reached stderr, and
+    # none of those is quote-sensitive. Measured, in a copy of `ops/` with the wrapper rewritten
+    # in place: three lines `if [ "$rc" -ne 0 ]; then / exit 0 / fi` above the opener quote
+    # nothing either, and the emission pin is among the failures because no boot is refused at
+    # all. It is here to pin that the predecessor edge is the GENERAL bound PRO-434 NB-1 asked
+    # for — indifferent to what the insertion does, which stream it writes, and how its guard is
+    # spelled — rather than a second net for quoted notices that the emission pin catches too.
     #
-    # The 4th field of each entry is the fragment this mutant must put on `stream`, or None
-    # when the mutant quotes nothing and the emission pin must be shown NOT to catch it.
+    # The 4th field of each entry is the fragment this mutant must put on `stream`, or None when
+    # the mutant quotes nothing and the emission pin must be shown NOT to catch it. Read `None`
+    # precisely (PRO-438 NB-2): it asserts the fragments the terminal received equal each
+    # route's pristine set, which is NOT the same proposition as "this entry contains no
+    # apostrophe". A mutant that quoted only an already-pinned fragment would dispatch here as
+    # well and stay red because of a fact about `REFUSAL_EMISSION_ROUTES` — no pinned fragment
+    # appears in every route's set, the mis-deploy arm's is `set()` — not because of anything in
+    # this entry or this branch. If you ever add a route whose set holds all three pinned
+    # fragments, that dependency breaks and this comment has to change with it.
     WRAPPER_UNQUOTED_NOTICE_MARK = "the database is on fire"
 
     WRAPPER_MUTANTS_ABOVE_THE_OPENER = (
@@ -9622,12 +9635,14 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
         said out loud instead of left to rot. For the unquoted one the split runs the other
         way and that is the whole reason it is in the table: `_quoted_fragments_emitted`
         reads `'([^']*)'` off what the terminal received, so with nothing quoted the
-        emission pin is structurally blind, holds its pristine per-route set, and CANNOT be
-        the thing that refuses this wrapper. Only the predecessor edge can, because it never
-        looks at the insertion. Two quoted mutants could only ever show that both nets catch
-        the same shape; this one shows the two nets are not the same net, which is the
-        generality NB-1 asked for when it said to pin the seam rather than the one shape
-        that used it.
+        FRAGMENT SCAN the emission pin runs holds its pristine per-route set on every route,
+        and the predecessor edge is the only net that can see an insertion which quotes
+        nothing and leaves the block's control flow alone. Not the pin as such — it keeps its
+        `REFUSING BOOT` and exit-code assertions, which are not quote-sensitive and do refuse
+        a control-flow insertion that quotes nothing (PRO-438 NB-1, measured). Two quoted
+        mutants could only ever show that both nets catch the same shape; this one shows the
+        two nets are not the same net, which is the generality NB-1 asked for when it said to
+        pin the seam rather than the one shape that used it.
         """
         import shutil
         import subprocess
@@ -9696,10 +9711,11 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                 # accepts any of these, because the region's predecessor is pinned too. On
                 # the two quoted mutants that makes the emission pin below belt-and-braces
                 # rather than the only thing standing between the mutant and a green build;
-                # on the unquoted one the predecessor edge is the ONLY net there is, and the
-                # assertions below measure that instead. Said out loud either way so nobody
-                # reads the negative control above as a claim that the text pins are still
-                # blind.
+                # on the unquoted one the predecessor edge is the only net that can see an
+                # insertion which quotes nothing and leaves the block's control flow alone,
+                # and the assertions below measure that instead. Said out loud either way so
+                # nobody reads the negative control above as a claim that the text pins are
+                # still blind.
                 with self.assertRaises(AssertionError) as cm:
                     ref._refusal_block_from_lines(
                         mutant, f"{self.WRAPPER.name} ({label})")
@@ -9710,7 +9726,11 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                               + str(cm.exception))
 
                 pinned = set(cls.WRAPPER_QUOTED_FRAGMENTS)
-                for route, body, _want_rc, want_frags, _want_arm in \
+                # `route_frags` and not `want_frags`: the table's 4th field is `want_frag`,
+                # one character away, and a rebind of the same name in this scope is the kind
+                # of collision that silently re-points the `None` dispatch below at the wrong
+                # set (PRO-438 advisory 1).
+                for route, body, _want_rc, route_frags, _want_arm in \
                         self.REFUSAL_EMISSION_ROUTES:
                     got = self._run_hostile(body, check_only=True, wrapper=path)
                     self.assertIn("REFUSING BOOT", got["stderr"],
@@ -9724,22 +9744,27 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                         # really does reach the operator on `stream` — which is also the
                         # proof that `_run_hostile` captures that stream, since a discarded
                         # one would come back empty and this assertion would be the failure
-                        # — while nothing on it is single-quoted, so the emission pin has
-                        # exactly what it had on a pristine boot. `assertEqual` below is the
-                        # suite saying out loud that EMISSION does not refuse this mutant;
-                        # the predecessor edge above is the only thing that does, which is
-                        # the generality PRO-434 NB-1 asked for and that two quoted mutants
-                        # could never demonstrate.
+                        # — while nothing on it is single-quoted, so the fragment scan the
+                        # emission pin runs has exactly what it had on a pristine boot.
+                        # `assertEqual` below is the suite saying out loud that EMISSION does
+                        # not refuse this mutant; the predecessor edge above is what does,
+                        # which is the generality PRO-434 NB-1 asked for and that two quoted
+                        # mutants could never demonstrate.
                         self.assertIn(self.WRAPPER_UNQUOTED_NOTICE_MARK, got[stream],
                                       f"{label} / {route}: the mutant stopped printing its "
                                       f"fourth notice on {stream}, so it no longer "
                                       "reproduces the residual hole")
                         self.assertEqual(
-                            sorted(want_frags), sorted(handed),
+                            sorted(route_frags), sorted(handed),
                             f"{label} / {route}: the emission pin now sees a single-quoted "
                             "fragment on a wrapper that quotes none, so this test can no "
                             "longer show that the predecessor edge alone is what refuses "
-                            "the unquoted insertion")
+                            "the unquoted insertion. If the fragment named is one of the "
+                            "pinned three, suspect the checkout rather than the pin: when "
+                            "this suite runs against a wrapper that already carries a quoted "
+                            "notice above the opener, every route hands that fragment up and "
+                            "the red belongs to the fixture — the diagnostic at the end of "
+                            "this test is what says so")
                         continue
                     notice = self._quoted_fragments_emitted(got[stream])
                     self.assertIn(want_frag, notice,
@@ -9751,7 +9776,7 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                                      "fragment outside the pinned three, so the exact-set "
                                      "design note above is stale — a subset check would "
                                      "catch this mutant too")
-                    self.assertNotEqual(sorted(want_frags), sorted(handed),
+                    self.assertNotEqual(sorted(route_frags), sorted(handed),
                                         f"{label} / {route}: the emission pin no longer "
                                         "refuses a refused boot that hands the operator a "
                                         "fourth single-quoted notice above the block it "
