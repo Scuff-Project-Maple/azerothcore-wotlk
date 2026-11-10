@@ -9546,38 +9546,59 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                          "that actually reaches the terminal, on either stream, and the "
                          "arms above are what defines it")
 
-    # The two shapes of "three lines inserted above the column-0 opener" that the operator
-    # can see and a text pin cannot. Both are `bash -n`-clean and both run on every refused
-    # boot. The first is the mutant PRO-413 re-review reproduced. The second is the variant
-    # the PRO-432 reviewer walked through at `0a58be29d` while the whole suite stayed
+    # The shapes of "three lines inserted above the column-0 opener" that the operator can
+    # see and a text pin cannot. All three are `bash -n`-clean and all three run on every
+    # refused boot. The first is the mutant PRO-413 re-review reproduced. The second is the
+    # variant the PRO-432 reviewer walked through at `0a58be29d` while the whole suite stayed
     # `Ran 395 tests ... OK`: it writes to STDOUT, which `_run_hostile` used to discard, and
     # its guard is spelled `[ "$rc" -ne 0 ]` rather than `(( rc != 0 ))`, so it is not even
-    # the line the text pins key on. The `2>/dev/null || :` on that printf is not decoration
-    # either — strip it and the PRO-353 `/dev/full` test catches this mutant by accident,
-    # because an unguarded printf to a full stdout aborts the block, and this suite would be
-    # crediting the wrong guard for the red.
+    # the line the text pins key on. The `2>/dev/null || :` on those printfs is not
+    # decoration either — strip it and the PRO-353 `/dev/full` test catches these mutants by
+    # accident, because an unguarded printf to a full stdout aborts the block, and this suite
+    # would be crediting the wrong guard for the red.
+    #
+    # The third carries NO single-quoted fragment at all, which is what makes it a different
+    # mutant and not a third spelling of the same one: `_quoted_fragments_emitted` reads
+    # `'([^']*)'` off what the terminal received, so with nothing quoted the emission pin is
+    # structurally blind to it and can never be the thing that refuses it. It is here to pin
+    # that the predecessor edge is the GENERAL bound PRO-434 NB-1 asked for — indifferent to
+    # what the insertion does, which stream it writes, and how its guard is spelled — rather
+    # than a second net for quoted notices that the emission pin already catches.
+    #
+    # The 4th field of each entry is the fragment this mutant must put on `stream`, or None
+    # when the mutant quotes nothing and the emission pin must be shown NOT to catch it.
+    WRAPPER_UNQUOTED_NOTICE_MARK = "the database is on fire"
+
     WRAPPER_MUTANTS_ABOVE_THE_OPENER = (
         ("a quoted `tell` on stderr", "stderr",
          (TestTheVerdictSurvivesTheOperatorsCodec.REFUSAL_BLOCK_OPENER,
           "  tell \"fourth notice: 'could not write the --json payload' hits the "
           "operator\"",
-          "fi")),
+          "fi"),
+         "could not write the --json payload"),
         ("a quoted `printf` on stdout", "stdout",
          ('if [ "$rc" -ne 0 ]; then',
           "  printf '%s\\n' \"worldserver-up: fourth notice: 'could not write the --json "
           "payload' on stdout\" 2>/dev/null || :",
-          "fi")),
+          "fi"),
+         "could not write the --json payload"),
+        ("an unquoted `printf` on stdout", "stdout",
+         ('if [ "$rc" -ne 0 ]; then',
+          "  printf \"%s\\n\" \"worldserver-up: fourth notice: "
+          + WRAPPER_UNQUOTED_NOTICE_MARK + "\" 2>/dev/null || :",
+          "fi"),
+         None),
     )
 
-    def test_a_fourth_notice_above_the_opener_fails_the_emission_pin_though_the_anchor_cut_accepts(
+    def test_a_fourth_notice_above_the_opener_is_refused_though_the_anchor_cut_accepts(
             self):
         """PRO-413 residual hole, made a test: three lines above the column-0 opener.
 
         Three lines dropped directly above the refusal block's opener are valid bash, run
-        on every refused boot, and sit outside the region every text cut compares. Two of
+        on every refused boot, and sit outside the region every text cut compares. Three of
         them are run here (`WRAPPER_MUTANTS_ABOVE_THE_OPENER`): the `tell` on stderr that
-        PRO-413 re-review reproduced, and the `printf` on stdout that PRO-432's reviewer
-        found still green at `0a58be29d`.
+        PRO-413 re-review reproduced, the `printf` on stdout that PRO-432's reviewer found
+        still green at `0a58be29d`, and a `printf` on stdout that quotes NOTHING.
 
         The insertion point comes from the ANCHOR, not from a count of openers. The anchor
         is what every pin here locates the block by and `_refusal_block_from_lines` already
@@ -9591,11 +9612,22 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
 
         The assertions are, in order: `bash -n` accepts the mutant; the golden cut as
         PRO-413 shipped it accepts it and still reports the frozen three (the negative
-        control — without it the failure below would not show that EMISSION is what closes
-        the hole); the current text pin refuses it too, on the predecessor edge PRO-434
-        NB-1 added, which makes the emission pin belt-and-braces here rather than the only
-        net — said out loud instead of left to rot; and the emission pin refuses every
-        route on its own.
+        control — without it the failure below would not show that the new bounds are what
+        close the hole); the current text pin refuses it, on the predecessor edge PRO-434
+        NB-1 added; and then the per-route assertions split on what the mutant can be seen
+        to do.
+
+        For the two quoted mutants the emission pin refuses every route on its own, which
+        makes it belt-and-braces alongside the predecessor edge rather than the only net —
+        said out loud instead of left to rot. For the unquoted one the split runs the other
+        way and that is the whole reason it is in the table: `_quoted_fragments_emitted`
+        reads `'([^']*)'` off what the terminal received, so with nothing quoted the
+        emission pin is structurally blind, holds its pristine per-route set, and CANNOT be
+        the thing that refuses this wrapper. Only the predecessor edge can, because it never
+        looks at the insertion. Two quoted mutants could only ever show that both nets catch
+        the same shape; this one shows the two nets are not the same net, which is the
+        generality NB-1 asked for when it said to pin the seam rather than the one shape
+        that used it.
         """
         import shutil
         import subprocess
@@ -9614,7 +9646,7 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                          f"opener {cls.REFUSAL_BLOCK_OPENER!r}, so there is no seam above "
                          "the block to insert into")
 
-        for label, stream, block in self.WRAPPER_MUTANTS_ABOVE_THE_OPENER:
+        for label, stream, block, want_frag in self.WRAPPER_MUTANTS_ABOVE_THE_OPENER:
             mutant = lines[:at] + list(block) + lines[at:]
             # The original block is still intact below the insert: opener, anchor under it.
             self.assertEqual(cls.REFUSAL_BLOCK_OPENER, mutant[at + len(block)])
@@ -9661,11 +9693,13 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                     "below prove nothing")
 
                 # And the honest half: as of PRO-434 NB-1 the CURRENT text pin no longer
-                # accepts either of these, because the region's predecessor is pinned too.
-                # The emission pin below is therefore belt-and-braces on this mutant, not
-                # the only thing standing between it and a green build — which is the point
-                # of asking for both halves, and is stated here so nobody reads the
-                # negative control above as a claim that the text pins are still blind.
+                # accepts any of these, because the region's predecessor is pinned too. On
+                # the two quoted mutants that makes the emission pin below belt-and-braces
+                # rather than the only thing standing between the mutant and a green build;
+                # on the unquoted one the predecessor edge is the ONLY net there is, and the
+                # assertions below measure that instead. Said out loud either way so nobody
+                # reads the negative control above as a claim that the text pins are still
+                # blind.
                 with self.assertRaises(AssertionError) as cm:
                     ref._refusal_block_from_lines(
                         mutant, f"{self.WRAPPER.name} ({label})")
@@ -9683,13 +9717,35 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                                   f"{label} / {route}: the mutant did not refuse the boot, "
                                   "so there is no fourth notice in flight and this route "
                                   "proves nothing")
+                    handed = (self._quoted_fragments_emitted(got["stderr"])
+                              | self._quoted_fragments_emitted(got["stdout"]))
+                    if want_frag is None:
+                        # The unquoted shape, and the reason it is in the table. The notice
+                        # really does reach the operator on `stream` — which is also the
+                        # proof that `_run_hostile` captures that stream, since a discarded
+                        # one would come back empty and this assertion would be the failure
+                        # — while nothing on it is single-quoted, so the emission pin has
+                        # exactly what it had on a pristine boot. `assertEqual` below is the
+                        # suite saying out loud that EMISSION does not refuse this mutant;
+                        # the predecessor edge above is the only thing that does, which is
+                        # the generality PRO-434 NB-1 asked for and that two quoted mutants
+                        # could never demonstrate.
+                        self.assertIn(self.WRAPPER_UNQUOTED_NOTICE_MARK, got[stream],
+                                      f"{label} / {route}: the mutant stopped printing its "
+                                      f"fourth notice on {stream}, so it no longer "
+                                      "reproduces the residual hole")
+                        self.assertEqual(
+                            sorted(want_frags), sorted(handed),
+                            f"{label} / {route}: the emission pin now sees a single-quoted "
+                            "fragment on a wrapper that quotes none, so this test can no "
+                            "longer show that the predecessor edge alone is what refuses "
+                            "the unquoted insertion")
+                        continue
                     notice = self._quoted_fragments_emitted(got[stream])
-                    self.assertIn("could not write the --json payload", notice,
+                    self.assertIn(want_frag, notice,
                                   f"{label} / {route}: the mutant stopped printing its "
                                   f"fourth notice on {stream}, so it no longer reproduces "
                                   "the residual hole")
-                    handed = (self._quoted_fragments_emitted(got["stderr"])
-                              | self._quoted_fragments_emitted(got["stdout"]))
                     self.assertEqual(set(), handed - pinned,
                                      f"{label} / {route}: the fourth notice now uses a "
                                      "fragment outside the pinned three, so the exact-set "
