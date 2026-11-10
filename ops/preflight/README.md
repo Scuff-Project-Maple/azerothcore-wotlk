@@ -736,6 +736,13 @@ Neither job is a required status check, and neither should be made one (PRO-295 
 triggers are `paths:`-filtered, so a PR outside that scope starts no run at all, and a required check
 that never starts sits at "Expected — waiting" forever. Read the check; do not gate a branch on it.
 
+"Read the check" has a precondition neither job can supply: the check has to have run. Between
+`2026-11-06T22:41:32Z` and PRO-441 nothing did, on any branch or PR, while this repository's
+Actions setting still read `enabled: true` — and because neither job is required, the absence
+left no row in any merge UI to read. See
+[Liveness: the run that never existed](#liveness-the-run-that-never-existed-pro-441) below for
+what to run by hand before a merge, and for what each of its answers means.
+
 | Step | Command | Verdict |
 | --- | --- | --- |
 | engine tests | `python3 ops/preflight/test_preflight_worlddb.py` | gates |
@@ -820,6 +827,8 @@ engine agrees with itself over the corpus in this checkout, and that the corpus 
 
 ### The ref the sweep attributes against, and the clone that has never held it (PRO-430)
 
+
+
 `corpus_sweep.py` answers the upstream question the way the boot gate does: it resolves the ref the
 policy names with **one** `git ls-tree -z -r <ref>` for the whole run (cached, so the tree is walked
 once), then compares each upstream-tagged file against the blob that ref holds with
@@ -901,6 +910,122 @@ not enough for one that never tracked it; the two forms above work for both. `--
 answer here either: it is the boot gate's typed opt-in back to the pre-PRO-248 exemption, and `corpus_sweep.py` never
 sets it — its hand-rolled `Args` has no such attribute, so `allow_missing_upstream_ref()` is `False` on every sweep run
 — which leaves the fetch as the only way a sweep can speak for the corpus at all.
+
+## Liveness: the run that never existed (PRO-441)
+
+Everything above describes what the check says when it runs. This is what happens when it does
+not run, which is the failure the five review rounds before this one did not catch.
+
+Between `2026-11-06T22:41:32Z` (`8f960d0ba`) and the day PRO-441 was filed, GitHub Actions
+started **nothing** for this repository — not the sweep, not `ubuntu-build`, nothing on any
+branch or PR. Merges landed on `Playerbot` in that window, several of them touching
+`ops/preflight/**`, each reviewed against a green pre-flight check that had stopped existing
+days earlier. Nothing in the repository could report it: the thing that would file that report
+is the thing that had stopped running. A workflow cannot announce its own non-execution.
+
+The cause is the API's own words, recorded by the guard rather than inferred:
+
+```
+POST /repos/Scuff-Project-Maple/azerothcore-wotlk/actions/workflows/409480917/dispatches
+HTTP 422
+{"message": "Actions has been disabled for this repository.", "status": "422"}
+
+GET  /repos/Scuff-Project-Maple/azerothcore-wotlk/actions/permissions
+{"enabled": true, "allowed_actions": "all", "sha_pinning_required": false}
+```
+
+The second body is the finding, and it is why a settings read is not evidence. The repository's
+Actions **setting** read enabled while Actions was disabled, so reading the settings, the YAML
+or the `paths:` filter could not have found this. Re-asserting the repository setting returns
+`204` and changes nothing; the dispatch stays `422`. What is above the repository is an
+organisation-level control: `Scuff-Project-Maple` is on the free plan, and with the
+repository-scoped credential this was diagnosed with, every
+`/orgs/Scuff-Project-Maple/actions/permissions…` and `/orgs/Scuff-Project-Maple/settings/billing/actions`
+read answers `403 Resource not accessible by integration`. The toggle that decides this is not
+visible from inside the repository, and no edit to any file in it can reach it.
+
+Ruled out with the same calls, so they do not get re-litigated next time: the workflow is
+registered and `active` (20 of 20 workflows active; `World DB pre-flight` is id 409480917); the
+newest run of **every** workflow in the repository is `2026-11-06T22:41:32Z`; there are no
+self-hosted runners registered and both jobs are `runs-on: ubuntu-latest`, so no runner box is
+involved; the org's other two repositories have 0 runs ever.
+
+The check, run by whoever merges:
+
+```
+python3 ops/preflight/ci_liveness_guard.py --sha <commit being merged>
+# name the cause rather than infer it (side effect, see below):
+python3 ops/preflight/ci_liveness_guard.py --sha <commit> --probe-ref Playerbot
+```
+
+| Verdict | Meaning | Exit | Whose problem |
+| --- | --- | --- | --- |
+| `PRESENT` | a run of this workflow for this commit completed green | 0 | nobody's |
+| `OUT OF SCOPE` | the commit touches none of the `paths:` — no run was owed | 0 | nobody's |
+| `RED` | the gate ran and is red; the design paying off | 2 | whoever changed the engine or the corpus |
+| `NOT EXECUTED` | a run exists but is `queued`/`waiting`/`pending`/`action_required`/`cancelled` | 2 | whoever merged: a check that has not finished is not a pass |
+| `NOT SCHEDULED` | the repository is not quiet, other workflows ran, this one did not | 2 | the owner of `ops/preflight` and this workflow |
+| `NOT RUNNING` | no workflow of any kind has run since before this commit was pushed | 2 | the organisation's Actions settings |
+| `ACTIONS DISABLED` | the dispatch probe was refused — the actual PRO-441 state | 2 | the organisation's Actions settings |
+| `UNPROVEN` | the API could not be read, so no verdict exists either way | 2 | whoever merged |
+
+Three properties are what make it worth the thirty seconds it costs to run:
+
+- **A green it did not see is not a pass.** `UNPROVEN` exits 2, including when no token is in
+  the environment. `--allow-unproven` exists for offline use: it prints a banner and changes
+  the closing line to *"a decision to merge without reading the check, not a pass"*. An empty
+  list from a query that was never made is not evidence of anything, and the first draft of
+  this guard printed "no workflow has run in this repository in the last 30 days" on a run that
+  had not asked — a true sentence about PRO-441 produced by a machine with no basis for it,
+  which is precisely how a fabricated diagnosis gets believed.
+- **Absence is separated from red, and a dead Actions from a dead trigger.** `NOT RUNNING` and
+  `NOT SCHEDULED` page different people, so the branch that chooses between them is not allowed
+  to fall through on a bad input: unparseable timestamps produce `UNPROVEN`, and the two sides
+  of the comparison are parsed into instants rather than compared as strings, because `git`
+  stamps a committer in UTC+8 with `12:00:00+08:00` while Actions answers `...Z`, and a string
+  compare ranks those by their sign character.
+- **The probe turns a suspicion into a named cause.** Read-only history can show that nothing
+  ran; it cannot show *why*. `--probe-ref` POSTs a real `workflow_dispatch` and records
+  GitHub's answer verbatim — which is what produced the `422` above. It is opt-in because a
+  successful probe costs ~6 minutes of a free Linux runner and prints that it caused the run.
+
+The `paths:` filter the `OUT OF SCOPE` verdict is decided from is mirrored in
+`ci_liveness_guard.GATE_PATHS` and **pinned against the YAML itself** by
+`TestCiLivenessGuard.test_the_path_mirror_is_the_workflows_paths`. That pin is load-bearing: a
+hand-copied list goes stale the day someone widens the filter, and a stale mirror certifies
+unguarded merges as out of scope — a silent green wearing a loud green face, which is the exact
+defect class this section is about. The same test class refuses the two edits that would
+"solve" a silent gate the wrong way: deleting the `paths:` filter, and making either job a
+required status check (PRO-295 review N2).
+
+**If Actions stops running again, this is what happens, stated plainly.**
+
+1. **Nothing in the repository notices, and nothing ever will.** Not a workflow, not a step,
+   not a schedule — every one of those is executed by the thing that stopped. A
+   `workflow_dispatch`-only canary, a cron job, a "check that CI is alive" job: all of them
+   are dead in exactly the case they would need to report. Detection has to live where merges
+   happen, which is outside Actions. That is why this script is in `ops/` and not in the YAML.
+2. **The absence leaves no artifact.** Because neither job is — or may be — a required status
+   check, a PR with no run shows no check row at all. It does not sit at "Expected — waiting",
+   it is simply not there, which is indistinguishable in the merge UI from a PR that never
+   needed one. The commit is merged, the review comments cite the last green that existed, and
+   the repository's history is indistinguishable from a healthy one.
+3. **The gate therefore runs on discipline, not on mechanism.** The merge is gated only if the
+   hand that merges runs the guard. `TestCiLivenessGuard` proves the guard answers correctly;
+   it cannot prove the guard was run. A merge done without it and a merge done with it on a
+   healthy repository produce the same history. Say that out loud rather than calling the
+   existence of the script a control: the residual hole is an unremembered run, and it is not
+   closable from inside the repository.
+4. **The first thing to check, in order.** `python3 ops/preflight/ci_liveness_guard.py --sha
+   <head> --probe-ref Playerbot`, then read which verdict came back. `NOT SCHEDULED` is this
+   file's problem and is fixable here. `NOT RUNNING`/`ACTIONS DISABLED` is above the repository
+   — organisation Actions settings or billing — and the only fix is the toggle that the
+   repository-scoped credential cannot read, let alone set. Do not "fix" it by editing the YAML;
+   the YAML was never the cause.
+5. **What the gate's absence does *not* mean.** It does not mean the corpus is clean. The sweep
+   is the only thing that has ever looked at all 3 060 files, and the boot gate does not
+   substitute for it: check 5 policy-checks only the files the updater has not applied yet. An
+   unguarded merge is not a passed merge; it is an unmeasured one.
 
 ## Dry run (check 5)
 

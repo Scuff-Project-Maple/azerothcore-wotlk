@@ -18,6 +18,18 @@ name: World DB pre-flight
 # meant to be read, and it is a real gate because a violating PR cannot hide the red.
 # If a branch-protection rule is ever wanted, it goes on a branch that only ever carries
 # in-scope changes, or this filter moves to `paths-ignore` of the unrelated trees.
+#
+# PRO-441 is why the sentence above ends in "meant to be read" rather than "is the gate":
+# this file was dead silently for four days. Actions had been disabled for the repository
+# from above while `GET /repos/.../actions/permissions` still answered `enabled: true`, so
+# nothing here ran on any branch — and nothing here could have said so, because a workflow
+# cannot report its own non-execution. That is what makes "read the check" something the
+# hand that merges has to do by hand: run ops/preflight/ci_liveness_guard.py for the
+# commit being merged (ops/preflight/README.md, "Liveness: the run that never existed").
+# It separates green, red, unscheduled and absent, and it refuses to call the last one a
+# pass. Do not answer a liveness failure by editing this file. The YAML was never the
+# cause, `paths:` was never the cause, and the fix for `NOT RUNNING` is a toggle that sits
+# above this repository.
 
 on:
   pull_request:

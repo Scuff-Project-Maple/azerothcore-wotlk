@@ -26,6 +26,8 @@ from preflight_worlddb import (
     NO_JSON_PAYLOAD_NOTE, BLANK_JSON_TARGET_NOTE,
 )
 
+import ci_liveness_guard as live
+
 HERE = Path(__file__).resolve().parent
 POLICY = json.loads((HERE / "preflight-policy.json").read_text())
 
@@ -9802,6 +9804,333 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
                          "the checkout is itself a mutant and the run above inserted a "
                          "second copy above it. Emission assertions passing alongside this "
                          "is expected: the red belongs to the fixture, not to the pin")
+
+
+class TestCiLivenessGuard(unittest.TestCase):
+    """PRO-441: a gate that never ran must not be readable as a pass.
+
+    The five review rounds before this one each cited a green sweep that had stopped
+    existing four days earlier, because the only thing that could report the absence was
+    the thing that had stopped running. These tests pin two things: the path mirror the
+    out-of-scope verdict is decided from, and every branch of `classify()` that decides
+    between "the gate is fine", "the gate is red", and "there is no gate".
+    """
+
+    HEAD = "85aa528fd11241fd38f96aba940245a6b28ec212"
+    PUSHED = "2026-11-10T04:06:47+00:00"
+    # The last run GitHub ever started for this repository before PRO-441.
+    LAST_ALIVE = "2026-11-06T22:41:32Z"
+
+    IN_SCOPE = ["ops/preflight/test_preflight_worlddb.py", "ops/preflight/README.md"]
+    OUT_SCOPE = ["src/server/scripts/Spells/spell_mage.cpp", "doc/x.md"]
+
+    # Recorded verbatim from the API on the day PRO-441 was filed. These are the two
+    # bodies that named the cause, and the reason a settings flag is not evidence: the
+    # dispatch was refused while the repository's Actions setting still read enabled.
+    DISPATCH_REFUSAL = {
+        "message": "Actions has been disabled for this repository.",
+        "documentation_url": "https://docs.github.com/rest/actions/workflows"
+                             "#create-a-workflow-dispatch-event",
+        "status": "422",
+    }
+    PERMISSIONS_LIE = {"enabled": True, "allowed_actions": "all",
+                       "sha_pinning_required": False}
+
+    @staticmethod
+    def _run(name=live.WORKFLOW_NAME, status="completed", conclusion="success", rid=1):
+        return {"name": name, "status": status, "conclusion": conclusion,
+                "event": "push", "id": rid, "created_at": "2026-11-10T04:07:00Z"}
+
+    def _classify(self, changed, runs=(), newest=None, **kw):
+        kw.setdefault("recent_known", True)
+        recent = [] if newest is None else [{"created_at": newest, "name": "ubuntu-build"}]
+        return live.classify(self.HEAD, list(changed), list(runs), recent,
+                             self.PUSHED, **kw)
+
+    # ------------------------------------------------------ the mirror, pinned to YAML ---
+
+    def _yaml_paths_blocks(self):
+        """The `paths:` lists the real workflow declares, read out of the real file.
+
+        Indent-scanned rather than regex-matched: both `paths:` blocks sit two levels
+        under `on:`, the two triggers carry comment lines between their keys, and a
+        regex over the whole file cannot tell a trigger's `paths:` from some future
+        step's. Scanning stops at the next top-level key so a `paths:` in a `jobs:`
+        block can never be mistaken for a trigger filter.
+        """
+        lines = (live.HERE.parents[1] / live.WORKFLOW_FILE).read_text().splitlines()
+        ons = [i for i, ln in enumerate(lines) if ln.rstrip() in ("on:", "true:", "'on':")]
+        self.assertTrue(ons, "no top-level `on:` key — the triggers cannot be located")
+        blocks, current = {}, None
+        i = ons[0] + 1
+        while i < len(lines):
+            ln = lines[i]
+            if ln.strip() and not ln.startswith(" "):
+                break                                   # next top-level key
+            indent = len(ln) - len(ln.lstrip())
+            stripped = ln.strip()
+            if indent == 2 and stripped.endswith(":") and not stripped.startswith("#"):
+                current = stripped[:-1]
+            elif indent == 4 and stripped == "paths:" and current:
+                got, j = [], i + 1
+                while j < len(lines) and lines[j].strip().startswith("- "):
+                    got.append(lines[j].strip()[2:].strip())
+                    j += 1
+                blocks[current] = got
+                i = j
+                continue
+            i += 1
+        return blocks
+
+    def test_the_path_mirror_is_the_workflows_paths(self):
+        """`GATE_PATHS` is a mirror, so it must be the workflow's own list.
+
+        An out-of-scope verdict is the only exit 0 this guard offers besides a green
+        run. Decide it from a hand-copied list and the day someone adds `tools/**` to
+        the filter, the guard starts certifying unguarded merges as out of scope — a
+        silent-green failure wearing a loud-green face, which is the exact defect class
+        this whole file exists to close.
+        """
+        blocks = self._yaml_paths_blocks()
+        self.assertIn("push", blocks, "the push trigger's paths: block is unparseable")
+        self.assertIn("pull_request", blocks)
+        self.assertEqual(live.GATE_PATHS, blocks["push"],
+                         "GATE_PATHS no longer mirrors the push trigger's paths:")
+        self.assertEqual(live.GATE_PATHS, blocks["pull_request"],
+                         "GATE_PATHS no longer mirrors the pull_request trigger's paths:")
+
+    def test_the_filters_were_not_deleted_and_nothing_was_made_required(self):
+        """PRO-441's fix is not allowed to be the wrong fix.
+
+        Two edits would "solve" a silent gate by creating a worse one: dropping the
+        `paths:` filter so every push runs a 6-minute sweep, and marking the job
+        required, which leaves every ordinary PR at "Expected — waiting" forever
+        (PRO-295 review N2). Both are refused here so the tradeoff has to be argued in
+        review rather than slipped into a liveness PR.
+        """
+        text = (live.HERE.parents[1] / live.WORKFLOW_FILE).read_text()
+        self.assertGreaterEqual(text.count("paths:"), 2,
+                                "both triggers must keep a paths: filter")
+        for pattern in live.GATE_PATHS:
+            self.assertIn(f"- {pattern}", text, f"{pattern} vanished from the filter")
+        self.assertIn("Do not mark either job as a required status check", text,
+                      "the reason these jobs are not required checks has to stay in "
+                      "the file next to the triggers, not only in the README")
+        self.assertNotIn("required status check:", text)
+        for trigger in ("pull_request:", "push:", "workflow_dispatch:"):
+            self.assertIn(trigger, text, f"{trigger} trigger removed — the dispatch "
+                                          "proof PRO-441 was asked for needs it")
+
+    def test_glob_depth_and_segment_semantics(self):
+        self.assertEqual(["ops/preflight/a.py", "ops/preflight/sub/b.py"],
+                         live.in_gate_scope(
+                             ["ops/preflight/a.py", "ops/preflight/sub/b.py",
+                              "ops/preflightx/c.py", "ops/preflightx/sub/d.py",
+                              "data/other/d.sql"]),
+                         "`**` must reach any depth and must not escape the directory")
+        self.assertEqual([], live.in_gate_scope(["ops/preflight"]))
+        self.assertEqual(["ops/preflight/sub/deep/e.py"], live.in_gate_scope(
+            ["ops/preflight/sub/deep/e.py"]))
+        self.assertEqual(["data/sql/base/db_world/x.sql"], live.in_gate_scope(
+            ["data/sql/base/db_world/x.sql", "docs/sql.md", "data/sqlx/y.sql"]))
+        self.assertEqual([], live.in_gate_scope(["ops/preflight"]))
+        self.assertEqual([live.WORKFLOW_FILE], live.in_gate_scope([live.WORKFLOW_FILE]))
+
+    # --------------------------------------------------------------- the recorded case ---
+
+    def test_recorded_dispatch_refusal_names_the_cause(self):
+        """Replay of PRO-441: the refusal outranks a settings flag that says otherwise.
+
+        This is the acceptance criterion — the cause is named by the response that shows
+        it. A guard that read `GET /actions/permissions` and stopped would have reported
+        `enabled: true` and let the merge through.
+        """
+        probe = {"status": 422, "message": self.DISPATCH_REFUSAL["message"],
+                 "ref": "Playerbot", "disabled": True, "started": False}
+        v = self._classify(self.IN_SCOPE, newest=self.LAST_ALIVE, probe=probe,
+                           permissions=self.PERMISSIONS_LIE)
+        self.assertEqual("ACTIONS DISABLED", v["verdict"])
+        self.assertEqual(2, live.EXIT_FOR[v["verdict"]])
+        self.assertIn("Actions has been disabled for this repository.", v["why"])
+        self.assertIn("enabled=True", v["why"],
+                      "the refusal has to name the contradiction, or the next reader "
+                      "goes looking at the repository settings again")
+        self.assertIn("above the repository", v["fixOwner"])
+
+    def test_a_started_probe_is_not_read_as_a_refusal(self):
+        probe = {"status": 204, "message": None, "ref": "Playerbot",
+                 "disabled": False, "started": True}
+        v = self._classify(self.IN_SCOPE, newest=self.LAST_ALIVE, probe=probe,
+                           permissions=self.PERMISSIONS_LIE)
+        self.assertNotEqual("ACTIONS DISABLED", v["verdict"])
+        self.assertEqual("NOT RUNNING", v["verdict"])
+
+    # -------------------------------------------------------------------- no evidence ---
+
+    def test_history_never_read_cannot_claim_nothing_ran(self):
+        """`[]` from a call that was never made is not the same as `[]` from an empty repo.
+
+        The first draft of this guard printed "no workflow has run in this repository in
+        the last 30 days" on a tokenless run. That sentence was true of PRO-441 and was
+        being produced by a machine that had not asked, which is how a fabricated
+        diagnosis gets believed.
+        """
+        v = live.classify(self.HEAD, self.IN_SCOPE, [], [], self.PUSHED,
+                          recent_known=False)
+        self.assertEqual("UNPROVEN", v["verdict"])
+        self.assertNotIn("no workflow has run", v["why"])
+        self.assertNotIn("newest run", v["why"])
+        self.assertEqual(2, live.EXIT_FOR["UNPROVEN"])
+
+    def test_api_error_is_unproven_not_absent(self):
+        v = self._classify(self.IN_SCOPE, newest=self.LAST_ALIVE,
+                           api_error="URLError: unreachable")
+        self.assertEqual("UNPROVEN", v["verdict"])
+        self.assertIn("unreachable", v["why"])
+
+    def test_unparseable_dates_refuse_rather_than_guess(self):
+        """NOT RUNNING and NOT SCHEDULED have different owners, so the branch that picks
+        between them cannot be decided by a timestamp that failed to parse."""
+        # `""` is what `git show -s --format=%cI` yields for a SHA it cannot resolve,
+        # and `None` is what the guard gets when a caller forgets the flag; both used to
+        # fall through to NOT SCHEDULED, which sends the reader to the YAML.
+        for bad in ("yesterday", "", None):
+            v = live.classify(self.HEAD, self.IN_SCOPE, [],
+                              [{"created_at": self.LAST_ALIVE}], bad, recent_known=True)
+            self.assertEqual("UNPROVEN", v["verdict"], f"{bad!r} was not refused")
+
+    def test_offsets_are_compared_as_instants_not_strings(self):
+        """`...Z` and `...+08:00` must not be ranked by their sign character.
+
+        A committer in UTC+8 pushing 04:00Z gets `12:00:00+08:00` stamped on the commit.
+        String comparison puts that *after* `06:00:00Z`, so a repository whose Actions
+        was alive an hour after the push would be declared dead — a false NOT RUNNING is
+        loud, but it is loud about the wrong thing, and the loud-but-wrong verdict is
+        what sends someone to edit org settings nobody broke.
+        """
+        v = live.classify(self.HEAD, self.IN_SCOPE, [],
+                          [{"created_at": "2026-11-06T22:41:32Z"}],
+                          "2026-11-07T06:00:00+08:00", recent_known=True)
+        self.assertEqual("NOT SCHEDULED", v["verdict"],
+                          "06:00+08:00 is 22:00Z on the 6th, before the newest run — "
+                          "a string compare calls this quiet")
+        v = live.classify(self.HEAD, self.IN_SCOPE, [],
+                          [{"created_at": "2026-11-06T22:41:32Z"}],
+                          "2026-11-07T07:00:00+08:00", recent_known=True)
+        self.assertEqual("NOT RUNNING", v["verdict"],
+                          "07:00+08:00 is 23:00Z, after the newest run")
+
+    # ------------------------------------------------------------------- the two absences ---
+
+    def test_in_scope_with_the_repository_quiet_is_not_running(self):
+        v = self._classify(self.IN_SCOPE, newest=self.LAST_ALIVE)
+        self.assertEqual("NOT RUNNING", v["verdict"])
+        self.assertEqual(2, live.EXIT_FOR[v["verdict"]])
+        self.assertIn("organisation's Actions settings", v["fixOwner"])
+        # The sentence that makes this actionable rather than alarming.
+        self.assertIn("the thing that stopped running", v["why"])
+
+    def test_in_scope_with_the_repository_alive_is_not_scheduled(self):
+        v = self._classify(self.IN_SCOPE,
+                           runs=[self._run(name="ubuntu-build")],
+                           newest="2026-11-10T04:09:00Z")
+        self.assertEqual("NOT SCHEDULED", v["verdict"])
+        self.assertIn("paths:", v["why"])
+        self.assertIn("owner of ops/preflight", v["fixOwner"])
+        self.assertIn("ubuntu-build", v["why"],
+                      "the verdict has to name the workflow that did run, or 'Actions "
+                      "is executing' is an unverified claim")
+
+    def test_zero_runs_anywhere_is_not_running_not_a_filter_bug(self):
+        v = self._classify(self.IN_SCOPE, newest=None)
+        self.assertEqual("NOT RUNNING", v["verdict"])
+
+    def test_out_of_scope_is_a_pass_only_while_the_repository_is_not_quiet(self):
+        v = self._classify(self.OUT_SCOPE, newest="2026-11-10T04:09:00Z")
+        self.assertEqual("OUT OF SCOPE", v["verdict"])
+        self.assertEqual(0, live.EXIT_FOR[v["verdict"]])
+        v = self._classify(self.OUT_SCOPE, newest=self.LAST_ALIVE)
+        self.assertEqual("NOT RUNNING", v["verdict"],
+                          "an out-of-scope merge is the last thing someone checks "
+                          "before an in-scope one goes through unguarded")
+
+    def test_out_of_scope_names_the_unread_history(self):
+        v = live.classify(self.HEAD, self.OUT_SCOPE, [], [], self.PUSHED,
+                          recent_known=False)
+        self.assertEqual("OUT OF SCOPE", v["verdict"])
+        self.assertIn("could not be read", v["why"])
+
+    # --------------------------------------------------------------------- states of a run ---
+
+    def test_green_run_is_the_only_pass(self):
+        v = self._classify(self.IN_SCOPE, runs=[self._run()], newest=self.LAST_ALIVE)
+        self.assertEqual("PRESENT", v["verdict"])
+        self.assertEqual(0, live.EXIT_FOR[v["verdict"]])
+
+    def test_a_run_that_has_not_finished_is_not_a_pass(self):
+        for status, conclusion in (("queued", None), ("waiting", None),
+                                   ("pending", None), ("in_progress", None),
+                                   ("action_required", None),
+                                   ("completed", "cancelled")):
+            with self.subTest(status=status, conclusion=conclusion):
+                v = self._classify(self.IN_SCOPE,
+                                   runs=[self._run(status=status, conclusion=conclusion)],
+                                   newest=self.LAST_ALIVE)
+                self.assertEqual("NOT EXECUTED", v["verdict"])
+                self.assertEqual(2, live.EXIT_FOR[v["verdict"]])
+
+    def test_red_is_named_as_the_gate_working(self):
+        """"Red" and "absent" must not share a sentence. The first is the design paying
+        off, the second is the design failing, and a reviewer who cannot tell them apart
+        will start treating red as evidence that nothing works."""
+        v = self._classify(self.IN_SCOPE,
+                           runs=[self._run(status="completed", conclusion="failure")],
+                           newest=self.LAST_ALIVE)
+        self.assertEqual("RED", v["verdict"])
+        self.assertIn("working as designed", v["why"])
+        self.assertNotIn("never ran", v["why"])
+
+    def test_a_run_of_a_different_name_is_not_our_gate(self):
+        v = self._classify(self.IN_SCOPE,
+                           runs=[self._run(name="World DB pre-flight (legacy)")],
+                           newest="2026-11-10T04:09:00Z")
+        self.assertEqual("NOT SCHEDULED", v["verdict"],
+                          "a renamed job must not satisfy the check it replaced")
+
+    def test_every_verdict_the_guard_can_produce_has_an_exit_code(self):
+        produced = set()
+        for changed, runs, newest, kw in [
+            (self.IN_SCOPE, [self._run()], self.LAST_ALIVE, {}),
+            (self.IN_SCOPE, [self._run(conclusion="failure")], self.LAST_ALIVE, {}),
+            (self.IN_SCOPE, [self._run(status="queued")], self.LAST_ALIVE, {}),
+            (self.IN_SCOPE, [], self.LAST_ALIVE, {}),
+            (self.IN_SCOPE, [], None, {}),
+            (self.OUT_SCOPE, [], "2026-11-10T04:09:00Z", {}),
+            (self.IN_SCOPE, [], self.LAST_ALIVE, {"api_error": "boom"}),
+            (self.IN_SCOPE, [], self.LAST_ALIVE,
+             {"probe": {"status": 422, "disabled": True, "message": "disabled",
+                        "started": False, "ref": "Playerbot"}}),
+        ]:
+            produced.add(self._classify(changed, runs=runs, newest=newest, **kw)["verdict"])
+        self.assertTrue(produced, "the sweep above produced no verdict at all")
+        missing = produced - set(live.EXIT_FOR)
+        self.assertEqual(set(), missing,
+                         f"classify() can produce {missing}, which EXIT_FOR does not "
+                         "know the exit code for — an unmapped verdict would default to "
+                         "2 by accident rather than by decision")
+        self.assertTrue(all(c in (0, 2) for c in live.EXIT_FOR.values()),
+                        "the workflow and the merge helper both read 0/2; anything "
+                        "else in the table is a code nobody handles")
+
+    def test_verdicts_are_not_duplicated_in_the_docs(self):
+        """The README is the operator-facing copy of these verdicts; drift is a lie in
+        the doc that tells someone who to page."""
+        readme = (live.HERE / "README.md").read_text()
+        for name in ("NOT RUNNING", "NOT SCHEDULED", "NOT EXECUTED", "UNPROVEN",
+                     "OUT OF SCOPE"):
+            self.assertIn(name, readme, f"{name} is emitted by the guard but is not in "
+                                        "the README's verdict table")
+        self.assertIn("ci_liveness_guard.py", readme)
 
 
 if __name__ == "__main__":
