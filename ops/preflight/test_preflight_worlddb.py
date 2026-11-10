@@ -6387,6 +6387,31 @@ fi
     # block and not at an offset in a string.
     WRAPPER_REFUSAL_BLOCK_FROZEN_LINES = WRAPPER_REFUSAL_BLOCK_FROZEN.splitlines()
 
+    # The five lines the wrapper runs immediately BEFORE the refusal block — the capture
+    # replay that hands the operator everything the gate said, plus the blank line the
+    # wrapper keeps between that replay and the block's column-0 opener. Frozen for the
+    # same reason the block is, and one row further up (PRO-434 NB-1): the golden pins the
+    # opener as the region's first line, so an insertion ABOVE it is outside the compared
+    # region while still being code every refused boot runs. The emission pin closes the
+    # `tell`-on-stderr shape that hole took; this closes the hole itself, because it does
+    # not care what the inserted lines do, which stream they write, or how their guard is
+    # spelled. Anything that moves the opener off the line under this `fi` breaks byte
+    # identity here.
+    #
+    # It is pinned as the whole block rather than as "the line above the opener is `fi`"
+    # because `fi` alone is the weakest line in bash to key on, and because the replay block
+    # is the block whose capture the refusal arms read their markers from — the two are one
+    # unit in the wrapper and are reviewed as one unit here. The blank is pinned with them:
+    # the bound is byte identity across the seam, so a wrapper that closes the gap has to say
+    # so here rather than leave the reader guessing which of the two blocks moved.
+    REFUSAL_BLOCK_PREDECESSOR_LINES = (
+        'if [[ -n "$GATE_DIR" ]]; then',
+        '  cat "$GATE_OUT" 2>/dev/null || true',
+        '  cat "$GATE_ERR" >&2 2>/dev/null || true',
+        'fi',
+        '',
+    )
+
     # A second, deliberately simpler `if`/`fi` reader, used only to audit the pinned block
     # (`test_the_frozen_refusal_block_is_a_balanced_block_and_not_a_hollow_copy`) and to find
     # the arm closers a mutant may de-indent (`_arm_closing_fis`) — never to bound the live
@@ -6440,9 +6465,14 @@ fi
         widened, re-indented or reworded without this suite saying so. The region is the
         whole executed block — the column-0 `if (( rc != 0 )); then` through the `fi` that
         closes it — and the top edge is pinned too: `start` is found from the anchor, so the
-        line above the anchor is asserted to BE that opener before anything is scanned,
-        which is what stops the golden from describing a block that starts one line below
-        the one bash runs (PRO-413 re-review B1). The history is why it is a frozen region
+         line above the anchor is asserted to BE that opener before anything is scanned,
+         which is what stops the golden from describing a block that starts one line below
+         the one bash runs (PRO-413 re-review B1). The top edge is pinned one row higher
+         still: the lines above that opener have to be the capture replay it follows
+         (`REFUSAL_BLOCK_PREDECESSOR_LINES`), so an insertion in the seam between the two
+         blocks breaks byte identity here instead of hiding above the region — the shape
+         PRO-434 NB-1 found still green at the head that pinned the opener alone. The
+         history is why it is a frozen region
         and not a rule: PRO-407 found "the first `fi` in column 0" fail-open, PRO-413
         replaced that with a nesting balance plus the column-0 `fi` as a cross-check,
         PRO-422 B1 showed that a flat-body assumption cannot describe the nested script this
@@ -6491,6 +6521,29 @@ fi
                 "starts on that opener, so whatever sits between it and the anchor is part "
                 "of what the operator is handed on a refused boot and has to be reviewed "
                 "with the block (PRO-413 re-review B1).")
+        # And one row further up. The opener check above says the region starts on the
+        # opener; it cannot say the opener is still the line the wrapper reaches straight
+        # after replaying the capture, so three lines dropped between the two satisfy every
+        # check so far and the golden still compares byte-identical (PRO-434 NB-1 — the
+        # shape a reviewer walked through at `0a58be29d` while the whole suite stayed green,
+        # because it neither used `tell` nor the guard spelling the pins key on). Keying on
+        # the predecessor rather than on the insert is what makes this bound general: it is
+        # indifferent to the channel the insertion writes and to how its condition is
+        # spelled, since it never looks at the insertion at all.
+        pred = list(self.REFUSAL_BLOCK_PREDECESSOR_LINES)
+        above = lines[start - 1 - len(pred):start - 1]
+        if above != pred:
+            self.fail(
+                f"the refusal block in {name} does not directly follow the capture replay "
+                f"that feeds it. The {len(pred)} lines above the opener "
+                f"{self.REFUSAL_BLOCK_OPENER!r} are {above}, not the pinned "
+                f"{pred}. The golden region starts on that opener, so anything inserted "
+                "between the replay and the block runs on every refused boot while staying "
+                "outside everything this suite compares — the region, the fragment scan and "
+                "the emission pin's per-arm sets (PRO-434 NB-1). If the replay block really "
+                "did change, move `REFUSAL_BLOCK_PREDECESSOR_LINES` in the same commit as "
+                "the wrapper and expect the capture-block regressions PRO-390 named to hold "
+                "the new shape.")
         # The right bound, walked command-by-command from that opener rather than assumed
         # flat (PRO-422 B1) — and read as the diagnostic it is, because PRO-428 B1 is the
         # measured shape where a line-local walk and the column-0 scan agree on the same
@@ -6620,16 +6673,21 @@ fi
         fooled walk — that probe plants its own `exit "$rc"` — which is exactly why it needs
         a case of its own rather than riding on the mutants.)
         """
-        no_tail = [
+        # The pinned predecessor replay sits above the opener now (PRO-434 NB-1), so the
+        # fixture carries it: every check up to the tail pin has to PASS here, and the
+        # predecessor check is one of those checks. Line numbers in the refusal below are
+        # counted from the whole fixture, opener at line 6, close at line 9.
+        no_tail = list(self.REFUSAL_BLOCK_PREDECESSOR_LINES) + [
             "if (( rc != 0 )); then",
             '  tell "REFUSING BOOT — pre-flight failed (exit $rc)."',
             '  tell "                  Do not bypass this gate."',
             "fi",
         ]
-        self.assertEqual((1, 0), self._shell_if_fi(no_tail[0]),
+        opener = len(self.REFUSAL_BLOCK_PREDECESSOR_LINES)
+        self.assertEqual((1, 0), self._shell_if_fi(no_tail[opener]),
                          "the fixture no longer opens on a structural `if`, so this is not "
                          "the block the tail pin is being asked about")
-        self.assertEqual(3, self._refusal_block_end(no_tail, 0, "synthetic"),
+        self.assertEqual(opener + 3, self._refusal_block_end(no_tail, opener, "synthetic"),
                          "the bound moved, so the failure below could be a bound failure "
                          "rather than the tail pin doing its job")
         with self.assertRaises(AssertionError) as got:
@@ -6637,7 +6695,7 @@ fi
         msg = str(got.exception)
         self.assertIn("does not end where this guard believes it ends", msg,
                       "the refusal did not come from the tail pin: " + msg)
-        self.assertIn("the `fi` at line 4", msg,
+        self.assertIn("the `fi` at line 9", msg,
                       "the refusal does not name the bound it refuses: " + msg)
         self.assertIn(self.REFUSAL_BLOCK_TAIL, msg,
                       "the refusal does not name the tail the block is missing: " + msg)
@@ -7346,20 +7404,68 @@ fi
                              self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES)))
 
     def _refusal_region_as_pinned_before_PRO_413_rereview(self, lines: list) -> list:
-        """The golden as PRO-413 shipped it: anchored on the anchor, not on the opener.
+        """The golden exactly as PRO-413 shipped it: cut anchor-down, and byte-compared.
 
         A second, weaker copy of the pin on purpose (the same role
-        `_region_and_fragments_as_before_PRO_413()` plays for the bound). Re-review B1 was
-        possible because this region starts one line BELOW the block bash runs, so it cannot
-        see what sits between the opener and the anchor. It comment-strips like the live
-        scan does, so the comparison below is about the top edge and nothing else.
+        `_region_and_fragments_as_before_PRO_413()` plays for the bound). The guard that
+        shipped in `4a25bf0d7` cut the region from the ANCHOR to the first `fi` in column
+        0 and compared those 77 lines byte-for-byte against `WRAPPER_REFUSAL_BLOCK_FROZEN_LINES`
+        minus its opener line, so this reproduces both halves — the cut AND the comparison,
+        which an earlier draft of this helper only claimed. The lines are raw, as they were
+        at the head that shipped: byte identity against the golden is the whole check, and
+        comment-stripping it would copy the wrong behaviour.
+
+        The weakness is the cut, and it is the reason re-review B1 was possible: the region
+        starts one line BELOW the block bash runs, so what sits between the opener and the
+        anchor reaches neither the cut nor the comparison. A green return from here on a
+        mutant is therefore the negative control — the shipped pin accepted it.
+
+        That claim used to be true only by luck of where the mutants sat, because the guard
+        that shipped in `4a25bf0d7` did not cut at the first column-0 `fi`: it computed an
+        `end` by `if`/`fi` nesting balance and then FAILED unless the first column-0 `fi`
+        agreed with it. A copy that cuts on the column-0 `fi` alone would go green on a
+        mutant where the two bounds disagree, and report "the shipped pin accepted this"
+        when the shipped pin would have refused it — a false negative control, which is the
+        worst kind of test to trust (PRO-434 NB-4). The cross-check is mirrored below, so a
+        green return is the shipped pin accepting it by construction rather than by the
+        accident of where the above-anchor mutants happen to sit. The anchor's own
+        structural-`if` check that the shipped guard also ran is NOT mirrored: it is
+        unreachable for the mutants this helper is asked about, and naming that is cheaper
+        than pretending to the copy.
         """
         start = next(i for i, ln in enumerate(lines) if self.REFUSAL_BLOCK_ANCHOR in ln)
-        end = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
-        if end is None:
-            raise AssertionError("no column-0 `fi` closes the region, so the old pin had "
-                                 "nothing to compare either")
-        return lines[start:end + 1]
+        col0 = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
+        if col0 is None:
+            self.fail("no column-0 `fi` closes the region, so the old pin had "
+                      "nothing to compare either")
+        depth = 1  # the anchor sits in the body of the `if` this region is cut short of
+        end = None
+        for i in range(start + 1, len(lines)):
+            opens, closes = self._shell_if_fi(lines[i])
+            depth += opens - closes
+            if depth == 0:
+                end = i
+                break
+        self.assertIsNotNone(
+            end,
+            "the nesting balance never closes the region, so the shipped guard would have "
+            "failed here rather than compare anything, and this copy has no business "
+            "returning green")
+        self.assertEqual(
+            col0, end,
+            "the two bounds the shipped guard compared disagree — the first column-0 `fi` "
+            f"is line {col0 + 1} and the nesting balance closes on line {end + 1} — so the "
+            "guard that shipped in 4a25bf0d7 would have FAILED on this wrapper rather than "
+            "compare the region. Returning green here would be a false negative control "
+            "(PRO-434 NB-4); the mutant belongs with "
+            "`test_a_column_zero_arm_fi_fails_the_bound_instead_of_the_pipeline` instead.")
+        region = lines[start:col0 + 1]
+        self.assertEqual(
+            self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES[1:], region,
+            "the anchor-down golden has moved, and this copy has no business moving it: "
+            "it exists to show what the shipped pin could not see, byte-for-byte, so it "
+            "has to stay the bytes the shipped pin compared")
+        return region
 
     # PRO-413 re-review B1. The gap the anchor-down golden could not see is one line wide in
     # the wrapper as merged, but it is a gap and not a constant, so these mutants fill it.
@@ -7437,8 +7543,10 @@ fi
                         "no longer something every refused boot prints")
 
         # The negative control, and the load-bearing one: the golden as PRO-413 shipped it —
-        # anchored on the anchor — cannot see the inserted lines, and the fragments it does
-        # see are still EXACTLY the three the seam tests compare. So neither
+        # anchored on the anchor and byte-compared against the golden-minus-opener, both
+        # halves reproduced by the helper — cannot see the inserted lines, and the fragments
+        # it does see are still EXACTLY the three the seam tests compare. A green call here
+        # therefore IS the shipped guard accepting this mutant. So neither
         # `test_the_wrapper_still_quotes_both_gate_lines_the_gate_emits`'s set equality nor
         # `test_every_fragment_the_wrapper_quotes_is_a_line_the_gate_really_emits`'s would
         # have said a word, while the operator was handed a fourth single-quoted notice.
@@ -8150,19 +8258,20 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
     # route is reached by naming a path that is not there — the operator's typo, which is
     # how it happens in the field. The driver still builds `policy.json` and the tree;
     # `main()` returns before either is reached, which is the point: the shape under test
-    # is the earliest `_emit`-backed exit `main()` has, and the one whose report goes to
-    # `sys.stderr`. `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4691` is
-    # earlier still and writes its usage error to `sys.stderr` directly — never through
-    # `_emit`, so nothing retires it — which is a separate gap (PRO-389 review N-a) and not
-    # what these pins drive.
+    # is the earliest `_emit`-backed exit `main()` has, and one of the two whose report goes
+    # to `sys.stderr` — the other is the operational-error return at
+    # `preflight_worlddb.py:4716-4718`, which this family does not drive.
+    # `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4692` is earlier still
+    # and writes its usage error to `sys.stderr` directly — never through `_emit`, so nothing
+    # retires it — which is a separate gap (PRO-389 review N-a) and not what these pins drive.
     _MAIN_ARGV = ('["--compose-root", str(td / "tree"), "--policy", str(td / "policy.json"), '
                   '"--json", str(td / "verdict.json")]')
     _MAIN_ARGV_MISSING_POLICY = ('["--compose-root", str(td / "tree"), "--policy", '
                                  'str(td / "absent.json"), "--json", str(td / "verdict.json")]')
     # The third route, for the `EXIT_ERROR` return whose report does *not* go to
     # `sys.stderr`: `--json ""` is "evidence asked for, produced none" (PRO-352), so the
-    # report is emitted on `sys.stdout` (`preflight_worlddb.py:4789`) and the two notice
-    # lines on `sys.stderr` (`:4799-4800`). There primary and fallback are two objects,
+    # report is emitted on `sys.stdout` (`preflight_worlddb.py:4795-4796`) and the two notice
+    # lines on `sys.stderr` (`:4805-4808`). There primary and fallback are two objects,
     # which is the pairing the missing-policy return cannot show.
     _MAIN_ARGV_BLANK_JSON = ('["--compose-root", str(td / "tree"), "--policy", '
                              'str(td / "policy.json"), "--json", ""]')
@@ -8409,7 +8518,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_FAIL, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` still costs the gate its rc: "
-                             f"rc={proc.returncode} stderr={proc.stderr}")
+                             f"rc={proc.returncode} "
+                             f"(stderr is empty by construction under 2>&1)")
             payload = Path(td) / "verdict.json"
             self.assertTrue(payload.is_file(),
                             "the evidence has to survive both descriptors being full")
@@ -8436,7 +8546,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=120 story in the pair test proves nothing ({proc.stderr})")
+                             f"the rc=120 story in the pair test proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertTrue((Path(td) / "verdict.json").is_file(),
                             "even the pre-fix build wrote the payload before presenting")
 
@@ -8445,7 +8556,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         """PRO-389 N2: the `EXIT_ERROR` route under `> /dev/full 2>&1` — the unpinned half.
 
         `_emit` has a second primary. `main()` returns `EXIT_ERROR` from three places, and
-        the one this pin drives — the missing `--policy` at `preflight_worlddb.py:4696-4697`
+        the one this pin drives — the missing `--policy` at `preflight_worlddb.py:4696-4698`
         — aims the report at `sys.stderr`; at startup `sys.stderr is sys.__stderr__`, so
         inside `_emit` the primary and the fallback are the *same object*. The report line
         and the notice line land in one buffer on one refusing descriptor, and there is no
@@ -8454,10 +8565,10 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         different stream, so none of them reaches that identity — which is why this route
         could sit unpinned while looking covered. (The three in-process `EXIT_ERROR` rc
         pins in the blank/whitespace `--json` family — `test_a_blank_json_target_refuses_the_boot`
-        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 360
+        and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 440-510
         lines and a class boundary above this one — are not end-to-end: they run `main()`
-        under `_drive_main`, which swaps the streams inside the child and so cannot see the
-        interpreter's teardown flush that costs 120.)
+        under `_drive_main`, which swaps the streams in the test process itself and so
+        cannot see the interpreter's teardown flush that costs 120.)
 
         Measured on 3.12.3 at `d97932345` this exits **2**, not 120. On this return the two
         `_retire_broken_stream` calls in `_emit` act on one object, so either one alone
@@ -8465,7 +8576,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         not by itself show which half of the fix saves the route, and this pin credits
         neither. The controls carry the asymmetry instead: on the `EXIT_FAIL` route either
         call removed on its own costs 120, while on the other `EXIT_ERROR` return — the
-        payload write failure / blank `--json` at `preflight_worlddb.py:4791-4803`, whose
+        payload write failure / blank `--json` at `preflight_worlddb.py:4797-4809`, whose
         report goes to `sys.stdout` — leaving only the `sys.stdout` retirement is no longer
         enough, which is what that route's own control below pins. "Passes today" is not a pin
         either way, and the failure class is the one `flush_std_files()` owns: bytes a device
@@ -8486,7 +8597,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(P.EXIT_ERROR, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
-                             f"the error route too: rc={proc.returncode} stderr={proc.stderr}")
+                             f"the error route too: rc={proc.returncode} "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the missing-policy return happens before the evidence write, so "
                              "the rc is the only thing this route can report")
@@ -8508,7 +8620,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the pre-fix build returned before the payload too; if this flips "
                              "the two tests are no longer driving the same route")
@@ -8517,10 +8630,10 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self):
         """PRO-389 review B1/N-b: the `EXIT_ERROR` return whose primary is *not* `sys.stderr`.
 
-        `main()`'s third `EXIT_ERROR` return (`preflight_worlddb.py:4791-4803`) is reached
+        `main()`'s third `EXIT_ERROR` return (`preflight_worlddb.py:4797-4809`) is reached
         with `--json ""` — evidence asked for and none produced (PRO-352) — and it presents
-        the other way round: the report goes to `sys.stdout` (`:4789`) and the two notice
-        lines to `sys.stderr` (`:4799-4800`). Primary and fallback are two different
+        the other way round: the report goes to `sys.stdout` (`:4795-4796`) and the two notice
+        lines to `sys.stderr` (`:4805-4808`). Primary and fallback are two different
         objects there, so the one-object identity that lets the missing-policy return above
         survive either retirement call alone does not exist. Measured on 3.12.3 under
         `> /dev/full 2>&1`: unpatched it exits **2**. The control below patches
@@ -8530,7 +8643,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         does *not* cost it 120 is blocking only the second call, nor the genuine pre-PRO-372
         `_emit` with nothing but the `if fallback_refused:` retirement deleted: both exit
         **2**, because this route runs more than one `_emit` and the pair at
-        `preflight_worlddb.py:4799-4800` carries its own *primary* retirement, which in the
+        `preflight_worlddb.py:4805-4808` carries its own *primary* retirement, which in the
         pre-372 build lands on the same `sys.__stderr__` the skipped fallback call would have
         covered. That is also why the control's predicate is strictly stronger than pre-372
         rather than equal to it — it drops that second primary call too.
@@ -8558,7 +8671,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             self.assertEqual(P.EXIT_ERROR, proc.returncode,
                              f"the operator's `> /dev/full 2>&1` changed the gate's verdict on "
                              f"the evidence-write route too: rc={proc.returncode} "
-                             f"stderr={proc.stderr}")
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "a blank `--json` target must never touch the filesystem, so the "
                              "rc is the only thing this route can report")
@@ -8593,7 +8706,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
             proc = self._drive_real_main_through_shell(driver, td, "> /dev/full 2>&1")
             self.assertEqual(120, proc.returncode,
                              f"the fixture no longer reaches the interpreter's final flush, so "
-                             f"the rc=2 pin above proves nothing ({proc.stderr})")
+                             f"the rc=2 pin above proves nothing "
+                             f"(stderr is empty by construction under 2>&1)")
             self.assertFalse((Path(td) / "verdict.json").is_file(),
                              "the suppressed-retirement build never wrote the payload either; "
                              "if this flips the two tests are no longer driving the same route")
@@ -8603,7 +8717,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
 
         The two pins above can only claim their rc — under `2>&1` fd 2 delivers nothing to
         the parent, and an `argparse` usage error exits 2 as well
-        (`preflight_worlddb.py:4691`, the gap PRO-389 review N-a routed to PRO-406), so rc
+        (`preflight_worlddb.py:4692`, the gap PRO-389 review N-a routed to PRO-406), so rc
         alone does not say which `EXIT_ERROR` return ran. Here only fd 1 sits on the refusing
         device, so fd 2 is live and the route can name itself: the `_emit` notice about the
         report, the PRO-352 blank-target line and the evidence-write refusal all have to
@@ -9629,13 +9743,23 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
         'if [ "$1" = "-" ]; then exec "$REALPY" - "$2"; fi\n'
     )
 
-    def _run_hostile(self, gate_body, *, check_only=True, tmpdir=None):
+    def _run_hostile(self, gate_body, *, check_only=True, tmpdir=None, wrapper=None):
         """Run the real wrapper once against a stub gate, on PRO-390's shape.
 
         `gate_body` is the shell the stub runs after the lease-check passthrough. The
         stub records that the gate ran (``$GATE_MARKER``) and a fake ``docker`` on PATH
         records that a boot happened (``$DOCKER_MARKER``), so "the gate ran" and "the
         container started" are both observable rather than inferred.
+
+        `wrapper` overrides the script that is run — for mutants, so they go through
+        the same execution path the real wrapper is tested on and not a re-implementation
+        of it (the PRO-413 rule for every mutant in this file).
+
+        Both operator streams are captured, not just stderr. The wrapper's `tell` writes to
+        stderr, so a pin that reads only stderr cannot tell a refused boot that hands the
+        operator one notice from one that hands them four (PRO-434 NB-1); the return dict
+        therefore carries `stdout` next to `stderr` and callers that care about what the
+        terminal was handed have to look at both.
         """
         import datetime
         import os
@@ -9702,10 +9826,12 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
             env.pop("PREFLIGHT_CHECK_ONLY", None)
 
         err = td / "stderr.txt"
-        argv = ["bash", str(self.WRAPPER), "--json", str(td / "v.json")]
-        with open(err, "w", encoding="utf-8") as fh:
+        out = td / "stdout.txt"
+        argv = ["bash", str(wrapper or self.WRAPPER), "--json", str(td / "v.json")]
+        with open(err, "w", encoding="utf-8") as efh, \
+                open(out, "w", encoding="utf-8") as ofh:
             proc = subprocess.run(
-                argv, env=env, cwd=str(td), stdout=subprocess.DEVNULL, stderr=fh,
+                argv, env=env, cwd=str(td), stdout=ofh, stderr=efh,
                 timeout=60,
             )
         return {
@@ -9713,6 +9839,7 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
             "docker_ran": docker_marker.is_file(),
             "gate_ran": gate_marker.is_file(),
             "stderr": err.read_text(encoding="utf-8", errors="replace"),
+            "stdout": out.read_text(encoding="utf-8", errors="replace"),
         }
 
     def test_a_signal_to_the_wrapper_during_the_gate_does_not_start_the_container(self):
@@ -9817,6 +9944,389 @@ class TestTheWrapperRoutesItsAdvice(unittest.TestCase):
         self.assertNotIn(
             "cannot say whether this is about your SQL", self._folded(proc.stderr)
         )
+
+    # -- the refusal block's EMISSION, not its text ------------------------------------ #
+    #
+    # Every PRO-413 pin reads the refusal block as text: a golden compared line by line,
+    # a scan of the single-quoted fragments inside the region. The re-review's residual
+    # hole is the shape that shares a blind spot with all of them — three lines inserted
+    # ABOVE the block's column-0 opener: `if (( rc != 0 )); then`, a `tell` carrying a
+    # fourth single-quoted notice, `fi`. The anchor search still finds the real block
+    # below, `lines[start - 1]` is still the pinned opener, the compared region is still
+    # byte-identical to the golden, and `bash -n` is happy — the whole suite stayed
+    # `Ran 393 tests ... OK` on that mutant (re-measured at f929e3e69) while every
+    # refused boot printed a fourth quoted notice. The claim has always been about what
+    # the OPERATOR is handed, so this pins what the wrapper actually PRINTS TO THE
+    # OPERATOR'S TERMINAL, by running it: one refused boot per advice arm, compared
+    # against the exact set of single-quoted fragments that route's arm is supposed to
+    # emit. Both streams, and the sentence has to say so (PRO-434 NB-1): the terminal has
+    # two of them, `tell` writes to stderr, and until this commit `_run_hostile` threw
+    # stdout away — so the pin that "pins what the wrapper prints" was really pinning what
+    # it prints on one named stream, and a fourth quoted notice written to stdout stayed a
+    # green build at `0a58be29d`.
+    #
+    # The sets are EXACT per route, and that is load-bearing rather than tidy: the
+    # mutant's fourth fragment is `'could not write the --json payload'` — itself one of
+    # the pinned three — so a subset-of-pinned check accepts the mutant. Exactness also
+    # refuses an arm that quietly stops emitting the fragment the operator depends on.
+    # Each route is (label, stub-gate body, exit code, quoted fragments the route may hand
+    # the operator, one line only the intended advice arm prints). That last field is what
+    # makes the docstring below's "every advice arm gets a boot refused in front of it" a
+    # checked claim instead of an asserted one: a gate line that fails to match its matcher
+    # still exits non-zero, still gets refused, and would otherwise contribute a fragment
+    # set measured in front of the WRONG arm.
+    REFUSAL_EMISSION_ROUTES = (
+        ("gate silent, exit 2 — the unclassified arm",
+         'echo started > "$GATE_MARKER"\nexit 2\n',
+         2, {"!!"},
+         "ac-worldserver was not started, and the gate printed neither a finding line nor"),
+        ("gate silent, exit 1 — the rc-only verdict",
+         'echo started > "$GATE_MARKER"\nexit 1\n',
+         1, set(),
+         "ac-worldserver was not started. Fix the named file(s) or"),
+        ("gate prints a `!!` finding, exit 1 — the SQL arm",
+         'echo started > "$GATE_MARKER"\n'
+         "printf '    !! unbounded-write: planted\\n'\nexit 1\n",
+         1, set(),
+         "ac-worldserver was not started. Fix the named file(s) or"),
+        ("gate could not write the --json payload — the evidence arm",
+         'echo started > "$GATE_MARKER"\n'
+         "printf 'preflight: could not write the --json payload to /tmp/v.json\\n' >&2\n"
+         "exit 2\n",
+         2, set(),
+         "the run asked for a --json evidence payload and the gate could not write it."),
+        ("gate operational error — the environment arm",
+         'echo started > "$GATE_MARKER"\n'
+         "printf 'preflight: operational error: cannot reach ac-database\\n' >&2\n"
+         "exit 2\n",
+         2, {"preflight: operational error:"},
+         "a 'preflight: operational error:' line is the gate failing to reach or set up"),
+        # The fifth arm, and the one the docstring below had been claiming without paying
+        # for (PRO-434 NB-3): `gate_printed_a_policy_notice` matches `'preflight: policy
+        # file not found:'`, the wrapper's mis-deploy arm, and until now no route ever
+        # printed it — so a quoted notice added to that arm above the arms these routes do
+        # pin was exactly the edit this suite was built to refuse and could not see. It is
+        # routed like the other environment arms and quoted nothing before this commit,
+        # which is what `set()` on this line is asserting rather than assuming; the arm line
+        # is what proves this boot was refused in front of THAT arm and not another.
+        ("gate policy file not found — the mis-deploy arm",
+         'echo started > "$GATE_MARKER"\n'
+         "printf 'preflight: policy file not found: %s\\n' "
+         "\"$GATE_DIR/policy.json\" >&2\n"
+         "exit 2\n",
+         2, set(),
+         "the gate could not find its policy file, so the checkout it was called from is"),
+    )
+    # Across every refused-boot route and BOTH operator streams, exactly two of the three
+    # pinned fragments ever reach the terminal single-quoted. `'could not write the --json
+    # payload'` is quoted in the block only as a `gate_printed` matcher argument — source
+    # text, not operator prose — and the replayed gate line that proves the route works
+    # carries it UNQUOTED. The union says that asymmetry out loud instead of leaving it
+    # implied, and since PRO-434 NB-1 it is a claim about stdout and stderr together rather
+    # than a claim about stderr that never said which stream it meant.
+    REFUSAL_EMISSION_UNION = {"!!", "preflight: operational error:"}
+
+    @staticmethod
+    def _quoted_fragments_emitted(stream: str) -> set:
+        """The single-quoted fragments on lines one operator stream carried, per line.
+
+        Call it once per stream — this is a function about a terminal, not about stderr,
+        and the PRO-434 NB-1 mutant was a quoted notice that lived entirely on the other
+        one (PRO-423's rule that a claim names the stream it was measured on).
+
+        Per line, not over the whole capture: an unbalanced apostrophe on one line must
+        not pair with one on another and invent a fragment. The stub gates above print no
+        quote pairs (their bodies are right here to check), so anything found was written
+        by the wrapper's own `tell` lines — including by code the text pins above never
+        look at, which is the point of running the script.
+        """
+        found = set()
+        for ln in stream.splitlines():
+            found.update(re.findall(r"'([^']*)'", ln))
+        return found
+
+    def test_every_refused_boot_route_emits_only_the_fragments_the_block_pins(self):
+        """PRO-413 residual hole: the three-fragment claim has to hold at the terminal.
+
+        Runs the real wrapper once per refused-boot route — every advice arm gets a
+        boot refused in front of it, and since PRO-434 NB-3 that includes the mis-deploy
+        arm — and compares the single-quoted fragments on BOTH operator streams against
+        the exact set that arm prints. No route may add one, nothing outside the pinned
+        three may appear, and the union across the routes and streams is exactly the two
+        the block hands out single-quoted.
+
+        The stdout half is the new teeth (PRO-434 NB-1). `tell` writes to stderr, so every
+        fragment the block owns arrives there and a stderr-only read of a refused boot
+        could not tell pristine from a wrapper carrying a fourth quoted notice on the other
+        stream: the reviewer's mutant at `0a58be29d` printed one on every refused boot and
+        the suite stayed `Ran 395 tests ... OK`. A refused boot therefore has to hand the
+        operator quoted fragments on stdout in no route at all, which is what the first
+        assertion below pins rather than folding silently into the set comparison.
+        """
+        pinned = set(TestTheVerdictSurvivesTheOperatorsCodec.WRAPPER_QUOTED_FRAGMENTS)
+        union = set()
+        for label, body, want_rc, want_frags, want_arm_line in self.REFUSAL_EMISSION_ROUTES:
+            got = self._run_hostile(body, check_only=True)
+            self.assertTrue(got["gate_ran"], f"{label}: the stub gate never ran")
+            self.assertFalse(got["docker_ran"],
+                             f"{label}: a refused boot started ac-worldserver")
+            self.assertEqual(want_rc, got["rc"], f"{label}: wrong exit code")
+            self.assertIn("REFUSING BOOT", got["stderr"],
+                          f"{label}: the wrapper did not refuse this boot, so the route "
+                          "is vacuous and its fragment set proves nothing")
+            self.assertIn(
+                want_arm_line, got["stderr"],
+                f"{label}: the boot was refused in front of a different advice arm than "
+                f"{want_arm_line!r}, so the fragment set measured below is not that arm's "
+                "— the gate line stopped matching its matcher (PRO-434 NB-3)")
+            on_stdout = self._quoted_fragments_emitted(got["stdout"])
+            self.assertEqual(
+                set(), on_stdout,
+                f"{label}: the refused boot handed the operator a single-quoted fragment "
+                "on STDOUT. Every fragment the refusal block owns is written by `tell`, "
+                "which writes to stderr, so a quoted notice arriving on the other stream "
+                "is a fourth notice this pin used to be blind to (PRO-434 NB-1). stdout "
+                "was:\n" + got["stdout"])
+            emitted = self._quoted_fragments_emitted(got["stderr"])
+            self.assertEqual(sorted(want_frags), sorted(emitted | on_stdout),
+                             f"{label}: the operator was handed a different set of "
+                             "single-quoted fragments than the arm prints. stderr was:\n"
+                             + got["stderr"] + "\nstdout was:\n" + got["stdout"])
+            self.assertEqual(set(), (emitted | on_stdout) - pinned,
+                             f"{label}: the refusal quoted a fragment outside the three "
+                             "the block pins")
+            union |= emitted | on_stdout
+        self.assertEqual(sorted(self.REFUSAL_EMISSION_UNION), sorted(union),
+                         "the union of single-quoted fragments a refused boot can hand "
+                         "the operator has moved; it is the half of the PRO-382 promise "
+                         "that actually reaches the terminal, on either stream, and the "
+                         "arms above are what defines it")
+
+    # The shapes of "three lines inserted above the column-0 opener" that the operator can
+    # see and a text pin cannot. All three are `bash -n`-clean and all three run on every
+    # refused boot. The first is the mutant PRO-413 re-review reproduced. The second is the
+    # variant the PRO-432 reviewer walked through at `0a58be29d` while the whole suite stayed
+    # `Ran 395 tests ... OK`: it writes to STDOUT, which `_run_hostile` used to discard, and
+    # its guard is spelled `[ "$rc" -ne 0 ]` rather than `(( rc != 0 ))`, so it is not even
+    # the line the text pins key on. The `2>/dev/null || :` on those printfs is not
+    # decoration either — strip it and the PRO-353 `/dev/full` test catches these mutants by
+    # accident, because an unguarded printf to a full stdout aborts the block, and this suite
+    # would be crediting the wrong guard for the red.
+    #
+    # The third carries NO single-quoted fragment at all, which is what makes it a different
+    # mutant and not a third spelling of the same one: `_quoted_fragments_emitted` reads
+    # `'([^']*)'` off what the terminal received, so with nothing quoted the emission pin is
+    # structurally blind to it and can never be the thing that refuses it. It is here to pin
+    # that the predecessor edge is the GENERAL bound PRO-434 NB-1 asked for — indifferent to
+    # what the insertion does, which stream it writes, and how its guard is spelled — rather
+    # than a second net for quoted notices that the emission pin already catches.
+    #
+    # The 4th field of each entry is the fragment this mutant must put on `stream`, or None
+    # when the mutant quotes nothing and the emission pin must be shown NOT to catch it.
+    WRAPPER_UNQUOTED_NOTICE_MARK = "the database is on fire"
+
+    WRAPPER_MUTANTS_ABOVE_THE_OPENER = (
+        ("a quoted `tell` on stderr", "stderr",
+         (TestTheVerdictSurvivesTheOperatorsCodec.REFUSAL_BLOCK_OPENER,
+          "  tell \"fourth notice: 'could not write the --json payload' hits the "
+          "operator\"",
+          "fi"),
+         "could not write the --json payload"),
+        ("a quoted `printf` on stdout", "stdout",
+         ('if [ "$rc" -ne 0 ]; then',
+          "  printf '%s\\n' \"worldserver-up: fourth notice: 'could not write the --json "
+          "payload' on stdout\" 2>/dev/null || :",
+          "fi"),
+         "could not write the --json payload"),
+        ("an unquoted `printf` on stdout", "stdout",
+         ('if [ "$rc" -ne 0 ]; then',
+          "  printf \"%s\\n\" \"worldserver-up: fourth notice: "
+          + WRAPPER_UNQUOTED_NOTICE_MARK + "\" 2>/dev/null || :",
+          "fi"),
+         None),
+    )
+
+    def test_a_fourth_notice_above_the_opener_is_refused_though_the_anchor_cut_accepts(
+            self):
+        """PRO-413 residual hole, made a test: three lines above the column-0 opener.
+
+        Three lines dropped directly above the refusal block's opener are valid bash, run
+        on every refused boot, and sit outside the region every text cut compares. Three of
+        them are run here (`WRAPPER_MUTANTS_ABOVE_THE_OPENER`): the `tell` on stderr that
+        PRO-413 re-review reproduced, the `printf` on stdout that PRO-432's reviewer found
+        still green at `0a58be29d`, and a `printf` on stdout that quotes NOTHING.
+
+        The insertion point comes from the ANCHOR, not from a count of openers. The anchor
+        is what every pin here locates the block by and `_refusal_block_from_lines` already
+        refuses a second one, so it is unique by construction; the opener is not, because
+        the stderr mutant inserts a copy of it. Keying the insertion on the opener count
+        made this test die at its own precondition on a checkout that was already the
+        mutant — the suite went red, which is what the fail-open needs, but the reviewer
+        reading the traceback was handed an attribution the test had not earned (PRO-434
+        NB-2). The uniqueness check is therefore a diagnostic that runs once the mutant is
+        built and the emission assertions have spoken.
+
+        The assertions are, in order: `bash -n` accepts the mutant; the golden cut as
+        PRO-413 shipped it accepts it and still reports the frozen three (the negative
+        control — without it the failure below would not show that the new bounds are what
+        close the hole); the current text pin refuses it, on the predecessor edge PRO-434
+        NB-1 added; and then the per-route assertions split on what the mutant can be seen
+        to do.
+
+        For the two quoted mutants the emission pin refuses every route on its own, which
+        makes it belt-and-braces alongside the predecessor edge rather than the only net —
+        said out loud instead of left to rot. For the unquoted one the split runs the other
+        way and that is the whole reason it is in the table: `_quoted_fragments_emitted`
+        reads `'([^']*)'` off what the terminal received, so with nothing quoted the
+        emission pin is structurally blind, holds its pristine per-route set, and CANNOT be
+        the thing that refuses this wrapper. Only the predecessor edge can, because it never
+        looks at the insertion. Two quoted mutants could only ever show that both nets catch
+        the same shape; this one shows the two nets are not the same net, which is the
+        generality NB-1 asked for when it said to pin the seam rather than the one shape
+        that used it.
+        """
+        import shutil
+        import subprocess
+
+        cls = TestTheVerdictSurvivesTheOperatorsCodec
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        anchors = [i for i, ln in enumerate(lines) if cls.REFUSAL_BLOCK_ANCHOR in ln]
+        self.assertEqual(1, len(anchors),
+                         "the wrapper no longer prints the refusal anchor on exactly one "
+                         "line, so the block these mutants are inserted above is not "
+                         "defined. `_refusal_block_from_lines` refuses this too, so a "
+                         "failure here is a fixture problem and not this pin's verdict")
+        at = anchors[0] - 1
+        self.assertEqual(cls.REFUSAL_BLOCK_OPENER, lines[at],
+                         "the line above the refusal anchor is no longer the column-0 "
+                         f"opener {cls.REFUSAL_BLOCK_OPENER!r}, so there is no seam above "
+                         "the block to insert into")
+
+        for label, stream, block, want_frag in self.WRAPPER_MUTANTS_ABOVE_THE_OPENER:
+            mutant = lines[:at] + list(block) + lines[at:]
+            # The original block is still intact below the insert: opener, anchor under it.
+            self.assertEqual(cls.REFUSAL_BLOCK_OPENER, mutant[at + len(block)])
+            self.assertIn(cls.REFUSAL_BLOCK_ANCHOR, mutant[at + len(block) + 1])
+
+            with tempfile.TemporaryDirectory() as td:
+                # The wrapper locates the gate at `$SCRIPT_DIR/../preflight/
+                # preflight_worlddb.py` and dies before running if it is not there, so the
+                # mutant needs its `ops/` shape — it is still executed with the stub
+                # `PYTHON`, the copy only has to exist.
+                gate_src = (self.WRAPPER.parent.parent / "preflight"
+                            / "preflight_worlddb.py")
+                (Path(td) / "preflight").mkdir()
+                (Path(td) / "deploy").mkdir()
+                shutil.copyfile(gate_src, Path(td) / "preflight" / "preflight_worlddb.py")
+                path = Path(td) / "deploy" / "worldserver-up.sh"
+                path.write_text("\n".join(mutant) + "\n", encoding="utf-8")
+                path.chmod(0o755)
+
+                res = subprocess.run(["bash", "-n", str(path)],
+                                     capture_output=True, text=True)
+                self.assertEqual(0, res.returncode,
+                                 f"{label}: the mutant is not valid bash, so this is a "
+                                 "broken script and not the fail-open under test. bash "
+                                 "said: " + res.stderr)
+
+                # Negative control: the golden cut as PRO-413 shipped it — anchored on the
+                # ANCHOR and byte-compared against the golden minus its opener, both halves
+                # reproduced by the helper — accepts the mutant and still reports the frozen
+                # three. A green call here IS the shipped pin taking it, which is what makes
+                # the emission assertions below the thing that closes this hole rather than a
+                # test that would have failed anyway. If this ever raises, the cut has
+                # acquired the top edge the emission pin was written for: say so here rather
+                # than let it rot.
+                ref = cls("test_the_operational_error_line_carries_the_prefix_the_wrapper_"
+                          "exempts")
+                blind = ref._refusal_region_as_pinned_before_PRO_413_rereview(mutant)
+                self.assertEqual(
+                    sorted(cls.WRAPPER_QUOTED_FRAGMENTS),
+                    ref._quoted_fragments_from_region("\n".join(blind)),
+                    f"{label}: the negative control has gone soft — the anchor-down cut no "
+                    "longer reports the frozen three on a wrapper whose real block it "
+                    "accepted, so it would already catch this mutant and the assertions "
+                    "below prove nothing")
+
+                # And the honest half: as of PRO-434 NB-1 the CURRENT text pin no longer
+                # accepts any of these, because the region's predecessor is pinned too. On
+                # the two quoted mutants that makes the emission pin below belt-and-braces
+                # rather than the only thing standing between the mutant and a green build;
+                # on the unquoted one the predecessor edge is the ONLY net there is, and the
+                # assertions below measure that instead. Said out loud either way so nobody
+                # reads the negative control above as a claim that the text pins are still
+                # blind.
+                with self.assertRaises(AssertionError) as cm:
+                    ref._refusal_block_from_lines(
+                        mutant, f"{self.WRAPPER.name} ({label})")
+                self.assertIn("capture replay", str(cm.exception),
+                              f"{label}: the text pin refused the mutant, but not on the "
+                              "predecessor edge PRO-434 NB-1 pinned, so the bound above is "
+                              "no longer what catches an insertion in this seam: "
+                              + str(cm.exception))
+
+                pinned = set(cls.WRAPPER_QUOTED_FRAGMENTS)
+                for route, body, _want_rc, want_frags, _want_arm in \
+                        self.REFUSAL_EMISSION_ROUTES:
+                    got = self._run_hostile(body, check_only=True, wrapper=path)
+                    self.assertIn("REFUSING BOOT", got["stderr"],
+                                  f"{label} / {route}: the mutant did not refuse the boot, "
+                                  "so there is no fourth notice in flight and this route "
+                                  "proves nothing")
+                    handed = (self._quoted_fragments_emitted(got["stderr"])
+                              | self._quoted_fragments_emitted(got["stdout"]))
+                    if want_frag is None:
+                        # The unquoted shape, and the reason it is in the table. The notice
+                        # really does reach the operator on `stream` — which is also the
+                        # proof that `_run_hostile` captures that stream, since a discarded
+                        # one would come back empty and this assertion would be the failure
+                        # — while nothing on it is single-quoted, so the emission pin has
+                        # exactly what it had on a pristine boot. `assertEqual` below is the
+                        # suite saying out loud that EMISSION does not refuse this mutant;
+                        # the predecessor edge above is the only thing that does, which is
+                        # the generality PRO-434 NB-1 asked for and that two quoted mutants
+                        # could never demonstrate.
+                        self.assertIn(self.WRAPPER_UNQUOTED_NOTICE_MARK, got[stream],
+                                      f"{label} / {route}: the mutant stopped printing its "
+                                      f"fourth notice on {stream}, so it no longer "
+                                      "reproduces the residual hole")
+                        self.assertEqual(
+                            sorted(want_frags), sorted(handed),
+                            f"{label} / {route}: the emission pin now sees a single-quoted "
+                            "fragment on a wrapper that quotes none, so this test can no "
+                            "longer show that the predecessor edge alone is what refuses "
+                            "the unquoted insertion")
+                        continue
+                    notice = self._quoted_fragments_emitted(got[stream])
+                    self.assertIn(want_frag, notice,
+                                  f"{label} / {route}: the mutant stopped printing its "
+                                  f"fourth notice on {stream}, so it no longer reproduces "
+                                  "the residual hole")
+                    self.assertEqual(set(), handed - pinned,
+                                     f"{label} / {route}: the fourth notice now uses a "
+                                     "fragment outside the pinned three, so the exact-set "
+                                     "design note above is stale — a subset check would "
+                                     "catch this mutant too")
+                    self.assertNotEqual(sorted(want_frags), sorted(handed),
+                                        f"{label} / {route}: the emission pin no longer "
+                                        "refuses a refused boot that hands the operator a "
+                                        "fourth single-quoted notice above the block it "
+                                        "pins")
+
+        # Diagnostic, deliberately last and deliberately about the CHECKOUT rather than
+        # about the mutant: the stderr shape below inserts a copy of the opener, so counting
+        # openers in the mutant proves nothing, while counting them in the file this suite
+        # read says the one thing worth saying — the checkout is itself the mutant, so every
+        # route above ran against a wrapper carrying two inserts. Before PRO-434 NB-2 this
+        # check came first and its message was the only thing a reviewer ever saw, which
+        # attributed the red to the fixture on runs where the emission pin had earned it.
+        openers = [i for i, ln in enumerate(lines) if ln == cls.REFUSAL_BLOCK_OPENER]
+        self.assertEqual(1, len(openers),
+                         "the wrapper this suite checked out already has "
+                         f"{len(openers)} refusal openers ({[i + 1 for i in openers]}), so "
+                         "the checkout is itself a mutant and the run above inserted a "
+                         "second copy above it. Emission assertions passing alongside this "
+                         "is expected: the red belongs to the fixture, not to the pin")
 
 
 if __name__ == "__main__":
