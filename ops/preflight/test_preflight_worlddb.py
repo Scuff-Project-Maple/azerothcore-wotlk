@@ -6061,6 +6061,219 @@ class TestTheVerdictSurvivesTheOperatorsCodec(unittest.TestCase):
     # `REFUSING BOOT` lines from the lease checks, and the guard below has to cover one
     # sentence, not a 300-line shell script (PRO-359 review B1).
     REFUSAL_BLOCK_ANCHOR = "REFUSING BOOT — pre-flight failed"
+    # The last statement the block runs before it closes, and therefore the statement that
+    # has to be sitting under the `fi` the walk lands on. It is what says so out loud when the
+    # scan silently shrank — the PRO-403 B1 failure mode, arriving from the opposite direction
+    # now that the block is nested — because every bound that stops short moves the tail out
+    # from under the `fi`.
+    #
+    # It is not the answer to a *fooled* walk, and PRO-428 B1 is the measurement that says so:
+    # the `smuggle-bang` probe plants its own `exit "$rc"` above the false close, so the tail
+    # is exactly where this pin expects to find it. `WRAPPER_REFUSAL_BLOCK_FROZEN` is the
+    # backstop for that class; this pin is the check that names a shortened block in words a
+    # unified diff does not.
+    REFUSAL_BLOCK_TAIL = 'exit "$rc"'
+
+    @staticmethod
+    def _shell_line_without_comment(line: str):
+        """`line` with its trailing shell comment removed, and whether its quotes balanced.
+
+        The comment has to go before anything is counted, and it has to go *quote-aware*:
+        `#` inside a quoted string is data, and `;` inside a quoted string is not a command
+        separator. Two measured reasons, both from the PRO-413/PRO-414 line of work on this
+        same bound:
+
+        - counting over raw lines books a phantom opener on trunk's
+          `# rc 1 IS a verdict even if the capture came back empty`, which closes the block
+          one `fi` early and hides the tail of the sentence;
+        - a stripper that guesses through an unbalanced quote is itself the bypass PRO-422 N1
+          warns about, so parity is *returned* rather than assumed. The caller fails on False;
+          nothing here continues with a guessed answer, which is what keeps a stripped
+          comment from becoming a way to hide a block token in plain sight.
+        """
+        kept, quote, i = [], "", 0
+        while i < len(line):
+            ch = line[i]
+            if quote == "'":
+                kept.append(ch)
+                if ch == "'":
+                    quote = ""
+                i += 1
+            elif quote == '"':
+                if ch == "\\" and i + 1 < len(line):
+                    kept.append(line[i:i + 2])
+                    i += 2
+                    continue
+                kept.append(ch)
+                if ch == '"':
+                    quote = ""
+                i += 1
+            elif ch in ("'", '"'):
+                quote = ch
+                kept.append(ch)
+                i += 1
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                break
+            elif ch == "\\" and i + 1 < len(line):
+                kept.append(line[i:i + 2])
+                i += 2
+            else:
+                kept.append(ch)
+                i += 1
+        return "".join(kept), not quote
+
+    @staticmethod
+    def _shell_command_first_words(line: str) -> tuple:
+        """The first word of every command `line` runs, in order.
+
+        A reserved word is only reserved at the start of a command, so this is what turns
+        `  true; if :; then` into the two commands PRO-403 B1 needs it to be — a line-leading
+        keyword match sees `true` there and the nested block vanishes from the count. The
+        separators are `;`, newline (only ever present in a logical line the walker joined
+        from a backslash continuation) and the list/pipeline operators `&&`, `||`, `|`, with
+        braces and parens included because a reserved word is also reserved after one of
+        those.
+
+        Splitting is done outside quotes, for the reason above: a `;` inside a quoted
+        sentence is prose the operator reads, not a command boundary. Over-splitting is the
+        tolerated direction — a phantom command whose first word happens to read `if` extends
+        the scan, and the column-0 cross-check then disagrees, which is loud. Under-counting
+        is the one that shrinks the scan, so anything that could hide a keyword from position
+        zero is named in `_refusal_block_end` rather than left uncounted.
+        """
+        commands, buf, quote, i = [], [], "", 0
+        while i < len(line):
+            ch = line[i]
+            if quote:
+                buf.append(ch)
+                if ch == quote:
+                    quote = ""
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                buf.append(ch)
+                i += 1
+                continue
+            pair = line[i:i + 2]
+            if pair in ("&&", "||") or ch in ";&|\n(){}":
+                commands.append("".join(buf))
+                buf = []
+                i += 2 if pair in ("&&", "||") else 1
+                continue
+            buf.append(ch)
+            i += 1
+        commands.append("".join(buf))
+        return tuple(cmd.split()[0] for cmd in (c.strip() for c in commands) if cmd)
+
+    @staticmethod
+    def _shell_continues(stripped_line: str) -> bool:
+        """Whether a comment-free line ends in a backslash continuation."""
+        stripped = stripped_line.rstrip()
+        return (len(stripped) - len(stripped.rstrip("\\"))) % 2 == 1
+
+    def _refusal_block_end(self, lines, start: int, where: str) -> int:
+        """Index of the `fi` closing the block whose opener is `lines[start]`.
+
+        Derived twice from the same text and required to agree, because the two fail in
+        opposite directions:
+
+        - a depth walk over command-position `if`/`fi` (`_shell_command_first_words`), which
+          is the only bound that survives a nested body and therefore the answer the scan is
+          cut at;
+        - the first `fi` written in column 0, which is how this helper bounded itself while
+          the block was flat and which no nested closer can imitate.
+
+        Requiring agreement is what PRO-413's cross-check buys: a walk that stops early at a
+        nested `fi` reports a line the column-0 scan does not, and a column-0 scan that runs
+        past a mis-counted opener reports a line the walk does not. Either disagreement is a
+        failure naming both answers.
+
+        What this cannot see, stated rather than assumed (PRO-422 N1 asked for the
+        false-positive class to be named; these are its false-*negative* twins, and PRO-428 B1
+        is the measurement that says a walk alone cannot carry the widening invariant):
+
+        - a real `if` that is not the first word of its command. `! if :; then :; fi` and
+          `time if :; then :; fi` are accepted by `bash -n` — `!` and `time` are command
+          prefixes, not commands — so the walk books no opener there and the `fi` belonging to
+          them takes the depth to zero early. The column-0 cross-check does not rescue it,
+          because the same edit writes that `fi` in column 0 and both bounds land on the same
+          wrong line; the tail pin does not rescue it either, because PRO-428's `smuggle-bang`
+          probe plants its own `exit "$rc"` above the false close. What makes the shape
+          survivable is `WRAPPER_REFUSAL_BLOCK_FROZEN`: whatever region the walk returns is
+          compared byte-for-byte against the pinned block in `_refusal_block_from_lines`, so a
+          bound that moved moves the diff. That is PRO-428 B1's ruling, and it is why the
+          frozen region — not this walk — is what the three-fragment claim rests on
+          (`test_a_quoted_notice_under_a_col_0_fi_the_counter_cannot_see_fails_the_frozen_block`
+          and `test_a_quoted_notice_above_the_anchor_fails_the_frozen_block` are the mutants
+          that hold it);
+         - a keyword split by a line continuation (`i\\` / `f true; the\\` / `n`). PRO-422 AC6
+           reached the same verdict for the flatness sweep this replaced — no token-level
+           bound over physical lines sees it, and closing that class needs a real shell lexer.
+           What the continuation join does carry is where a continued run ENDS, and that is
+           pinned rather than assumed: PRO-437 N3 found `_shell_continues` unfailable by any
+           fixture in this suite and added
+           `test_the_block_walk_carries_a_continued_line_onto_the_line_it_continues` for it;
+        - a `fi` inside a here-doc body, or a command actually named `if`/`fi`, both of which
+          the walk counts as block structure (PRO-414's two counterexamples to a walk alone).
+          The cross-check catches these only when the two answers happen to disagree, which is
+          the case `test_the_two_bounds_have_to_agree_and_a_stray_fi_in_a_body_is_caught`
+          pins; when an attacker writes the here-doc `fi` in column 0 too, they agree and only
+          the frozen region refuses it.
+
+        So this helper is a readability aid and a diagnostic, not the net: a bound that is
+        fooled is answered by the byte-for-byte comparison in `_refusal_block_from_lines`,
+        which is also what refuses a wrapper `bash -n` is content with.
+
+        Quote parity is a precondition rather than a hope: an unterminated quote in the
+        region fails here, because every rule above is a rule about *unquoted* text.
+        """
+        depth = 0
+        walked = None
+        i = start
+        while i < len(lines):
+            body, balanced = self._shell_line_without_comment(lines[i])
+            if not balanced:
+                self.fail(f"{where}:{i + 1} leaves a quote open, so neither the block walk "
+                          "nor the comment strip below it can tell block keywords from "
+                          "operator-facing prose. Bound the region some other structural way "
+                          "rather than letting the scan run over text it cannot parse "
+                          "(PRO-422 N1).")
+            while self._shell_continues(body) and i + 1 < len(lines):
+                i += 1
+                more, balanced = self._shell_line_without_comment(lines[i])
+                if not balanced:
+                    self.fail(f"{where}:{i + 1} leaves a quote open mid-continuation, so the "
+                              "logical line it belongs to cannot be counted (PRO-422 N1).")
+                body += "\n" + more
+            for word in self._shell_command_first_words(body):
+                if word == "if":
+                    depth += 1
+                elif word == "fi":
+                    depth -= 1
+                    if depth == 0:
+                        walked = i
+                        break
+            if walked is not None:
+                break
+            i += 1
+        if walked is None:
+            self.fail(f"no `fi` closes the refusal block opened at {lines[start]!r} in {where}; "
+                      "the block cannot be bounded, so neither can the claim about what it "
+                      "quotes")
+        col0 = next((j for j in range(start, len(lines)) if lines[j] == "fi"), None)
+        if col0 is None:
+            self.fail(f"nothing closes the refusal block in {where} with a `fi` in column 0; "
+                      "the block's own closer has to be reachable from the outside, or this "
+                      "scan has no bound it can defend")
+        if col0 != walked:
+            self.fail(f"the refusal block cannot be bounded two ways and agrees with itself "
+                      f"on neither: the block walk closes it at line {walked + 1} "
+                      f"({lines[walked]!r}) but the first column-0 `fi` is line {col0 + 1}. "
+                      "One of the two is lying about the nesting, and the scan would be cut "
+                      "at whichever it trusts (PRO-413 cross-check).")
+        return walked
+
     # The statement that opens the refusal block, in column 0. PRO-413 re-review B1: the
     # guard locates the block by the anchor, so this is the one line the anchor-based
     # search cannot see for itself, and it is the line the block's whole body sits inside.
@@ -6203,59 +6416,32 @@ fi
         '',
     )
 
-    # Structural `if`/`fi` tokens, matched only against a comment-stripped line and only
-    # where the keyword IS the statement. Both halves of that matter: `# rc 1 IS a verdict
-    # even if the capture came back empty` is a real line of the refusal block, and a
-    # `\bif\b` anywhere-in-line count books it as an opener, which then needs a `fi` that
-    # never comes and hides the tail of the block from the guard.
+    # A second, deliberately simpler `if`/`fi` reader, and never the thing that bounds the live
+    # scan — that is `_refusal_block_end`'s job, and four call sites use this one without asking
+    # it to bound anything:
+    # `test_the_frozen_refusal_block_is_a_balanced_block_and_not_a_hollow_copy` audits the pinned
+    # block against itself, `_arm_closing_fis` finds the arm closers a mutant may de-indent,
+    # `test_a_bound_that_lands_above_the_tail_is_refused_by_the_tail_pin` pins that its own
+    # fixture opens on a structural `if` before it dares blame a failure on the tail pin, and
+    # `_refusal_region_as_pinned_before_PRO_413_rereview` replays the region as the guard read it
+    # before the top edge was pinned. PRO-437 review nit 3 is the correction that names all four;
+    # the list used to claim two of them, which is the kind of claim a reader trusts and a
+    # refactor silently outgrows. Keeping two spellings is the point: the audit asks a question
+    # the walk is not allowed to answer for itself, so gutting the golden cannot be done in a way
+    # that fools only one of them. Tokens are matched against a comment-stripped line and only
+    # where the keyword IS the statement. Both halves of that matter:
+    # `# rc 1 IS a verdict even if the capture came back empty` is a real line
+    # of the refusal block, and a `\bif\b` anywhere-in-line count books it as an opener,
+    # which then needs a `fi` that never comes.
     #
-    # The price is a premise, and PRO-413 review B1 is what named it: the counter sees a
-    # keyword only when it starts its own stripped line and only when the line is read on
-    # its own, so `: ; if true; then` has no opener and a `fi` inside a heredoc body looks
-    # like a real one. Those two shapes are what the bound below walks into, and they are
-    # why `WRAPPER_REFUSAL_BLOCK_FROZEN` — not this counter — is what the three-fragment
-    # claim rests on.
+    # The price is a premise, and PRO-413 review B1 is what named it: this reader sees a
+    # keyword only when it starts its own stripped line and only when the line is read on its
+    # own, so `: ; if true; then` has no opener and a `fi` inside a heredoc body looks like a
+    # real one. That is affordable here because nothing about the scanned region depends on
+    # it; the same shapes are what PRO-428 B1 used against the walk, and there the frozen
+    # region — not either counter — is what the three-fragment claim rests on.
     SHELL_IF_TOKEN = re.compile(r"if(\s|$)")
     SHELL_FI_TOKEN = re.compile(r"fi(\s|$)")
-
-    @staticmethod
-    def _without_shell_comment(line: str) -> str:
-        """`line` up to the first `#` that can actually start a shell comment.
-
-        Quote-aware, because `tell "… # …"` is operator prose and not a comment. It is
-        line-local though: it carries no quote opened on an earlier line and knows nothing
-        of heredoc bodies, which is exactly why the nesting bound built on it is a
-        diagnostic and the frozen region is the check that matters (PRO-413 review B1).
-        """
-        out = []
-        quote = ""
-        i = 0
-        while i < len(line):
-            ch = line[i]
-            if quote:
-                if quote == '"' and ch == "\\":
-                    out.append(ch)
-                    i += 1
-                    if i < len(line):
-                        out.append(line[i])
-                        i += 1
-                    continue
-                if ch == quote:
-                    quote = ""
-            elif ch == "\\":
-                out.append(ch)
-                i += 1
-                if i < len(line):
-                    out.append(line[i])
-                    i += 1
-                continue
-            elif ch in "'\"":
-                quote = ch
-            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
-                break
-            out.append(ch)
-            i += 1
-        return "".join(out)
 
     def _shell_if_fi(self, line: str) -> tuple:
         """(opens, closes) for one line — a structural `if` and/or `fi`, 0 or 1 each.
@@ -6263,12 +6449,17 @@ fi
         One token of each kind per line, which is the shape `worldserver-up.sh` is written
         in and the shape a reviewer can read at a glance. Two edits do not fit it: a
         `if …; then …; fi` one-liner reads as unbalanced, and so does a `tell` whose string
-        is split across lines. Both then make the two bounds disagree, which is the loud
-        direction and the one wanted — the alternative is a guard quietly scanning less
-        than the block. Whoever hits the multi-line `tell` failure is looking at an `if`/`fi`
-        problem even though the edit only touched prose.
+        is split across lines. Both then make the audit say the pinned block is not the block
+        it claims to be, which is the loud direction and the one wanted — the alternative is
+        a golden quietly scanning less than the block. Whoever hits the multi-line `tell`
+        failure is looking at an `if`/`fi` problem even though the edit only touched prose.
+
+        The strip is the suite's one comment stripper, shared with the walk so the two
+        readers cannot drift apart on what a comment is; an unbalanced quote is not this
+        reader's question to answer — `_refusal_block_end` refuses those before any scan
+        starts, and `_quoted_fragments_from_region` refuses them on the fragment path.
         """
-        stripped = self._without_shell_comment(line).strip()
+        stripped = self._shell_line_without_comment(line)[0].strip()
         return (1 if self.SHELL_IF_TOKEN.match(stripped) else 0,
                 1 if self.SHELL_FI_TOKEN.match(stripped) else 0)
 
@@ -6294,19 +6485,31 @@ fi
          PRO-434 NB-1 found still green at the head that pinned the opener alone. The
          history is why it is a frozen region
         and not a rule: PRO-407 found "the first `fi` in column 0" fail-open, PRO-413
-        replaced that with a nesting balance plus the column-0 `fi` as a
-        cross-check, and review B1 produced two `bash -n`-clean wrappers that move BOTH
-        bounds onto the same wrong line — a `fi` sitting in a heredoc body, and a
-        `: ; if true; then` opener the line-local counter cannot see. A frozen region is
-        not a bound, so there is nothing left for two of them to agree about.
+        replaced that with a nesting balance plus the column-0 `fi` as a cross-check,
+        PRO-422 B1 showed that a flat-body assumption cannot describe the nested script this
+        one is, and PRO-428 B1 produced a `bash -n`-clean wrapper that moves every
+        line-local bound onto the same wrong line at once. A frozen region is not a bound,
+        so there is nothing left for two of them to agree about.
 
-        The bounds are kept because each names its own failure far better than a diff does,
-        and the nesting balance is what refuses a block that never closes. They are not two
-        independent tests: both fire on "a line whose stripped content begins with `fi`",
-        so agreement is evidence about an indentation-only move of a real `fi` — the case
-        PRO-407 actually found, and the one the column filter exists for — and about
-        nothing else.
-        """
+        The checks before it are diagnostics, and each is kept because it names its own
+        failure in words a diff does not: the two-anchor check (PRO-413 review N3) is the
+        only thing that notices a second refusal block, because the scan reads the first and
+        the golden would pass on it; the opener check closes the top edge;
+        `_refusal_block_end` walks the nesting command-by-command and refuses a region it
+        cannot parse; the tail pin names a block that stopped short of its `exit "$rc"`.
+        PRO-428 B1 is why none of them is described here as the net, and why the two opener
+         checks this branch used to run at this site — a position-free block-token sweep of
+         the opener line and a `then`-must-end-the-line regex — are gone: the byte equality
+         against `REFUSAL_BLOCK_OPENER` fires before either on every spelling they could
+         catch, and a check that cannot fire on its own is a coverage claim the suite cannot
+         honour. The same reasoning retires PRO-413's line-leading depth walk and its
+         anchor-is-not-a-structural-`if` check here: the walk below counts a `fi` wherever it
+         starts on the line, and the anchor line is itself one of the 78 pinned bytes.
+         Honoured in the other direction too, per PRO-413's owner's ask: the equality that
+         replaced them is failed by name in
+         `test_an_opener_that_only_looks_like_the_opener_is_refused_by_the_opener_pin`, which
+         is what PRO-437 M12/M13/M14 could not do at the head they were measured on.
+         """
         anchors = [i for i, ln in enumerate(lines) if self.REFUSAL_BLOCK_ANCHOR in ln]
         if not anchors:
             self.fail(f"{name} no longer prints {self.REFUSAL_BLOCK_ANCHOR!r}. "
@@ -6356,35 +6559,19 @@ fi
                 "did change, move `REFUSAL_BLOCK_PREDECESSOR_LINES` in the same commit as "
                 "the wrapper and expect the capture-block regressions PRO-390 named to hold "
                 "the new shape.")
-        anchor_opens, anchor_closes = self._shell_if_fi(lines[start])
-        if anchor_opens or anchor_closes:
-            self.fail(f"the {name} line holding {self.REFUSAL_BLOCK_ANCHOR!r} is itself a "
-                      f"structural `if`/`fi` ({lines[start]!r}), so the depth the refusal "
-                      "block sits at is ambiguous and the region cannot be bounded")
-        depth = 1  # the anchor sits in the body of the `if` this block is bounded by
-        end = None
-        for i in range(start + 1, len(lines)):
-            opens, closes = self._shell_if_fi(lines[i])
-            depth += opens - closes
-            if depth == 0:
-                end = i
-                break
-        if end is None:
-            self.fail(f"no `fi` closes the refusal block opened at {self.REFUSAL_BLOCK_ANCHOR!r} "
-                      f"in {name}; the block cannot be bounded, so neither can "
-                      "the claim about what it quotes")
-        col0 = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
-        if col0 != end:
-            where = ("there is no `fi` in column 0 at or below the anchor at all"
-                     if col0 is None else
-                     f"the first `fi` in column 0 is line {col0 + 1}: {lines[col0]!r}")
-            self.fail(f"the refusal block in {name} cannot be bounded by a single rule: "
-                      f"`if`/`fi` nesting balance closes it at line {end + 1}, but "
-                      f"{where}. Both bounds have to land on the same `fi`; until they do, "
-                      "one of them is cutting the region short and the guard would be "
-                      "scanning a block that has already ended (PRO-413). Either re-indent "
-                      "the arm that closes in column 0, or fix the nesting — do not relax "
-                      "this check.")
+        # The right bound, walked command-by-command from that opener rather than assumed
+        # flat (PRO-422 B1) — and read as the diagnostic it is, because PRO-428 B1 is the
+        # measured shape where a line-local walk and the column-0 scan agree on the same
+        # wrong line. The comparison below is what refuses that wrapper.
+        end = self._refusal_block_end(lines, start - 1, name)
+        if lines[end - 1].strip() != self.REFUSAL_BLOCK_TAIL:
+            self.fail(f"the refusal block in {name} does not end where this "
+                      f"guard believes it ends: the bound lands on the `fi` at line "
+                      f"{end + 1}, but the statement above it is {lines[end - 1]!r} rather "
+                      f"than {self.REFUSAL_BLOCK_TAIL!r}. Either the block grew a tail the "
+                      "scan was never shown or the bound stopped short of the real close, and "
+                      "the no-widening guard reads exactly one of those as the whole sentence "
+                      "(PRO-403 B1, PRO-422 B1).")
         # Pinned on BOTH edges: inclusive of the opener one line above the anchor and of the
         # closing `fi`, so "the block starts here and ends here" is a frozen fact too and not
         # something a rule — or the anchor search — has to keep finding correctly.
@@ -6400,9 +6587,9 @@ fi
                       f"{len(self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES)}:\n{diff}\n\n"
                       "The pinned region is what the claim that the refusal block quotes "
                       "exactly the two exempted gate lines plus the finding marker rests on "
-                      "(PRO-413 review B1): a rule that finds the end of the block can be "
-                      "moved by text the counter cannot see, and `bash -n` does not notice "
-                      "it move. If the block really did change, move "
+                      "(PRO-413 review B1, PRO-428 B1): a rule that finds the end of the "
+                      "block can be moved by text the counter cannot see, and `bash -n` does "
+                      "not notice it move. If the block really did change, move "
                       "`WRAPPER_REFUSAL_BLOCK_FROZEN` in the same commit as the wrapper and "
                       "expect "
                       "`test_every_fragment_the_wrapper_quotes_is_a_line_the_gate_really_"
@@ -6410,6 +6597,307 @@ fi
         # The scan still reads the body only: the closing `fi` is pinned above,
         # and a bare `fi` carries no fragment for the quote scan to find.
         return "\n".join(block[:-1])
+
+    # A refusal block of the shape the wrapper has, written for the walk to read: one
+    # nested arm, one comment that contains the word `if`, and the same tail the real
+    # wrapper ends on. These are the pins PRO-422 N1 asked for — the strip and the counter
+    # the bound is built from are tested as things in their own right, not only through the
+    # wrapper they happen to be reading today (PRO-414's lesson on this same bound).
+    _WALKED_BLOCK = (
+        "if (( rc != 0 )); then",
+        '  tell "REFUSING BOOT — pre-flight failed (exit $rc)."',
+        "  # rc 1 IS a verdict even if the capture came back empty",
+        '  if [[ -n "$GATE_DIR" ]]; then',
+        "    has_finding=1",
+        "  fi",
+        '  tell "                  Do not bypass this gate."',
+        '  exit "$rc"',
+        "fi",
+    )
+
+    # The same shape again, with a body line continued onto the next and a `fi` sitting inside
+    # the continued run before the line that actually closes the block. This is what
+    # `_shell_continues` is for, and until PRO-437 N3 nothing in this suite could fail it:
+    # forcing the rule to answer False left the whole suite green, because no fixture ever
+    # handed it a continuation to honour. It cannot be reached through the wrapper either —
+    # `if (( rc != 0 )) \` never gets as far as the walk, since the opener equality refuses that
+    # spelling first — so the only way to make the rule load-bearing is to hand a block of this
+    # shape straight to `_refusal_block_end`.
+    #
+    # Why the join is the bound here, and not merely tidier: `_shell_command_first_words`
+    # treats the newline a join introduces as a command separator, so the `fi ; \` line is
+    # booked as a close whether or not the continuation is honoured. What the join changes is
+    # where the walk is ALLOWED to stop. Reading physical lines it breaks out of the loop the
+    # moment depth hits zero and calls line 3 the close — PRO-403 B1's direction, a scan cut
+    # in the middle of a sentence. Reading the logical line it reports the line the sentence
+    # ends on, which is the only answer the column-0 cross-check can also accept.
+    _CONTINUED_BLOCK = (
+        "if (( rc != 0 )); then",
+        "  tell one \\",
+        "fi ; \\",
+        "fi",
+    )
+
+    def test_the_block_walk_closes_a_nested_block_on_its_own_column_zero_fi(self):
+        """The nested arm is the whole point of the walk, so it is walked here directly."""
+        self.assertEqual(self._refusal_block_end(list(self._WALKED_BLOCK), 0, "synthetic"),
+                         len(self._WALKED_BLOCK) - 1)
+
+    def test_the_block_walk_carries_a_continued_line_onto_the_line_it_continues(self):
+        """PRO-437 N3: the continuation rule, given the one fixture that can fail it.
+
+        `  tell one \\` continues into `fi ; \\`, and the block's real close is the `fi` after
+        that. Honoured, the walk reads one logical line and closes on the last line; ignored,
+        it reads three physical lines, sees depth hit zero on the first of them, and returns a
+        bound that cuts the refusal sentence in half — which the column-0 cross-check then has
+        to shout about, because nothing else in the suite can see the difference. PRO-437 N3
+        measured exactly this: forcing `_shell_continues` to answer False left the 402 tests at
+        the reviewed head green, so the rule was carrying no weight anywhere in the suite.
+
+        The control is the same block with the backslashes deleted. `bash -n` is not what the
+        walk consults, so the refusal cannot be a syntax error wearing a costume: it is pinned
+        to arrive by way of the two bounds disagreeing.
+        """
+        import subprocess
+
+        lines = list(self._CONTINUED_BLOCK)
+        # The premises, so a passing call means what it says. Two continuations in a row, a
+        # `fi` that any physical-line reader would book as the close, and no trip through the
+        # quote-parity precondition on the way in — a fixture that failed there would be
+        # refused for a reason that has nothing to do with the rule under test.
+        self.assertTrue(self._shell_continues(lines[1]),
+                        "the fixture no longer continues, so the walk is being asked about "
+                        "an ordinary line and nothing here tests the rule")
+        self.assertTrue(self._shell_continues(lines[2]),
+                        "the continued run is no longer two lines deep, so the walk is never "
+                        "asked to keep going past the `fi` it can already see")
+        self.assertFalse(self._shell_continues(lines[3]),
+                         "the closing `fi` continues too, so the logical line the walk has to "
+                         "report the end of is no longer this one")
+        self.assertEqual("fi", self._shell_command_first_words(lines[2])[0],
+                         "the middle line is no longer a `fi` to a physical-line reader, so "
+                         "the rule has nothing to protect the bound from")
+        for i in range(len(lines)):
+            _, balanced = self._shell_line_without_comment(lines[i])
+            self.assertTrue(balanced, f"fixture line {i + 1} leaves a quote open, so the walk "
+                                      "would refuse this block on parity before the "
+                                      "continuation ever came into play")
+
+        # Real bash, not a syntax error wearing a costume: the two backslashes join the run
+        # into `tell one fi ; fi`, one command and the block's close.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "continued.sh"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            res = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+            self.assertEqual(0, res.returncode,
+                             "the fixture is not valid bash, so the walk refusing it would "
+                             f"prove nothing about the continuation. bash said: {res.stderr}")
+
+        self.assertEqual(len(lines) - 1, self._refusal_block_end(lines, 0, "synthetic"),
+                         "a continued line closed the block, or the block moved: the close is "
+                         "the last line of the fixture and only that line closes it")
+
+        broken = list(lines)
+        broken[1] = "  tell one"
+        broken[2] = "fi ;"
+        self.assertFalse(any(self._shell_continues(broken[i]) for i in (1, 2)))
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_end(broken, 0, "synthetic")
+        self.assertIn("column-0", str(got.exception),
+                      "deleting the continuation did not make the walk disagree with the "
+                      "column-0 scan, so the control below is not the control it claims to "
+                      "be: " + str(got.exception))
+
+    def test_the_command_counter_sees_a_block_sharing_a_line_with_another_command(self):
+        """PRO-403 B1 in unit form: `true; if :; then` is two commands, not one.
+
+        A line-leading keyword match reports `true` and the nested block never enters the
+        count, which is how a fourth exempted quote used to leave the scan with the suite
+        green. The counter has to see the `if` regardless of what precedes it on the line.
+        """
+        self.assertEqual(self._shell_command_first_words("  true; if :; then"),
+                         ("true", "if", "then"))
+
+    def test_the_command_counter_reads_a_semicolon_inside_quotes_as_prose(self):
+        """The other half of the same rule: quoting is what tells an operator's sentence
+        from a command boundary, so a `;` in a quoted string starts nothing."""
+        self.assertEqual(
+            self._shell_command_first_words('  tell "the; if the gate; fi refused"'),
+            ("tell",))
+
+    def test_the_comment_strip_books_no_opener_for_a_sentence_about_if(self):
+        """The line PRO-413 measured: a comment about `if` is not an `if`.
+
+        Counting over raw lines closes the block one `fi` early on this sentence, and an
+        early close is the direction that shrinks the scan rather than failing it.
+        """
+        stripped, balanced = self._shell_line_without_comment(
+            "  # rc 1 IS a verdict even if the capture came back empty")
+        self.assertTrue(balanced)
+        self.assertEqual(self._shell_command_first_words(stripped), ())
+
+    def test_an_unterminated_quote_is_refused_rather_than_guessed_through(self):
+        """PRO-422 N1: a stripper that guesses past an unbalanced quote is the bypass.
+
+        Every rule in the walk is a rule about unquoted text, so parity is a precondition
+        the caller can act on instead of a property the strip quietly assumes.
+        """
+        _, balanced = self._shell_line_without_comment('  tell "never closed')
+        self.assertFalse(balanced)
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_end(["if (( rc != 0 )); then", '  tell "never closed',
+                                     "  exit \"$rc\"", "fi"], 0, "synthetic")
+        self.assertIn("quote", str(got.exception))
+
+    def test_the_two_bounds_have_to_agree_and_a_stray_fi_in_a_body_is_caught(self):
+        """PRO-414's here-doc counterexample, pinned as a detected case.
+
+        A `fi` written in a here-doc body is block structure to a token walk and closes the
+        scan early on its own — which is the unsafe direction, a guard that quietly reads
+        half a sentence. The column-0 bound is what makes it loud: the two answers differ,
+        and the helper refuses to choose between them.
+        """
+        crossed = ["if (( rc != 0 )); then", "  cat <<'EOF'", "  fi", "EOF",
+                   '  exit "$rc"', "fi"]
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_end(crossed, 0, "synthetic")
+        self.assertIn("column-0", str(got.exception))
+
+    def test_a_bound_that_lands_above_the_tail_is_refused_by_the_tail_pin(self):
+        """PRO-428 N1: a pin nobody can fail is a pin nobody has.
+
+        Mutating `if lines[end - 1].strip() != self.REFUSAL_BLOCK_TAIL:` to `if False:`
+        left this suite green, which is to say nothing in it could tell a scan that stopped
+        short of the real close from one that read the whole sentence — the PRO-403 B1
+        failure mode the pin exists to catch. This is the synthetic case that was missing:
+        a balanced, valid `if` body that simply has no `exit "$rc"` above its close, so the
+        bound is correct, every check up to this one passes, and only the tail pin can
+        object. (PRO-428 B1 separately established that the pin is NOT the answer to a
+        fooled walk — that probe plants its own `exit "$rc"` — which is exactly why it needs
+        a case of its own rather than riding on the mutants.)
+        """
+        # The pinned predecessor replay sits above the opener now (PRO-434 NB-1), so the
+        # fixture carries it: every check up to the tail pin has to PASS here, and the
+        # predecessor check is one of those checks. Line numbers in the refusal below are
+        # counted from the whole fixture, opener at line 6, close at line 9.
+        no_tail = list(self.REFUSAL_BLOCK_PREDECESSOR_LINES) + [
+            "if (( rc != 0 )); then",
+            '  tell "REFUSING BOOT — pre-flight failed (exit $rc)."',
+            '  tell "                  Do not bypass this gate."',
+            "fi",
+        ]
+        opener = len(self.REFUSAL_BLOCK_PREDECESSOR_LINES)
+        self.assertEqual((1, 0), self._shell_if_fi(no_tail[opener]),
+                         "the fixture no longer opens on a structural `if`, so this is not "
+                         "the block the tail pin is being asked about")
+        self.assertEqual(opener + 3, self._refusal_block_end(no_tail, opener, "synthetic"),
+                         "the bound moved, so the failure below could be a bound failure "
+                         "rather than the tail pin doing its job")
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_from_lines(no_tail, name="synthetic (no tail)")
+        msg = str(got.exception)
+        self.assertIn("does not end where this guard believes it ends", msg,
+                      "the refusal did not come from the tail pin: " + msg)
+        self.assertIn("the `fi` at line 9", msg,
+                      "the refusal does not name the bound it refuses: " + msg)
+        self.assertIn(self.REFUSAL_BLOCK_TAIL, msg,
+                      "the refusal does not name the tail the block is missing: " + msg)
+        self.assertIn("Do not bypass this gate", msg,
+                      "the refusal does not name the statement it found instead: " + msg)
+
+    def test_the_comment_strip_keeps_a_hash_inside_quotes_as_data(self):
+        """PRO-428 N2: quote-awareness of the strip was asserted nowhere.
+
+        The break has two conditions and each one is a lever, so both are pinned here.
+        `#` inside a quote is data (PRO-428 N2 measured the quote-blind version green on all
+        393 tests: on the block walk a naive cut lands mid-quote, where the parity
+        precondition refuses it loudly, but on the fragment path there is no parity check to
+        catch it — the tail of the sentence is simply gone and a fragment the operator is
+        really handed disappears from the set the seam tests compare, green). And the second
+        condition, `i == 0 or line[i - 1] in " \t"`, is what makes an unquoted `#` that is
+        not at a word boundary data too: drop it and `tell a#b ...` loses everything after
+        the hash, which is exactly where a block token or a quoted fragment can sit. That
+        half is the mutant the PRO-428 N2 report measured green, and it is the reason the
+        fixture below carries a `#` inside quotes and an unquoted one immediately after a
+        word character.
+        """
+        line = '  tell "a # if :; then" >&2'
+        stripped, balanced = self._shell_line_without_comment(line)
+        self.assertTrue(balanced,
+                        f"the strip cut inside the quoted sentence, leaving: {stripped!r}")
+        self.assertIn("# if :; then", stripped,
+                      f"the strip treated a quoted `#` as a comment: {stripped!r}")
+        self.assertEqual(("tell",), self._shell_command_first_words(stripped)[:1],
+                          f"the counter did not read the `tell` as the command: {stripped!r}")
+        self.assertEqual(["true", "if", "then"],
+                         list(self._shell_command_first_words('  true; if :; then "a # b"')),
+                         "a `;` or a `#` inside quotes is being read as structure")
+        self.assertEqual(["a # if :; then"],
+                         self._quoted_fragments_from_region("  tell 'a # if :; then' >&2"),
+                         "a fragment behind a quoted `#` is being dropped by the strip")
+
+        # The same two levers with the `#` unquoted. The first line is the word-boundary
+        # condition on its own: `a#b` is one shell word, not a comment, so the `if` after it
+        # still has to reach the counter and the fragment after it still has to reach the
+        # scan. An unconditional break deletes both, and that is the shape PRO-428 N2 found
+        # survivable.
+        unquoted = "  tell a#b 'a fragment after a hash' ; if :; then"
+        stripped, balanced = self._shell_line_without_comment(unquoted)
+        self.assertTrue(balanced,
+                        f"the strip lost balance on an unquoted hash: {stripped!r}")
+        self.assertIn("'a fragment after a hash'", stripped,
+                      f"an unquoted `#` mid-word is being read as a comment: {stripped!r}")
+        self.assertEqual(["true", "d#if", "if", "then"],
+                         list(self._shell_command_first_words("  true; d#if x ; if :; then")),
+                         "a `#` that is not at a word boundary is hiding a block token "
+                         "from the counter (PRO-428 N2)")
+        self.assertEqual(["a fragment after a hash"],
+                         self._quoted_fragments_from_region(unquoted),
+                         "a fragment behind an unquoted mid-word `#` is being dropped")
+
+        # The parity precondition on this path is a check and not decoration either: a
+        # region line that leaves a quote open is refused rather than scanned with a
+        # guessed comment boundary. Turning `if not balanced:` into `if False:` here passed
+        # all 401 tests until this assertion was added, and the guess it allows is the one
+        # that deletes a fragment rather than one that shrinks a scan.
+        with self.assertRaises(AssertionError) as got:
+            self._quoted_fragments_from_region("  tell 'a quote that never closes")
+        self.assertIn("left a quote open", str(got.exception),
+                      "the fragment scan guessed through an unterminated quote instead of "
+                      "refusing it (PRO-422 N1, PRO-428 N2)")
+
+    def test_a_second_refusal_block_is_refused_rather_than_read_once(self):
+        """PRO-413 review N3, which PRO-428's mutation matrix found untested.
+
+        `if len(anchors) > 1:` -> `if False:` left the suite green. The region is read from
+        the first anchor, so a wrapper that grows a second refusal block keeps matching the
+        frozen golden on the first and the three-fragment claim silently covers only part of
+        what the operator is handed on a refused boot. Nothing else in the suite can see the
+        second block: the walk, the tail pin and the golden all describe the first. The
+        fixture duplicates the real anchor line rather than inventing one, so what fails is
+        the check and not a transcription.
+        """
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        at = [i for i, ln in enumerate(lines) if self.REFUSAL_BLOCK_ANCHOR in ln]
+        self.assertEqual(1, len(at),
+                         "the wrapper no longer prints the refusal anchor exactly once, so "
+                         "this fixture is duplicating something else")
+        doubled = lines[:at[0] + 1] + [lines[at[0]]] + lines[at[0] + 1:]
+        self.assertEqual(2, len([ln for ln in doubled
+                                 if self.REFUSAL_BLOCK_ANCHOR in ln]))
+        with self.assertRaises(AssertionError) as got:
+            self._refusal_block_from_lines(doubled, name="synthetic (two refusal blocks)")
+        msg = str(got.exception)
+        self.assertNotIn("not the block it pins", msg,
+                         "the refusal came from the golden, not the anchor count: " + msg)
+        self.assertIn(self.REFUSAL_BLOCK_ANCHOR, msg,
+                      "the refusal does not name the anchor it found twice: " + msg)
+        self.assertIn("2 lines", msg,
+                      "the refusal does not say how many anchors it found: " + msg)
+        self.assertIn(str(at[0] + 1), msg,
+                      "the refusal does not name the anchor lines: " + msg)
+        self.assertIn(str(at[0] + 2), msg,
+                      "the refusal does not name the anchor lines: " + msg)
 
     def _wrapper_refusal_block(self) -> str:
         return self._refusal_block_from_lines(
@@ -6421,14 +6909,27 @@ fi
         Comment-stripped line by line first (PRO-413 review N2): the block carries a
         comment per arm, and `# the gate's own words, quoted: 'like this'` is prose about
         the wrapper rather than a fragment the operator is handed, so it must not be booked
-        as one. The strip is the same quote-aware one the token counter uses, and it is
-        just as line-local — a fragment on a continuation line of a string opened earlier
-        can be read as a comment. That is the direction to be worried about, and it is the
-        frozen region above that refuses the edit, not this scan.
+        as one. The strip is the suite's one stripper — the same quote-aware function the
+        block walk counts tokens with, so the two readers cannot disagree about what a
+        comment is — and it is just as line-local: a fragment on a continuation line of a
+        string opened earlier can be read as a comment.
+
+        That is the direction to be worried about, and it has a check on it now rather than
+        a hope (PRO-428 N2): an unbalanced quote anywhere in the region fails here. A
+        stripper that guesses through an open quote is the bypass PRO-422 N1 named, and on
+        this path a guessed comment boundary does not shrink a scan, it deletes a fragment
+        from the set the seam tests compare — which is the failure that reads as green.
         """
-        return sorted(set(re.findall(
-            r"'([^']*)'",
-            "\n".join(self._without_shell_comment(ln) for ln in region.splitlines()))))
+        kept = []
+        for ln in region.splitlines():
+            body, balanced = self._shell_line_without_comment(ln)
+            if not balanced:
+                self.fail(f"a line of the region left a quote open, so the fragment scan "
+                          "cannot tell what the wrapper quotes from what it merely printed: "
+                          f"{ln!r}. Bound or quote the region some other way rather than "
+                          "letting the scan guess through it (PRO-422 N1, PRO-428 N2).")
+            kept.append(body)
+        return sorted(set(re.findall(r"'([^']*)'", "\n".join(kept))))
 
     def _quoted_fragments_from_lines(self, lines: list, name: str) -> list:
         """Every single-quoted fragment inside the refusal block, deduplicated."""
@@ -6436,7 +6937,13 @@ fi
             self._refusal_block_from_lines(lines, name))
 
     def _wrapper_quoted_fragments(self) -> list:
-        """Every single-quoted fragment inside the refusal block, deduplicated."""
+        """Every distinct single-quoted fragment inside the refusal block, sorted.
+
+        Sorted, not first-seen (PRO-388 NB4): both callers compare this against
+        `sorted(...)` of the pinned tuple, so order carries no information here — a
+        first-seen list would fail those comparisons on any rewording that reorders the
+        sentence without adding or removing a fragment.
+        """
         return self._quoted_fragments_from_region(self._wrapper_refusal_block())
 
     def _line_the_operator_matches(self, err: str, *, quoted: str, prefix: str) -> str:
@@ -6510,15 +7017,17 @@ fi
                          "an untyped write failure leaves the operator unable to tell a "
                          "missing directory from a full disk")
 
-    def test_the_wrapper_still_quotes_both_gate_lines_the_gate_emits(self):
+    def test_the_wrapper_still_quotes_the_three_fragments_the_refusal_block_carries(self):
         """The pairing is two-sided, so the other half is pinned too (PRO-359).
 
         This suite does not own the wrapper's wording — `worldserver-up.sh` is frozen as
-        merged and its exemption is prose — but it does own the claim that these are the
-        two fragments an operator locked out is handed. Read it as the seam: whenever the
-        wrapper is reworded, its exemption and the two emitter lines move together, or a
-        one-sided rename routes an environment failure to Scuff (SQL) and a real finding
-        to nobody.
+        merged and its exemption is prose — but it does own the claim about what the
+        operator locked out of a boot is handed: three quoted fragments, the two exempted
+        gate lines plus the `'!!'` finding marker (PRO-388 NB5 — this test used to be
+        named for two, while it loops `WRAPPER_QUOTED_FRAGMENTS` and compares all three).
+        Read it as the seam: whenever the wrapper is reworded, its exemption and the
+        emitter lines move together, or a one-sided rename routes an environment failure
+        to Scuff (SQL) and a real finding to nobody.
         """
         block = self._wrapper_refusal_block()
         for frag in self.WRAPPER_QUOTED_FRAGMENTS:
@@ -6540,11 +7049,19 @@ fi
                          "gate lines plus the finding marker; it is three quoted fragments "
                          "and PRO-346 rejected adding a fourth")
 
-    # Every shape `main()` can leave the operator in, so the wrapper-read test below has
-    # the complete set of lines the gate really writes to compare against: the printed
-    # verdict, the degraded verdict, the operational error, and the refused payload.
-    # `render_raises` and `op_error` are the two failure paths; `missing-dir` is the
-    # evidence-write path; the plain drive is a normal refused boot with findings.
+    # Every shape this suite needs a witness from, so the wrapper-read test below has the
+    # lines the gate really writes to compare against: the printed verdict, the degraded
+    # verdict, the operational error, and the refused payload. `render_raises` and
+    # `op_error` are the two failure paths; `missing-dir` is the evidence-write path; the
+    # plain drive is a normal refused boot with findings.
+    # This is not a claim that it is every shape `main()` can leave the operator in
+    # (PRO-388 NB3). Three more exist and none of them is quoted by the refusal block, so
+    # none needs a witness here: the policy-file-not-found early return (one
+    # `preflight: policy file not found: <path>` line on stderr, then `EXIT_ERROR`), the
+    # blank `--json ""` case (`main()` reports `BLANK_JSON_TARGET_NOTE`, added by PRO-352
+    # after this list was first written), and `--json-only`, which writes nothing to
+    # stdout at all. Each row of `WRAPPER_QUOTED_EVIDENCE` names its own shape, so a row
+    # that names a shape not driven here fails on the lookup rather than passing quietly.
     OPERATOR_FACING_SHAPES = (
         ("verdict", {}),
         ("degraded verdict", {"render_raises": True}),
@@ -6552,15 +7069,35 @@ fi
                                            "No such file or directory"}),
         ("refused payload", {"json_target": "missing-dir"}),
     )
-    # Each fragment the refusal block quotes, and the one shape that has to show it.
+    # Each fragment the refusal block quotes, the one shape that has to show it, the prefix
+    # the gate must put on that line, and — where a second emitter writes a line with that
+    # same prefix — the prefix that marks the decoy, which does not count as a witness.
     # Naming the shape is not decoration: pooled into one corpus, `'!!'` is satisfied by
-    # the render-failure apology alone and the findings listing could stop marking
-    # findings without anyone noticing, which is the half of the wrapper's sentence that
-    # tells the operator what still counts as their problem.
+    # the render-failure apology alone and the findings listing could stop marking findings
+    # without anyone noticing, which is the half of the wrapper's sentence that tells the
+    # operator what still counts as their problem.
+    #
+    # Naming the prefix is not decoration either, and neither is naming which emitter is
+    # being witnessed (PRO-388 NB1, the same self-consistency defect PRO-369 NB1 was about).
+    # The two exempted lines are safe from a shape-column repoint because their prefixes
+    # are emitted by exactly one shape each — the check below asserts that, so the shape
+    # cell cannot be moved without losing the witness. `'!!'` is not: `    !! ` is written
+    # by two emitters, the formatted listing in `render()` and the degraded fallback in
+    # `_render_or_say_why()`, so a bare prefix would still be satisfied after the finding
+    # marker is renamed, provided the row is pointed at a shape that renders degraded. The
+    # decoy column pins this row to the formatted-listing emitter by excluding the
+    # fallback's `    !! [<check>] <severity> ` shape, and the decoy is itself pinned to a
+    # line the fallback really writes: a decoy nothing matches excludes nothing, which is
+    # how PRO-403 P7 left the row unguarded with the suite green. (Pointing this row at
+    # `"refused payload"` stays a genuine witness: that shape reaches the same formatted
+    # listing and only then fails the payload write, so it is the same emitter, not a
+    # second one.)
     WRAPPER_QUOTED_EVIDENCE = (
-        ("preflight: operational error:", "operational error"),
-        ("could not write the --json payload", "refused payload"),
-        ("!!", "verdict"),
+        ("preflight: operational error:", "operational error",
+         "preflight: operational error: ", None),
+        ("could not write the --json payload", "refused payload",
+         "preflight: could not write the --json payload to ", None),
+        ("!!", "verdict", "    !! ", "    !! ["),
     )
 
     def _lines_the_gate_really_emits(self) -> dict:
@@ -6600,20 +7137,75 @@ fi
         self.assertEqual(sorted(self.WRAPPER_QUOTED_FRAGMENTS), quoted,
                          "the refusal block and this suite's view of it have drifted; "
                          "fix the wrapper and the pins together, in one change")
-        self.assertEqual({f for f, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
+        self.assertEqual({f for f, _, _, _ in self.WRAPPER_QUOTED_EVIDENCE}, set(quoted),
                          "a quoted fragment has no witness shape, so nothing checks that "
                          "the gate still emits it")
         emitted = self._lines_the_gate_really_emits()
         for name, lines in emitted.items():
             self.assertTrue(lines, f"the gate produced nothing at all in the {name!r} "
                                    "shape; an empty corpus passes any substring test")
-        for frag, shape in self.WRAPPER_QUOTED_EVIDENCE:
+        for frag, shape, line_prefix, decoy in self.WRAPPER_QUOTED_EVIDENCE:
+            self.assertIn(frag, line_prefix,
+                          f"the fixture drifted: {frag} is not a fragment of "
+                          f"{line_prefix!r}, so this row no longer describes gate and "
+                          "wrapper (compare the pairing rule in "
+                          "`_line_the_operator_matches`)")
             lines = emitted[shape]
+            if decoy is None:
+                # The prefix is carrying this row on its own, so it has to identify the
+                # shape. If another shape ever emits it too, the shape cell becomes a
+                # lever again: repoint it and the witness survives without the emitter
+                # this row is supposed to be watching.
+                for other, other_lines in emitted.items():
+                    if other == shape:
+                        continue
+                    self.assertFalse(
+                        [ln for ln in other_lines if ln.startswith(line_prefix)],
+                        f"{line_prefix!r} is not exclusive to the {shape!r} shape: the "
+                        f"{other!r} shape emits a line with it too, so this row's shape "
+                        "column can be repointed at a corpus the named emitter never "
+                        "wrote. Give the row a decoy if a second emitter really does "
+                        "write this prefix.")
+                witnesses = [ln for ln in lines if ln.startswith(line_prefix)]
+            else:
+                self.assertTrue(decoy.startswith(line_prefix),
+                                f"the fixture drifted: the decoy {decoy!r} does not even "
+                                f"start with the prefix {line_prefix!r} it is meant to "
+                                "exclude")
+                # A decoy that no line the gate writes can ever match excludes nothing, and
+                # the two asserts below cannot see that: `elsewhere` only asks for the
+                # *prefix* to turn up in another shape, which the `refused payload` shape
+                # still reaches through the same formatted listing. Measured on PRO-403 P7:
+                # rename the degraded fallback's `    !! [` marker and the decoy becomes
+                # fiction while the suite stays green — an excluded shape that was never
+                # real, which is PRO-369 NB1's self-answering defect again.
+                self.assertTrue(
+                    [ln for other_lines in emitted.values() for ln in other_lines
+                     if ln.startswith(decoy)],
+                    f"the decoy {decoy!r} on the {frag!r} row matches no line the gate "
+                    "actually writes, so it excludes nothing and the witness set is "
+                    "unguarded: point it at a shape the fallback emitter really produces or "
+                    "drop the column (PRO-403 P7).")
+                elsewhere = [ln for other, other_lines in emitted.items()
+                             if other != shape
+                             for ln in other_lines if ln.startswith(line_prefix)]
+                self.assertTrue(
+                    elsewhere,
+                    f"the decoy {decoy!r} on the {frag!r} row is decoration: no shape "
+                    f"outside {shape!r} emits {line_prefix!r} at all, so nothing outside "
+                    "this row's own shape could have satisfied it and there is no second "
+                    "emitter to exclude. Drop the decoy rather than keep a check that "
+                    "checks nothing (PRO-369 NB1's shape).")
+                witnesses = [ln for ln in lines if ln.startswith(line_prefix)
+                             and not ln.startswith(decoy)]
             self.assertTrue(
-                any(frag in ln for ln in lines),
+                witnesses,
                 f"{self.WRAPPER.name} quotes '{frag}' at the operator as though the gate "
-                f"wrote it, but no line the gate produced in the {shape!r} shape contains "
-                "it. The refusal routing turns on that string: an operator locked out is "
+                f"wrote it, but no line the gate produced in the {shape!r} shape starts "
+                f"with {line_prefix!r}"
+                + (f" without also starting with the decoy {decoy!r}"
+                   if decoy is not None else "")
+                + ". The refusal routing turns on that string: an operator locked out is "
                 "told to escalate to Scuff (SQL) unless the gate said something like it, "
                 "and the gate no longer says it. Lines seen were:\n"
                 + "\n".join(sorted({ln for ln in lines if ln.strip()})))
@@ -6631,6 +7223,14 @@ fi
         return [i for i in range(start + 1, len(lines))
                 if self._shell_if_fi(lines[i])[1] and lines[i] != "fi"]
 
+    def _first_col0_fi(self, lines: list, start: int):
+        """The first `fi` written in column 0 at or below `start`, or None.
+
+        The pre-PRO-413 right bound, in one place so both the weak reproduction below and
+        the mutant assertions above cannot drift from each other.
+        """
+        return next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
+
     def _region_and_fragments_as_before_PRO_413(self, lines: list, start: int) -> list:
         """The pre-PRO-413 bound, reproduced rather than restated: first `fi` in column 0.
 
@@ -6642,7 +7242,7 @@ fi
         That asymmetry is the point — this has to reproduce the weaker behaviour the suite
         actually shipped, not be "helpfully" unified with the current scan.
         """
-        end = next((i for i in range(start, len(lines)) if lines[i] == "fi"), None)
+        end = self._first_col0_fi(lines, start)
         return sorted(set(re.findall(
             r"'([^']*)'", "\n".join(lines[start:end]) if end is not None else "")))
 
@@ -6717,20 +7317,40 @@ fi
 
         # The pin. Either arm closing in column 0 is a failure on its own, with or without
         # the notice below it — the notice is what makes it dangerous, not what makes it
-        # detectable.
+        # detectable. What refuses it at this head is the agreement check: the walk counts
+        # commands, so it still closes the block at its real `fi`, while the column-0 scan
+        # stops at the arm that just moved to the left margin. Two bounds, two answers, and
+        # the suite refuses to pick one — which is the loud direction PRO-413 added the
+        # cross-check for. The byte comparison is asserted below on the region the column-0
+        # bound would have returned, so the net is checked independently of which diagnostic
+        # happens to fire first (PRO-428 B1 is the shape where none of the earlier ones can
+        # see the move at all).
         for label, mutant in (("mis-indented arm", misindented),
                               ("mis-indented arm with a fourth notice",
                                misindented_with_notice)):
+            fooled_end = self._first_col0_fi(mutant, start)
+            self.assertIsNotNone(fooled_end,
+                                 f"{label}: no column-0 `fi` below the anchor, so the old "
+                                 "bound had nothing to be blind about")
+            self.assertNotEqual(
+                self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES,
+                mutant[start - 1:fooled_end + 1],
+                f"{label}: the region the column-0 bound returns is byte-identical to the "
+                "pinned block, so the frozen region is not the net at this site")
             with self.assertRaises(AssertionError) as cm:
                 self._refusal_block_from_lines(mutant, name=f"{self.WRAPPER.name} "
                                                             f"({label})")
             msg = str(cm.exception)
-            self.assertIn("column 0", msg,
+            self.assertIn("cannot be bounded two ways", msg,
                           f"{label}: the bound failed, but not for the indentation reason "
                           f"this test is about: {msg}")
-            self.assertIn("nesting balance", msg,
+            self.assertIn("the block walk closes it", msg,
+                          f"{label}: the refusal does not name the nesting answer, so the "
+                          f"command-position walk has stopped disagreeing with the "
+                          f"column-0 scan: {msg}")
+            self.assertIn("column-0 `fi`", msg,
                           f"{label}: the bound has stopped comparing the column-0 `fi` "
-                          f"against the nesting balance: {msg}")
+                          f"against the walk: {msg}")
 
         # And the widening half still bites on its own. A fourth quote below the FIRST arm
         # is inside the block, so the two bounds agree there and nothing about the boundary
@@ -6757,9 +7377,19 @@ fi
     # pasting a usage block into the refusal arms looks like — and `: ; if true; then` is
     # the structural one, an opener the line-local counter cannot see closed by a real
     # column-0 `fi`.
+    #
+    # The third field is the check that refuses each one at this head, and it changed when
+    # PRO-422 replaced the line-leading counter with a command-position walk: the heredoc
+    # `fi` now closes the walk one statement early, so the tail pin is what objects, and the
+    # `: ; if` opener is now booked as an `if`, so the walk and the column-0 scan land on
+    # different lines and the cross-check objects. Neither reaches the byte comparison, which
+    # is why the loop asserts the frozen region separately, on the region a fooled bound
+    # would have returned — see the `not the block it pins` assertions.
     WRAPPER_MUTANT_TAILS = (
-        ("heredoc body carrying a column-0 `fi`", ("  cat <<EOS", "fi", "EOS")),
-        ("unseen opener closed by a column-0 `fi`", (": ; if true; then", "  :", "fi")),
+        ("heredoc body carrying a column-0 `fi`", ("  cat <<EOS", "fi", "EOS"),
+         "does not end where this guard believes it ends"),
+        ("unseen opener closed by a column-0 `fi`", (": ; if true; then", "  :", "fi"),
+         "cannot be bounded two ways"),
     )
 
     def test_a_quoted_notice_under_a_col_0_fi_the_counter_cannot_see_fails_the_frozen_block(
@@ -6777,8 +7407,19 @@ fi
         `python3 ops/preflight/test_preflight_worlddb.py` at `Ran 383 tests ... OK` with
         `bash -n` happy and the wrapper printing a fourth single-quoted notice on every
         refused boot. So the assertions here are, in order: the old bound is blind to the
-        mutant, the bounds agree (which is what proves the disagreement check cannot be the
-        safety net), and the frozen region refuses it.
+        mutant, the mutant is refused by a structural check that runs before the byte
+        comparison, and the frozen region refuses the very region that bound returned.
+
+        The middle assertion is the one PRO-422 changed. With the command-position walk the
+        two mutants no longer slip past both bounds — one is caught by the tail pin, the
+        other by the cross-check — so "the bounds agree" is no longer what this test can
+        claim about them, and a test that only asserted the first refusal it happens to get
+        would silently stop testing the net if those diagnostics were ever relaxed. The
+        golden is therefore asserted on the fooled bound's own region, which is the region
+        the pre-PRO-413 scan handed back and the region the byte comparison exists to
+        refuse. PRO-428 B1 is the shape where the earlier checks really are blind (a planted
+        `exit "$rc"` above a false close) and the frozen region is the only thing left; that
+        probe is run against this head in the PRO-396 report.
         """
         import subprocess
 
@@ -6800,7 +7441,7 @@ fi
                         "the last arm is no longer above the closing notices, so a mutant "
                         "inserted there would not be inside the block")
 
-        for label, extra in self.WRAPPER_MUTANT_TAILS:
+        for label, extra, expected in self.WRAPPER_MUTANT_TAILS:
             mutant = list(lines)
             mutant[last_arm + 1:last_arm + 1] = list(extra) + [self.WRAPPER_MUTANT_NOTICE]
             name = f"{self.WRAPPER.name} ({label})"
@@ -6835,21 +7476,29 @@ fi
                 f"catches the {label!r} mutant, so the assertions below would not show "
                 "anything about the nesting bound")
 
-            # The bounds agree. Had they disagreed, the failure would name both of them,
-            # and this test would be a duplicate of the one above rather than the reason
-            # the frozen region exists.
+            # The net, asserted on the region the old bound hands back rather than on
+            # whichever check happens to fire first: the frozen block has to refuse what a
+            # fooled bound calls the block, or the suite is one relaxed diagnostic away
+            # from the green fail-open this test was written against.
+            fooled_end = self._first_col0_fi(mutant, start)
+            self.assertIsNotNone(fooled_end,
+                                 f"{label}: no column-0 `fi` below the anchor, so the old "
+                                 "bound had nothing to be blind about")
+            self.assertNotEqual(
+                self.WRAPPER_REFUSAL_BLOCK_FROZEN_LINES,
+                mutant[start - 1:fooled_end + 1],
+                f"{label}: the region the column-0 bound returns is byte-identical to the "
+                "pinned block, so the frozen region is not the net at this site and every "
+                "assertion below is load-bearing on its own")
+
+            # And the refusal the suite actually reports, named so a change in check order
+            # is a decision rather than an accident.
             with self.assertRaises(AssertionError) as cm:
                 self._refusal_block_from_lines(mutant, name=name)
             msg = str(cm.exception)
-            self.assertIn("not the block it pins", msg,
-                          f"{label}: the frozen region did not refuse the mutant: {msg}")
-            self.assertNotIn("cannot be bounded by a single rule", msg,
-                             f"{label}: the two bounds disagreed, so this mutant no longer "
-                             f"shows that their agreement is the hole — it belongs with "
-                             f"`test_a_column_zero_arm_fi_fails_the_bound_instead_of_the_"
-                             f"pipeline` instead: {msg}")
-            self.assertLess(msg.count("\n+  tell \"a fourth notice"), 2,
-                            f"{label}: the diff should name the added notice once")
+            self.assertIn(expected, msg,
+                          f"{label}: refused by something other than the check this mutant "
+                          f"is pinned to — {expected!r} expected, got: {msg}")
 
         # And the pinned region is the thing doing the work at every one of these sites:
         # the frozen three are still exactly what a correct wrapper scans to.
@@ -7028,8 +7677,123 @@ fi
                       "the refusal did not come from the opener check, so it is not the "
                       "check that closes re-review B1: " + msg)
         self.assertIn("a fourth notice", msg,
-                      "the failure does not name the notice the operator is handed above "
+                      "the refusal does not name the notice the operator is handed above "
                       "the anchor: " + msg)
+
+    # The two ways the opener can stop being the opener that, until now, had only ever been
+    # measured as a whole-suite mutant: numbers in a review comment rather than cases in the
+    # suite. Each row is (what it mutates, the opener line it is replaced with, the lines
+    # inserted above the block's close to keep bash accepting the mutant, and whether the
+    # replacement still starts with the pinned opener — the last field is why each row is in the
+    # table, and the test refuses a row whose reason has quietly changed).
+    #
+    # `bash -n` accepts BOTH, which is the whole reason they need cases of their own: PRO-437 N1
+    # re-measured the first spelling and found `test_the_wrapper_is_valid_bash` passing next to
+    # five failures, all of them the opener equality. So the equality is not belt-and-braces on
+    # top of a syntax check — for this shape it is the only thing in the suite that can see it.
+    WRAPPER_OPENER_MUTANTS = (
+        # `;` where the pinned opener has `;`, and a condition that ends in an assignment. Not a
+        # prefix of the pinned opener, so a prefix comparison refuses it too: this row is the
+        # equality's own case, and the one whose refusal text can tell the two sides apart.
+        ("a condition that ends in an assignment",
+         "if (( rc != 0 )) && then=1 ; then", (), False),
+        # The pinned opener, verbatim, with a structural `if` bolted onto the end of it and
+        # closed one line into the body. This row IS the pinned opener as its own first 22
+        # characters, so it is the discriminator: relax the pin to `startswith` and the refusal
+        # below stops coming from the opener check and starts coming from the golden diff, which
+        # is the difference between a pinned opener and a suggestion (PRO-437's M13, which sat
+        # green at 402 tests alongside M14's substring variant).
+        ("an opener that carries a nested `if` on its own line",
+         "if (( rc != 0 )); then if :; then :", ("  fi",), True),
+    )
+
+    def test_an_opener_that_only_looks_like_the_opener_is_refused_by_the_opener_pin(self):
+        """PRO-413's owner's ask, and PRO-437 N1's measurement, as two cases of their own.
+
+        The opener equality is the check that closes PRO-413 re-review B1's top edge, and until
+        now its only evidence was a mutant table in a review thread: deleting it outright left
+        one failure in the suite (PRO-437's M12), and both relaxations of it — a prefix match, a
+        substring match — left all 402 tests green (M13, M14). A pin that nothing can fail is a
+        pin nobody has, which is the same rule PRO-428 N1 applied to the tail pin two rounds ago
+        and the reason this test asserts which check is talking, not merely that something did.
+
+        So each mutant is refused by the opener check and by nothing else: the body is asserted
+        byte-identical before the call, which is what makes
+        `assertNotIn("not the block it pins", msg)` — the golden diff's own words — the
+        assertion that says the top edge is being refused as the top edge. Take the opener check
+        away and that assertion is what goes red, not a count.
+        """
+        import subprocess
+
+        lines = self.WRAPPER.read_text(encoding="utf-8").splitlines()
+        start = next((i for i, ln in enumerate(lines)
+                      if self.REFUSAL_BLOCK_ANCHOR in ln), None)
+        self.assertIsNotNone(start, "the mutants have nothing to mutate without the anchor")
+        # The head is what this commit asserts of every wrapper, so it is checked before
+        # anything is claimed about a mutant of it.
+        self.assertEqual(self.REFUSAL_BLOCK_OPENER, lines[start - 1])
+
+        for label, opener, body_extra, is_prefix in self.WRAPPER_OPENER_MUTANTS:
+            self.assertEqual(is_prefix, opener.startswith(self.REFUSAL_BLOCK_OPENER),
+                             f"{label}: this row no longer starts with the pinned opener the "
+                             "way the table says it does, so it is no longer the case it is in "
+                             "the table for — one row has to be a prefix of the opener and the "
+                             "other has not to be, or a prefix-comparison pin goes unnoticed")
+            self.assertNotEqual(self.REFUSAL_BLOCK_OPENER, opener,
+                                f"{label}: the mutant opener is the pinned opener, so this "
+                                "case asserts nothing about an equality")
+
+            tail = next((i for i in range(start, len(lines))
+                         if lines[i].strip() == self.REFUSAL_BLOCK_TAIL), None)
+            self.assertIsNotNone(tail,
+                                 f"{label}: nothing below the anchor is {self.REFUSAL_BLOCK_TAIL!r}, "
+                                 "so there is no seam to insert the mutant's closer into and the "
+                                 "mutant would be a broken script rather than a fail-open")
+
+            mutant = list(lines)
+            # Inserted above the close first, so the opener replacement below keeps its index.
+            mutant[tail + 1:tail + 1] = list(body_extra)
+            mutant[start - 1:start] = [opener]
+            self.assertEqual(opener, mutant[start - 1],
+                             f"{label}: the mutant no longer mutates the opener line, so the "
+                             "refusal below would not be about the opener")
+            self.assertIn(self.REFUSAL_BLOCK_ANCHOR, mutant[start],
+                          f"{label}: the line above the anchor is no longer the mutated opener, "
+                          "so the refusal below could be coming from anywhere")
+            self.assertEqual(lines[start + 1:tail + 1], mutant[start + 1:tail + 1],
+                             f"{label}: the mutant moved a body line too, so a golden diff "
+                             "would be a legitimate refusal and this test would say nothing "
+                             "about the top edge")
+
+            with tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "opener-mutant.sh"
+                path.write_text("\n".join(mutant) + "\n", encoding="utf-8")
+                res = subprocess.run(["bash", "-n", str(path)],
+                                     capture_output=True, text=True)
+                self.assertEqual(0, res.returncode,
+                                 f"{label}: the mutant is not valid bash, so this is a broken "
+                                 "wrapper and not the fail-open the opener pin exists for. "
+                                 f"bash said: {res.stderr}")
+
+            with self.assertRaises(AssertionError) as got:
+                self._refusal_block_from_lines(
+                    mutant, name=f"{self.WRAPPER.name} (opener: {label})")
+            msg = str(got.exception)
+            self.assertIn("the line above", msg,
+                          f"{label}: refused by something other than the opener check: " + msg)
+            self.assertIn(opener, msg,
+                          f"{label}: the refusal does not name the opener the wrapper actually "
+                          "has: " + msg)
+            # For the prefix row this one is satisfied by the found line as much as by the
+            # expected one, which is exactly why it is paired with the two below it.
+            self.assertIn(self.REFUSAL_BLOCK_OPENER, msg,
+                          f"{label}: the refusal does not name the opener the wrapper is "
+                          "missing: " + msg)
+            self.assertNotIn("not the block it pins", msg,
+                             f"{label}: the refusal came from the golden diff, not from the top "
+                             "edge — the block body is asserted byte-identical above, so this "
+                             "is the opener check having been skipped and the pinned region "
+                             "doing this suite's seeing for it (PRO-437 M12/M13/M14): " + msg)
 
     def test_the_frozen_refusal_block_is_a_balanced_block_and_not_a_hollow_copy(self):
         """A golden can be quietly gutted, so the golden is checked against itself.
@@ -7130,8 +7894,12 @@ fi
     # inside the presentation half at all (PRO-335 §2, PRO-341 review N1/B1). The four
     # tests in `test_the_degraded_verdict_*` below pin its three shapes plus the blank
     # `--json ""` case; the `_payload_fortune()` helper that branch carried was dropped
-    # in the PRO-331 merge rather than kept as a second, competing source of the same
-    # claim.
+    # in the PRO-331 merge (`c6eca76f3`) rather than kept as a second, competing source of
+    # the same claim. Check that instead of trusting it:
+    # `git diff 1f11c9273 c6eca76f3 -- ops/preflight/preflight_worlddb.py`, where
+    # `1f11c9273` is the `pro-331-preflight-nb-fixes` tip that still held the helper. The
+    # obvious `git log -S"_payload_fortune" -- ops/preflight/` misses the drop, because
+    # pickaxe does not diff merge commits unless asked (PRO-388 NB6).
 
     def test_checks_that_pass_still_refuse_the_boot_when_the_payload_cannot_be_written(self):
         """PRO-324 NB3: the case that actually changes what boots.
