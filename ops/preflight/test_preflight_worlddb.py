@@ -7607,7 +7607,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
     # `main()` returns before either is reached, which is the point: the shape under test
     # is the earliest `_emit`-backed exit `main()` has, and one of the two whose report goes
     # to `sys.stderr` — the other is the operational-error return at
-    # `preflight_worlddb.py:4716-4717`, which this family does not drive.
+    # `preflight_worlddb.py:4716-4718`, which this family does not drive.
     # `build_arg_parser().parse_args(argv)` at `preflight_worlddb.py:4692` is earlier still
     # and writes its usage error to `sys.stderr` directly — never through `_emit`, so nothing
     # retires it — which is a separate gap (PRO-389 review N-a) and not what these pins drive.
@@ -7903,7 +7903,7 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         """PRO-389 N2: the `EXIT_ERROR` route under `> /dev/full 2>&1` — the unpinned half.
 
         `_emit` has a second primary. `main()` returns `EXIT_ERROR` from three places, and
-        the one this pin drives — the missing `--policy` at `preflight_worlddb.py:4696-4697`
+        the one this pin drives — the missing `--policy` at `preflight_worlddb.py:4696-4698`
         — aims the report at `sys.stderr`; at startup `sys.stderr is sys.__stderr__`, so
         inside `_emit` the primary and the fallback are the *same object*. The report line
         and the notice line land in one buffer on one refusing descriptor, and there is no
@@ -7914,8 +7914,8 @@ class TestTheGateHoldsItsOwnRc(unittest.TestCase):
         pins in the blank/whitespace `--json` family — `test_a_blank_json_target_refuses_the_boot`
         and its two siblings in `TestTheVerdictSurvivesTheOperatorsCodec`, roughly 440-510
         lines and a class boundary above this one — are not end-to-end: they run `main()`
-        under `_drive_main`, which swaps the streams inside the child and so cannot see the
-        interpreter's teardown flush that costs 120.)
+        under `_drive_main`, which swaps the streams in the test process itself and so
+        cannot see the interpreter's teardown flush that costs 120.)
 
         Measured on 3.12.3 at `d97932345` this exits **2**, not 120. On this return the two
         `_retire_broken_stream` calls in `_emit` act on one object, so either one alone
